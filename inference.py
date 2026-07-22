@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--input", required=True, help="Image folder, single image, or video file")
     parser.add_argument("--save", required=True, help="Output .npz path")
     parser.add_argument("--checkpoint_dir", default="Luo-Yihang/4RC")
-    parser.add_argument("--track_query_idx", type=int, default=-1, help="Frame index for tracking query; -1 = middle frame")
+    parser.add_argument("--track_query_idx", type=int, nargs="+", default=[-1], help="Frame index/indices for tracking query; -1 = middle frame")
     parser.add_argument("--refine_track_visualization", action="store_true", default=False)
     args = parser.parse_args()
 
@@ -85,8 +85,7 @@ def main():
     model = Arc.from_pretrained(args.checkpoint_dir).to(device).eval()
     imgs = load_images(paths, size=512, verbose=True, patch_size=14)
 
-    track_query_idx = args.track_query_idx if args.track_query_idx >= 0 else len(imgs) // 2
-    q = [track_query_idx] if track_query_idx < len(imgs) else [len(imgs) // 2]
+    q = [idx if 0 <= idx < len(imgs) else len(imgs) // 2 for idx in args.track_query_idx]
     for img in imgs:
         img["track_query_idx"] = torch.tensor(q)
 
