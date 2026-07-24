@@ -32,6 +32,20 @@ class Arc(
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
     )
+    LEGACY_SAFETENSOR_ALIASES = {
+        "head.scratch.output_conv2_aux.1.2.weight":
+            "head.scratch.output_conv2_aux.0.2.weight",
+        "head.scratch.output_conv2_aux.1.2.bias":
+            "head.scratch.output_conv2_aux.0.2.bias",
+        "head.scratch.output_conv2_aux.2.2.weight":
+            "head.scratch.output_conv2_aux.0.2.weight",
+        "head.scratch.output_conv2_aux.2.2.bias":
+            "head.scratch.output_conv2_aux.0.2.bias",
+        "head.scratch.output_conv2_aux.3.2.weight":
+            "head.scratch.output_conv2_aux.0.2.weight",
+        "head.scratch.output_conv2_aux.3.2.bias":
+            "head.scratch.output_conv2_aux.0.2.bias",
+    }
 
     def __init__(
         self,
@@ -321,6 +335,12 @@ class Arc(
     ):
         from safetensors.torch import load_model
 
+        verified_legacy_aliases = (
+            cls._verify_legacy_safetensor_aliases(model_file)
+            if not strict
+            else set()
+        )
+
         load_kwargs = {"strict": False}
         supports_device = "device" in inspect.signature(load_model).parameters
         if supports_device:
@@ -334,12 +354,45 @@ class Arc(
         if not supports_device and str(map_location) != "cpu":
             model.to(map_location)
 
+        unexpected_keys = set(unexpected_keys) - verified_legacy_aliases
         cls._validate_checkpoint_incompatibility(
             missing_keys,
             unexpected_keys,
             strict=strict,
         )
         return model
+
+    @classmethod
+    def _verify_legacy_safetensor_aliases(cls, model_file):
+        from safetensors import safe_open
+
+        verified_aliases = set()
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            checkpoint_keys = set(checkpoint.keys())
+            for alias, canonical in cls.LEGACY_SAFETENSOR_ALIASES.items():
+                if alias not in checkpoint_keys:
+                    continue
+                if canonical not in checkpoint_keys:
+                    raise RuntimeError(
+                        "Checkpoint is incompatible with Arc; legacy safetensors "
+                        f"alias '{alias}' has no canonical tensor '{canonical}'"
+                    )
+
+                alias_tensor = checkpoint.get_tensor(alias)
+                canonical_tensor = checkpoint.get_tensor(canonical)
+                if (
+                    alias_tensor.shape != canonical_tensor.shape
+                    or alias_tensor.dtype != canonical_tensor.dtype
+                    or not torch.equal(alias_tensor, canonical_tensor)
+                ):
+                    raise RuntimeError(
+                        "Checkpoint is incompatible with Arc; legacy safetensors "
+                        f"alias '{alias}' conflicts with canonical tensor "
+                        f"'{canonical}' (shared-module checkpoint is ambiguous)"
+                    )
+                verified_aliases.add(alias)
+
+        return verified_aliases
 
     @classmethod
     def _load_as_pickle(

@@ -188,6 +188,57 @@ class _LegacyTinyArc(nn.Module):
             self.unexpected = nn.Parameter(torch.zeros(1))
 
 
+class _TinyAliasScratch(nn.Module):
+    def __init__(self):
+        super().__init__()
+        shared_layer_norm = nn.LayerNorm(2)
+        self.output_conv2_aux = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Identity(),
+                    nn.Identity(),
+                    shared_layer_norm,
+                )
+                for _ in range(4)
+            ]
+        )
+
+
+class _TinyAliasHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scratch = _TinyAliasScratch()
+
+
+class _TinyUnsharedPretrained(nn.Module):
+    def __init__(self, include_time_embedding):
+        super().__init__()
+        self.shared = nn.Linear(2, 2)
+        if include_time_embedding:
+            self.time_index_embedding = nn.Embedding(4, 2)
+            nn.init.zeros_(self.time_index_embedding.weight)
+
+
+class _TinyUnsharedBackbone(nn.Module):
+    def __init__(self, include_time_embedding):
+        super().__init__()
+        self.pretrained = _TinyUnsharedPretrained(include_time_embedding)
+
+
+class _AliasTinyHubArc(_TinyHubArc):
+    def __init__(self, freeze="none"):
+        super().__init__(freeze=freeze)
+        self.backbone = _TinyUnsharedBackbone(include_time_embedding=True)
+        self.head = _TinyAliasHead()
+
+
+class _LegacyAliasTinyArc(_LegacyTinyArc):
+    def __init__(self):
+        super().__init__(include_head=False)
+        self.backbone = _TinyUnsharedBackbone(include_time_embedding=False)
+        self.head = _TinyAliasHead()
+
+
 def _arc_shell(max_time_indices=8):
     model = Arc.__new__(Arc)
     nn.Module.__init__(model)
@@ -211,6 +262,20 @@ def _save_safetensors_model(model, directory):
 
     directory.mkdir()
     save_model(model, directory / "model.safetensors")
+
+
+def _save_raw_safetensors_state(state_dict, directory):
+    pytest.importorskip("safetensors")
+    from safetensors.torch import save_file
+
+    directory.mkdir()
+    save_file(
+        {
+            name: tensor.detach().clone().contiguous()
+            for name, tensor in state_dict.items()
+        },
+        directory / "model.safetensors",
+    )
 
 
 def test_time_embedding_size_is_configurable_and_zero_initialized():
@@ -532,6 +597,83 @@ def test_from_pretrained_accepts_only_the_legacy_time_embedding_gap(tmp_path):
 
     with pytest.raises(RuntimeError, match="time_index_embedding"):
         _TinyHubArc.from_pretrained(str(legacy_dir), strict=True)
+
+
+def test_from_pretrained_accepts_identical_known_safetensor_aliases(tmp_path):
+    legacy_dir = tmp_path / "legacy-aliases"
+    source = _LegacyAliasTinyArc()
+    with torch.no_grad():
+        shared_layer_norm = source.head.scratch.output_conv2_aux[0][2]
+        shared_layer_norm.weight.copy_(torch.tensor([2.0, 3.0]))
+        shared_layer_norm.bias.copy_(torch.tensor([-1.0, 4.0]))
+    legacy_state = source.state_dict()
+    _save_raw_safetensors_state(legacy_state, legacy_dir)
+
+    assert set(Arc.LEGACY_SAFETENSOR_ALIASES).issubset(legacy_state)
+    restored = _AliasTinyHubArc.from_pretrained(str(legacy_dir))
+
+    restored_layer_norm = restored.head.scratch.output_conv2_aux[0][2]
+    assert torch.equal(
+        restored_layer_norm.weight,
+        torch.tensor([2.0, 3.0]),
+    )
+    assert torch.equal(
+        restored_layer_norm.bias,
+        torch.tensor([-1.0, 4.0]),
+    )
+    assert torch.count_nonzero(
+        restored.backbone.pretrained.time_index_embedding.weight
+    ) == 0
+
+    with pytest.raises(RuntimeError, match="time_index_embedding"):
+        _AliasTinyHubArc.from_pretrained(str(legacy_dir), strict=True)
+
+
+def test_strict_loading_rejects_known_safetensor_aliases(tmp_path):
+    checkpoint_dir = tmp_path / "complete-with-aliases"
+    _save_raw_safetensors_state(
+        _AliasTinyHubArc().state_dict(),
+        checkpoint_dir,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"output_conv2_aux\.1\.2",
+    ):
+        _AliasTinyHubArc.from_pretrained(
+            str(checkpoint_dir),
+            strict=True,
+        )
+
+
+def test_from_pretrained_rejects_conflicting_known_safetensor_alias(tmp_path):
+    checkpoint_dir = tmp_path / "conflicting-alias"
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in _LegacyAliasTinyArc().state_dict().items()
+    }
+    conflicting_alias = "head.scratch.output_conv2_aux.1.2.weight"
+    state[conflicting_alias].add_(1)
+    _save_raw_safetensors_state(state, checkpoint_dir)
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"{conflicting_alias}.*conflicts",
+    ):
+        _AliasTinyHubArc.from_pretrained(str(checkpoint_dir))
+
+
+def test_known_safetensor_aliases_do_not_allow_arbitrary_unexpected_keys(tmp_path):
+    checkpoint_dir = tmp_path / "aliases-with-unexpected"
+    state = {
+        name: tensor.detach().clone()
+        for name, tensor in _LegacyAliasTinyArc().state_dict().items()
+    }
+    state["arbitrary.unexpected"] = torch.zeros(1)
+    _save_raw_safetensors_state(state, checkpoint_dir)
+
+    with pytest.raises(RuntimeError, match="arbitrary.unexpected"):
+        _AliasTinyHubArc.from_pretrained(str(checkpoint_dir))
 
 
 def test_from_pretrained_strictly_loads_a_complete_time_indexed_state(tmp_path):
