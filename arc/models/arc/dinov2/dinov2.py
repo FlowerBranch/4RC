@@ -29,6 +29,7 @@ class DinoV2(nn.Module):
         rope_start: int = -1,
         cat_token: bool = True,
         has_time_token: bool = False,
+        max_time_indices: int = 32,
         **kwargs,
     ):
         super().__init__()
@@ -56,6 +57,7 @@ class DinoV2(nn.Module):
             rope_start=rope_start,
             cat_token=cat_token,
             has_time_token=has_time_token,
+            max_time_indices=max_time_indices,
         )
 
     def forward(self, x, **kwargs):

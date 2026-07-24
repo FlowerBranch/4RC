@@ -107,6 +107,7 @@ class DinoVisionTransformer(nn.Module):
         plus_cam_token=False,
         cat_token=True,
         has_time_token=False,
+        max_time_indices=32,
     ):
         """
         Args:
@@ -132,6 +133,8 @@ class DinoVisionTransformer(nn.Module):
                 positional embeddings
             interpolate_offset: (float) work-around offset to apply when interpolating
                 positional embeddings
+            max_time_indices: Number of learned time-index offsets available when
+                has_time_token is enabled.
         """
         super().__init__()
         self.patch_start_idx = 1
@@ -146,6 +149,11 @@ class DinoVisionTransformer(nn.Module):
         self.rope_start = rope_start
         self.cat_token = cat_token
         self.has_time_token = has_time_token
+        if isinstance(max_time_indices, bool) or not isinstance(max_time_indices, int):
+            raise TypeError("max_time_indices must be a positive integer")
+        if max_time_indices <= 0:
+            raise ValueError("max_time_indices must be a positive integer")
+        self.max_time_indices = max_time_indices
         self.num_tokens = 1
         self.n_blocks = depth
         self.num_heads = num_heads
@@ -163,6 +171,8 @@ class DinoVisionTransformer(nn.Module):
             self.camera_token = nn.Parameter(torch.randn(1, 2, embed_dim))
             if self.has_time_token:
                 self.time_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+                self.time_index_embedding = nn.Embedding(max_time_indices, embed_dim)
+                nn.init.zeros_(self.time_index_embedding.weight)
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         assert num_register_tokens >= 0
         self.register_tokens = (
@@ -299,8 +309,49 @@ class DinoVisionTransformer(nn.Module):
                 pos_nodiff = torch.cat([pos_special, pos_nodiff], dim=2)
         return pos, pos_nodiff
 
+    def _validate_time_indices(self, time_indices, B, S, device):
+        if time_indices is None:
+            return None
+        if not isinstance(time_indices, torch.Tensor):
+            time_indices = torch.as_tensor(time_indices, device=device)
+        else:
+            time_indices = time_indices.to(device=device)
+
+        if (
+            time_indices.dtype == torch.bool
+            or time_indices.is_floating_point()
+            or time_indices.is_complex()
+        ):
+            raise TypeError("time_indices must contain integer values")
+        if time_indices.shape != (B, S):
+            raise ValueError(
+                f"time_indices must have shape ({B}, {S}), got {tuple(time_indices.shape)}"
+            )
+
+        time_indices = time_indices.to(dtype=torch.long)
+        if torch.any(time_indices < 0) or torch.any(time_indices >= self.max_time_indices):
+            min_index = int(time_indices.min().item())
+            max_index = int(time_indices.max().item())
+            raise ValueError(
+                f"time_indices must be in [0, {self.max_time_indices - 1}], "
+                f"got range [{min_index}, {max_index}]"
+            )
+        return time_indices
+
+    def _prepare_time_tokens(self, B, S, time_indices):
+        time_tokens = self.time_token.expand(B, S, -1)
+        if time_indices is not None:
+            time_tokens = time_tokens + self.time_index_embedding(time_indices)
+        return time_tokens.unsqueeze(2)
+
     def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
         B, S, _, H, W = x.shape
+        time_indices = self._validate_time_indices(
+            kwargs.get("time_indices"),
+            B,
+            S,
+            x.device,
+        )
         x = self.prepare_tokens_with_masks(x)
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
@@ -320,6 +371,8 @@ class DinoVisionTransformer(nn.Module):
                 # Reorder views to place reference view first
                 x = reorder_by_reference(x, b_idx)
                 local_x = reorder_by_reference(local_x, b_idx)
+                if time_indices is not None:
+                    time_indices = reorder_by_reference(time_indices, b_idx)
 
             if self.alt_start != -1 and i == self.alt_start:
                 ref_token = self.camera_token[:, :1].expand(B, -1, -1)
@@ -328,7 +381,7 @@ class DinoVisionTransformer(nn.Module):
                 x[:, :, 0] = cam_token
 
                 if self.has_time_token:
-                    time_token = self.time_token.expand(B, S, -1).unsqueeze(2)
+                    time_token = self._prepare_time_tokens(B, S, time_indices)
                     x = torch.cat([x[:, :, :1], time_token, x[:, :, 1:]], dim=2)
 
             if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:

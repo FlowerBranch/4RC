@@ -1,3 +1,4 @@
+import inspect
 import time
 import torch
 import torch.nn as nn
@@ -17,7 +18,6 @@ from arc.models.arc.heads.motiondecoder import MotionDecoder
 from arc.models.arc.heads.dpt_head import DPTHead
 
 from arc.dust3r.utils.image import ImgRenormalize
-from arc.dust3r.utils.misc import freeze_all_params
 from arc.models.arc.utils.geometry import unproject_depth_map_to_point_map
 
 
@@ -28,9 +28,28 @@ class Arc(
     repo_url="https://github.com/Luo-Yihang/4RC",
 ):
     PATCH_SIZE = 14
+    TIME_INDEX_KEY = "time_index"
+    LEGACY_CHECKPOINT_MISSING_KEYS = (
+        "backbone.pretrained.time_index_embedding.weight",
+    )
 
-    def __init__(self, freeze="none", motion_decoder_depth=4, motion_decoder_has_self_attention=True, motion_decoder_has_cross_attention=True, motion_decoder_use_adaln=True, track_head_activation="inv_log"):
+    def __init__(
+        self,
+        freeze="none",
+        motion_decoder_depth=4,
+        motion_decoder_has_self_attention=True,
+        motion_decoder_has_cross_attention=True,
+        motion_decoder_use_adaln=True,
+        track_head_activation="inv_log",
+        max_time_indices=32,
+    ):
         super().__init__()
+
+        if isinstance(max_time_indices, bool) or not isinstance(max_time_indices, int):
+            raise TypeError("max_time_indices must be a positive integer")
+        if max_time_indices <= 0:
+            raise ValueError("max_time_indices must be a positive integer")
+        self.max_time_indices = max_time_indices
 
         self.backbone = DinoV2(
             name="vitg",
@@ -40,6 +59,7 @@ class Arc(
             rope_start=13,
             cat_token=True,
             has_time_token=True,
+            max_time_indices=max_time_indices,
         )
 
         self.head = DualDPT(
@@ -74,8 +94,59 @@ class Arc(
         images = ImgRenormalize(images)
         track_query_idx = 0 if "track_query_idx" not in views[0] else views[0]["track_query_idx"]
         track_query_idx_list = self._normalize_track_query_idx(track_query_idx, images.shape[1])
+        time_indices = self._preprocess_time_indices(
+            views,
+            batch_size=images.shape[0],
+            device=images.device,
+        )
 
-        return images, track_query_idx_list
+        return images, track_query_idx_list, time_indices
+
+    def _preprocess_time_indices(self, views, batch_size, device):
+        has_time_index = [self.TIME_INDEX_KEY in view for view in views]
+        if not any(has_time_index):
+            return None
+        if not all(has_time_index):
+            raise ValueError(
+                f"Either every view must provide '{self.TIME_INDEX_KEY}' or none may provide it"
+            )
+
+        per_view_indices = []
+        for view_idx, view in enumerate(views):
+            value = view[self.TIME_INDEX_KEY]
+            try:
+                value = torch.as_tensor(value, device=device)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"View {view_idx} '{self.TIME_INDEX_KEY}' must contain integer values"
+                ) from exc
+
+            if value.dtype == torch.bool or value.is_floating_point() or value.is_complex():
+                raise TypeError(
+                    f"View {view_idx} '{self.TIME_INDEX_KEY}' must contain integer values"
+                )
+
+            if value.numel() == 1:
+                value = value.reshape(1).expand(batch_size)
+            elif value.numel() == batch_size:
+                value = value.reshape(batch_size)
+            else:
+                raise ValueError(
+                    f"View {view_idx} '{self.TIME_INDEX_KEY}' must be a scalar or contain "
+                    f"one value per batch element ({batch_size}), got {value.numel()}"
+                )
+
+            per_view_indices.append(value.to(dtype=torch.long))
+
+        time_indices = torch.stack(per_view_indices, dim=1)
+        if torch.any(time_indices < 0) or torch.any(time_indices >= self.max_time_indices):
+            min_index = int(time_indices.min().item())
+            max_index = int(time_indices.max().item())
+            raise ValueError(
+                f"'{self.TIME_INDEX_KEY}' values must be in [0, {self.max_time_indices - 1}], "
+                f"got range [{min_index}, {max_index}]"
+            )
+        return time_indices
 
     def _normalize_track_query_idx(self, track_query_idx, num_views):
         if isinstance(track_query_idx, torch.Tensor):
@@ -182,12 +253,115 @@ class Arc(
         return output_list
 
     def set_freeze(self, freeze):
+        supported_modes = {"none", "temporal_tracking"}
+        if freeze not in supported_modes:
+            raise ValueError(
+                f"Unknown freeze mode '{freeze}'. Expected one of {sorted(supported_modes)}"
+            )
+
+        self.requires_grad_(True)
+        if freeze == "temporal_tracking":
+            self.requires_grad_(False)
+            self.backbone.pretrained.time_index_embedding.requires_grad_(True)
+            self.motion_decoder.requires_grad_(True)
+            self.track_head.requires_grad_(True)
+
         self.freeze = freeze
-        to_be_frozen = {
-            "none": [],
+
+    def get_trainable_parameter_report(self):
+        parameters = [
+            (name, parameter.numel())
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+        ]
+        return {
+            "parameters": parameters,
+            "tensor_count": len(parameters),
+            "parameter_count": sum(count for _, count in parameters),
         }
-        if freeze in to_be_frozen:
-             freeze_all_params(to_be_frozen[freeze])
+
+    @classmethod
+    def _validate_checkpoint_incompatibility(
+        cls,
+        missing_keys,
+        unexpected_keys,
+        *,
+        strict,
+    ):
+        missing_keys = set(missing_keys)
+        unexpected_keys = set(unexpected_keys)
+        allowed_missing_keys = (
+            set()
+            if strict
+            else set(cls.LEGACY_CHECKPOINT_MISSING_KEYS)
+        )
+        invalid_missing_keys = missing_keys - allowed_missing_keys
+
+        if invalid_missing_keys or unexpected_keys:
+            details = []
+            if invalid_missing_keys:
+                details.append(
+                    f"missing keys: {sorted(invalid_missing_keys)}"
+                )
+            if unexpected_keys:
+                details.append(
+                    f"unexpected keys: {sorted(unexpected_keys)}"
+                )
+            raise RuntimeError(
+                "Checkpoint is incompatible with Arc; " + "; ".join(details)
+            )
+
+    @classmethod
+    def _load_as_safetensor(
+        cls,
+        model,
+        model_file,
+        map_location,
+        strict,
+    ):
+        from safetensors.torch import load_model
+
+        load_kwargs = {"strict": False}
+        supports_device = "device" in inspect.signature(load_model).parameters
+        if supports_device:
+            load_kwargs["device"] = map_location
+
+        missing_keys, unexpected_keys = load_model(
+            model,
+            model_file,
+            **load_kwargs,
+        )
+        if not supports_device and str(map_location) != "cpu":
+            model.to(map_location)
+
+        cls._validate_checkpoint_incompatibility(
+            missing_keys,
+            unexpected_keys,
+            strict=strict,
+        )
+        return model
+
+    @classmethod
+    def _load_as_pickle(
+        cls,
+        model,
+        model_file,
+        map_location,
+        strict,
+    ):
+        state_dict = torch.load(
+            model_file,
+            map_location=torch.device(map_location),
+            weights_only=True,
+        )
+        incompatibility = model.load_state_dict(state_dict, strict=False)
+        cls._validate_checkpoint_incompatibility(
+            incompatibility.missing_keys,
+            incompatibility.unexpected_keys,
+            strict=strict,
+        )
+        model.eval()
+        return model
     
     def forward(
         self,
@@ -202,9 +376,15 @@ class Arc(
             profiling_info = {} if profiling else None
             start_time = time.time()
 
-        images, track_query_idx = self._preprocess_input(views)
+        images, track_query_idx, time_indices = self._preprocess_input(views)
 
-        predictions = self._forward(images, track_query_idx, inference_track=inference_track, **kwargs)
+        predictions = self._forward(
+            images,
+            track_query_idx,
+            inference_track=inference_track,
+            time_indices=time_indices,
+            **kwargs,
+        )
         
         if not self.training and not force_no_output_conversion:
             predictions = self._postprocess_output(predictions, use_ray_pose)
@@ -221,9 +401,12 @@ class Arc(
         track_query_idx,
         ref_view_strategy: str = "first",
         inference_track: bool = True,
+        time_indices=None,
     ) -> Dict[str, torch.Tensor]:
         feats, _ = self.backbone(
-            x, ref_view_strategy=ref_view_strategy,
+            x,
+            ref_view_strategy=ref_view_strategy,
+            time_indices=time_indices,
         )
         H, W = x.shape[-2], x.shape[-1]
 
