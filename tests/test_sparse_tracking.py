@@ -668,6 +668,73 @@ def test_known_sim3_is_recovered_and_detached(dumped_scene, monkeypatch):
     assert not fitted.translation.requires_grad
 
 
+def test_predicted_pointmaps_stay_float32_inside_bfloat16_autocast(monkeypatch):
+    depth = torch.ones(1, 2, 4, 5, dtype=torch.bfloat16)
+    pose_encoding = torch.ones(1, 2, 9, dtype=torch.bfloat16)
+
+    def fake_pose_conversion(converted_pose, image_shape):
+        assert converted_pose.dtype == torch.float32
+        assert image_shape == (4, 5)
+        camera_to_world = torch.eye(4).expand(1, 2, 4, 4).clone()
+        intrinsics = torch.eye(3).expand(1, 2, 3, 3).clone()
+        return camera_to_world, intrinsics
+
+    def fake_unproject(converted_depth, intrinsics, camera_to_world):
+        assert converted_depth.dtype == torch.float32
+        # Matmul is deliberately autocast-sensitive. The alignment helper must
+        # disable the caller's BF16 autocast before reaching this operation.
+        marker = torch.ones(1, 1, dtype=torch.float32)
+        marker = marker @ marker
+        return marker * torch.ones(1, 2, 4, 5, 3, dtype=torch.float32)
+
+    monkeypatch.setattr(
+        sparse_module,
+        "pose_encoding_to_extri_intri",
+        fake_pose_conversion,
+    )
+    monkeypatch.setattr(sparse_module, "as_homogeneous", lambda value: value)
+    monkeypatch.setattr(sparse_module, "unproject_depth", fake_unproject)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        pointmaps = sparse_module._predicted_pointmaps(
+            {"depth": depth, "pose_enc": pose_encoding}
+        )
+
+    assert pointmaps.dtype == torch.float32
+    assert pointmaps.numpy().dtype == np.float32
+
+
+def test_detached_sim3_stays_float32_inside_bfloat16_autocast():
+    points = torch.tensor(
+        [[1.0, 2.0, 3.0], [-2.0, 0.5, 4.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    vectors = torch.tensor(
+        [[0.25, -0.5, 1.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        alignment = DetachedSim3(
+            scale=torch.tensor(2.0, dtype=torch.float32),
+            rotation=torch.eye(3, dtype=torch.float32),
+            translation=torch.tensor([0.1, 0.2, 0.3], dtype=torch.float32),
+        ).to(device=torch.device("cpu"), dtype=torch.float32)
+        transformed_points = alignment.apply_points(points)
+        transformed_vectors = alignment.apply_vectors(vectors)
+        loss = transformed_points.sum() + transformed_vectors.sum()
+
+    assert transformed_points.dtype == torch.float32
+    assert transformed_vectors.dtype == torch.float32
+    loss.backward()
+    assert points.grad is not None
+    assert vectors.grad is not None
+    assert torch.isfinite(points.grad).all()
+    assert torch.isfinite(vectors.grad).all()
+
+
 def test_correspondence_is_direct_projection_and_detached(dumped_scene):
     correspondences = build_anchor_correspondences(dumped_scene)
 

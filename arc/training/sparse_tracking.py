@@ -50,20 +50,29 @@ class DetachedSim3:
             raise ValueError("Sim(3) contains NaN or Inf")
         if scale <= 0:
             raise ValueError(f"Sim(3) scale must be positive, got {scale.item()}")
-        identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
-        if not torch.allclose(rotation @ rotation.mT, identity, atol=1e-4, rtol=1e-4):
-            raise ValueError("Sim(3) rotation is not orthonormal")
-        determinant = torch.linalg.det(rotation)
-        if not torch.allclose(
-            determinant,
-            torch.ones_like(determinant),
-            atol=1e-4,
-            rtol=1e-4,
-        ):
-            raise ValueError(
-                "Sim(3) rotation must be proper (determinant +1), got "
-                f"{determinant.item()}"
-            )
+        # Sim(3) validation is a detached numerical side path. An enclosing
+        # mixed-precision context must not autocast the rotation product to
+        # BF16 while leaving the comparison identity in float32.
+        with torch.autocast(device_type=rotation.device.type, enabled=False):
+            identity = torch.eye(3, dtype=rotation.dtype, device=rotation.device)
+            if not torch.allclose(
+                rotation @ rotation.mT,
+                identity,
+                atol=1e-4,
+                rtol=1e-4,
+            ):
+                raise ValueError("Sim(3) rotation is not orthonormal")
+            determinant = torch.linalg.det(rotation)
+            if not torch.allclose(
+                determinant,
+                torch.ones_like(determinant),
+                atol=1e-4,
+                rtol=1e-4,
+            ):
+                raise ValueError(
+                    "Sim(3) rotation must be proper (determinant +1), got "
+                    f"{determinant.item()}"
+                )
         object.__setattr__(self, "scale", scale)
         object.__setattr__(self, "rotation", rotation)
         object.__setattr__(self, "translation", translation)
@@ -76,10 +85,12 @@ class DetachedSim3:
         )
 
     def apply_points(self, points: torch.Tensor) -> torch.Tensor:
-        return self.scale * (points @ self.rotation.mT) + self.translation
+        with torch.autocast(device_type=points.device.type, enabled=False):
+            return self.scale * (points @ self.rotation.mT) + self.translation
 
     def apply_vectors(self, vectors: torch.Tensor) -> torch.Tensor:
-        return self.scale * (vectors @ self.rotation.mT)
+        with torch.autocast(device_type=vectors.device.type, enabled=False):
+            return self.scale * (vectors @ self.rotation.mT)
 
 
 @dataclass(frozen=True)
@@ -243,7 +254,13 @@ def _predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
             f"{tuple(pose_encoding.shape)}"
         )
 
-    with torch.no_grad():
+    # Scene alignment is a detached numerical side path. Keep its geometry in
+    # float32 even when the caller is inside mixed-precision autocast; otherwise
+    # unprojection can return BF16 and NumPy cannot consume it below.
+    with torch.no_grad(), torch.autocast(
+        device_type=depth.device.type,
+        enabled=False,
+    ):
         depth = depth.detach().float()
         pose_encoding = pose_encoding.detach().float()
         height, width = depth.shape[-2:]
