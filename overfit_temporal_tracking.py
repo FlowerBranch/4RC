@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""One-scene sparse temporal-tracking overfit for dumped MVTracker data.
+
+This is deliberately a direct PyTorch smoke harness, not a general trainer.
+It loads the released reconstruction model, freezes it with the existing
+``temporal_tracking`` preset, fits one detached scene Sim(3) per forward, and
+optimizes sparse postprocess-equivalent track positions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from contextlib import nullcontext
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from arc.training import (
+    build_anchor_correspondences,
+    fit_scene_sim3,
+    gather_query_anchor_points,
+    load_dumped_kubric_scene,
+    save_temporal_tracking_checkpoint,
+    sparse_tracking_loss,
+)
+
+
+EXPECTED_TRAINABLE_TENSORS = 231
+EXPECTED_NON_TEMPORAL_EMBEDDING_PARAMETERS = 314_551_588
+TIME_EMBEDDING_DIM = 1536
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Overfit 4RC sparse temporal tracking on one dumped scene"
+    )
+    parser.add_argument("--checkpoint_dir")
+    parser.add_argument("--data_root", required=True)
+    parser.add_argument("--scene", required=True)
+    parser.add_argument("--cameras", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--times", type=int, nargs="+", default=[0, 1, 2, 3])
+    parser.add_argument("--max_time_indices", type=int, default=32)
+    parser.add_argument(
+        "--query_camera",
+        type=int,
+        help="Selected camera that owns the dense query field (default: first)",
+    )
+    parser.add_argument(
+        "--query_time",
+        type=int,
+        help="Selected original query frame (default: first selected time)",
+    )
+    parser.add_argument("--steps", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--output_dir")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--precision",
+        choices=("32", "16-mixed", "bf16-mixed"),
+        default="bf16-mixed",
+    )
+    parser.add_argument("--huber_delta_m", type=float, default=0.05)
+    parser.add_argument(
+        "--parse_only",
+        action="store_true",
+        help=(
+            "Load and validate the selected MVTracker dump without requiring "
+            "a checkpoint or CUDA"
+        ),
+    )
+    return parser
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    if not args.cameras:
+        raise ValueError("--cameras must contain at least one camera")
+    if len(set(args.cameras)) != len(args.cameras):
+        raise ValueError("--cameras must not contain duplicates")
+    if any(camera < 0 for camera in args.cameras):
+        raise ValueError("--cameras must contain non-negative integers")
+    if not args.times:
+        raise ValueError("--times must contain at least one frame")
+    if len(set(args.times)) != len(args.times):
+        raise ValueError("--times must not contain duplicates")
+    if any(time < 0 for time in args.times):
+        raise ValueError("--times must contain non-negative integers")
+    if any(later <= earlier for earlier, later in zip(args.times, args.times[1:])):
+        raise ValueError("--times must be strictly increasing")
+    if args.max_time_indices <= 0:
+        raise ValueError("--max_time_indices must be positive")
+    if len(args.times) > args.max_time_indices:
+        raise ValueError(
+            f"Selected {len(args.times)} semantic times, but "
+            f"--max_time_indices={args.max_time_indices}"
+        )
+
+    query_camera = (
+        args.cameras[0] if args.query_camera is None else args.query_camera
+    )
+    query_time = args.times[0] if args.query_time is None else args.query_time
+    if query_camera not in args.cameras:
+        raise ValueError("--query_camera must be one of --cameras")
+    if query_time not in args.times:
+        raise ValueError("--query_time must be one of --times")
+
+    if args.parse_only:
+        return
+    if not args.checkpoint_dir:
+        raise ValueError("--checkpoint_dir is required unless --parse_only is set")
+    if not args.output_dir:
+        raise ValueError("--output_dir is required unless --parse_only is set")
+    if args.steps <= 0:
+        raise ValueError("--steps must be positive")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        raise ValueError("--lr must be finite and positive")
+    if not math.isfinite(args.huber_delta_m) or args.huber_delta_m <= 0:
+        raise ValueError("--huber_delta_m must be finite and positive")
+    if query_time != 0:
+        raise ValueError(
+            "Sparse training requires --query_time 0 because the dump contains "
+            "only depth0. Use --parse_only for other windows."
+        )
+
+
+def _validate_scene_layout(scene) -> None:
+    expected_observations = len(scene.cameras) * len(scene.times)
+    if scene.num_observations != expected_observations:
+        raise RuntimeError(
+            f"Expected {expected_observations} camera/time observations, got "
+            f"{scene.num_observations}"
+        )
+    expected_times = tuple(range(len(scene.times))) * len(scene.cameras)
+    if scene.time_indices != expected_times:
+        raise RuntimeError(
+            f"Unexpected camera-major time mapping {scene.time_indices}; "
+            f"expected {expected_times}"
+        )
+    expected_pairs = [
+        (camera, original_time)
+        for camera in scene.cameras
+        for original_time in scene.times
+    ]
+    actual_pairs = [
+        (observation.camera, observation.original_time)
+        for observation in scene.observations
+    ]
+    if actual_pairs != expected_pairs:
+        raise RuntimeError(
+            f"Unexpected camera/time observation order {actual_pairs}; "
+            f"expected {expected_pairs}"
+        )
+
+
+def _print_parse_report(scene) -> None:
+    query = scene.observations[scene.query_observation_slot]
+    print(f"scene={scene.name}")
+    print(f"cameras={list(scene.cameras)}")
+    print(f"original_times={list(scene.times)}")
+    print(f"time_indices={list(scene.time_indices)}")
+    print(f"observations={scene.num_observations}")
+    print(
+        "query_observation="
+        f"slot {query.slot}, camera {query.camera}, "
+        f"original_time {query.original_time}"
+    )
+    for observation, view in zip(scene.observations, scene.views):
+        print(
+            f"slot={observation.slot} camera={observation.camera} "
+            f"original_time={observation.original_time} "
+            f"time_index={observation.semantic_time_index} "
+            f"image_shape={tuple(view['img'].shape)} path={observation.path}"
+        )
+    print(
+        "metadata_shapes="
+        f"query_points{tuple(scene.query_points.shape)} "
+        f"trajectories{tuple(scene.trajectories_world.shape)} "
+        f"visibility{tuple(scene.visibility.shape)} "
+        f"intrinsics{tuple(scene.intrinsics.shape)} "
+        f"extrinsics{tuple(scene.extrinsics_world_to_camera.shape)} "
+        f"depth0{tuple(scene.depth0.shape)}"
+    )
+    print(f"track_upscaling_factor={scene.track_upscaling_factor}")
+    print("PASS mvtracker dump parsing")
+
+
+def _autocast_context(precision: str):
+    if precision == "32":
+        return nullcontext()
+    dtype = torch.float16 if precision == "16-mixed" else torch.bfloat16
+    return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _gradient_norm(parameters) -> float:
+    squared_norm = torch.zeros((), device="cuda", dtype=torch.float32)
+    found = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        found = True
+        squared_norm += parameter.grad.detach().float().square().sum()
+    return float(torch.sqrt(squared_norm).item()) if found else 0.0
+
+
+def _assert_frozen_gradients_absent(model) -> None:
+    offenders = [
+        name
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and parameter.grad is not None
+    ]
+    if offenders:
+        raise RuntimeError(
+            "Frozen parameters received gradients: " + ", ".join(offenders[:10])
+        )
+
+
+def _assert_trainable_gradients_finite(model) -> None:
+    missing = []
+    non_finite = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            missing.append(name)
+        elif not torch.isfinite(parameter.grad).all():
+            non_finite.append(name)
+    if missing or non_finite:
+        details = []
+        if missing:
+            details.append(f"missing gradients: {missing[:10]}")
+        if non_finite:
+            details.append(f"non-finite gradients: {non_finite[:10]}")
+        raise RuntimeError("Invalid trainable gradients; " + "; ".join(details))
+
+
+def _move_views_to_cuda(views: list[dict]) -> None:
+    for view in views:
+        for key in ("img", "time_index", "track_query_idx"):
+            view[key] = view[key].to("cuda", non_blocking=True)
+
+
+def _tracking_only(raw_predictions: dict) -> dict:
+    """Drop unused reconstruction branches promptly to reduce retained memory."""
+
+    return {
+        "track_multi": raw_predictions["track_multi"],
+        "track_query_idx": raw_predictions["track_query_idx"],
+    }
+
+
+def _evaluate(model, scene, correspondences, precision, huber_delta_m):
+    model.eval()
+    with torch.no_grad(), _autocast_context(precision):
+        raw = model(scene.views, force_no_output_conversion=True)
+        alignment, alignment_report = fit_scene_sim3(raw, scene)
+        query_anchors = gather_query_anchor_points(
+            raw,
+            scene,
+            correspondences,
+        )
+        raw = _tracking_only(raw)
+        result = sparse_tracking_loss(
+            raw,
+            scene,
+            correspondences,
+            alignment,
+            query_anchors,
+            huber_delta_m=huber_delta_m,
+        )
+    return (
+        float(result.loss.item()),
+        float(result.metric_error.item()),
+        alignment,
+        alignment_report,
+    )
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    try:
+        _validate_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    scene = load_dumped_kubric_scene(
+        args.data_root,
+        args.scene,
+        cameras=args.cameras,
+        times=args.times,
+        query_camera=args.query_camera,
+        query_time=args.query_time,
+        verbose=True,
+    )
+    _validate_scene_layout(scene)
+    if args.parse_only:
+        _print_parse_report(scene)
+        return
+    query_observation = scene.observations[scene.query_observation_slot]
+    print(
+        "input_layout="
+        f"{len(scene.cameras)} cameras x {len(scene.times)} times = "
+        f"{scene.num_observations} observations; "
+        f"time_indices={list(scene.time_indices)}; "
+        f"query=(camera {query_observation.camera}, "
+        f"time {query_observation.original_time}, "
+        f"slot {query_observation.slot})"
+    )
+    if not torch.cuda.is_available():
+        parser.error("A CUDA GPU is required for the released 4RC model")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    from arc.models.arc import Arc
+
+    model = Arc.from_pretrained(
+        args.checkpoint_dir,
+        max_time_indices=args.max_time_indices,
+    ).to("cuda")
+    model.set_freeze("temporal_tracking")
+    report = model.get_trainable_parameter_report()
+    expected_parameter_count = (
+        EXPECTED_NON_TEMPORAL_EMBEDDING_PARAMETERS
+        + args.max_time_indices * TIME_EMBEDDING_DIM
+    )
+    if (
+        report["tensor_count"] != EXPECTED_TRAINABLE_TENSORS
+        or report["parameter_count"] != expected_parameter_count
+    ):
+        raise RuntimeError(
+            "Unexpected temporal_tracking parameter set: "
+            f"{report['tensor_count']} tensors / "
+            f"{report['parameter_count']} parameters; expected "
+            f"{EXPECTED_TRAINABLE_TENSORS} / {expected_parameter_count}"
+        )
+    print(
+        "trainable="
+        f"{report['tensor_count']} tensors / {report['parameter_count']} parameters"
+    )
+
+    _move_views_to_cuda(scene.views)
+    model.eval()
+    with torch.no_grad(), _autocast_context(args.precision):
+        initial_raw = model(scene.views, force_no_output_conversion=True)
+    if initial_raw["track_multi"].shape[2] != scene.num_observations:
+        raise RuntimeError(
+            "Initial output observation axis does not match the selected inputs"
+        )
+    initial_alignment, initial_alignment_report = fit_scene_sim3(
+        initial_raw,
+        scene,
+    )
+    correspondences = build_anchor_correspondences(scene)
+    initial_query_anchors = gather_query_anchor_points(
+        initial_raw,
+        scene,
+        correspondences,
+    )
+    initial_result = sparse_tracking_loss(
+        _tracking_only(initial_raw),
+        scene,
+        correspondences,
+        initial_alignment,
+        initial_query_anchors,
+        huber_delta_m=args.huber_delta_m,
+    )
+    initial_loss = float(initial_result.loss.item())
+    initial_error = float(initial_result.metric_error.item())
+    del initial_raw, initial_query_anchors, initial_result
+    print(
+        "alignment="
+        f"{initial_alignment_report['pair_count']} pairs, "
+        f"{initial_alignment_report['median_residual_metric']:.6f} m median residual, "
+        f"scale={initial_alignment_report['scale']:.6f}"
+    )
+    print(f"eligible_queries={correspondences.count}")
+
+    embedding = model.backbone.pretrained.time_index_embedding
+    initial_embedding = embedding.weight.detach().clone()
+    initial_embedding_norm = float(initial_embedding.float().norm().item())
+
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    # No regularizer is part of this proof: in particular, do not move the
+    # unsupervised confidence output through decoupled weight decay.
+    optimizer = torch.optim.AdamW(parameters, lr=args.lr, weight_decay=0.0)
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=args.precision == "16-mixed"
+    )
+    torch.cuda.reset_peak_memory_stats()
+
+    last_gradient_norms = None
+    for step in range(args.steps):
+        # Root/backbone training mode enables DINO activation checkpointing and
+        # the memory-safe one-frame track-head chunk. ViT-G has zero drop path.
+        model.train()
+        model.head.eval()
+        model.cam_dec.eval()
+        model.motion_decoder.train()
+        model.track_head.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        with _autocast_context(args.precision):
+            raw = model(scene.views, force_no_output_conversion=True)
+            if raw["track_multi"].shape[2] != scene.num_observations:
+                raise RuntimeError(
+                    "Output observation axis changed during optimization"
+                )
+            alignment, alignment_report = fit_scene_sim3(raw, scene)
+            query_anchors = gather_query_anchor_points(
+                raw,
+                scene,
+                correspondences,
+            )
+            raw = _tracking_only(raw)
+            result = sparse_tracking_loss(
+                raw,
+                scene,
+                correspondences,
+                alignment,
+                query_anchors,
+                huber_delta_m=args.huber_delta_m,
+            )
+
+        scaler.scale(result.loss).backward()
+        scaler.unscale_(optimizer)
+        _assert_trainable_gradients_finite(model)
+        embedding_gradient = embedding.weight.grad
+        if embedding_gradient is None:
+            raise RuntimeError("Temporal embedding received no gradient")
+        if not torch.isfinite(embedding_gradient).all():
+            raise FloatingPointError("Temporal embedding gradient is NaN or Inf")
+
+        last_gradient_norms = {
+            "time_embedding": _gradient_norm(embedding.parameters()),
+            "motion_decoder": _gradient_norm(model.motion_decoder.parameters()),
+            "track_head": _gradient_norm(model.track_head.parameters()),
+        }
+        if last_gradient_norms["time_embedding"] == 0:
+            raise RuntimeError("Temporal embedding gradient norm is zero")
+        if (
+            last_gradient_norms["motion_decoder"] == 0
+            or last_gradient_norms["track_head"] == 0
+        ):
+            raise RuntimeError(
+                "MotionDecoder or track-head gradient norm is zero"
+            )
+        _assert_frozen_gradients_absent(model)
+        scaler.step(optimizer)
+        scaler.update()
+
+        print(
+            f"step={step + 1}/{args.steps} "
+            f"loss={result.loss.detach().item():.8f} "
+            f"metric_error_m={result.metric_error.detach().item():.8f} "
+            f"grad_time={last_gradient_norms['time_embedding']:.6g} "
+            f"grad_motion={last_gradient_norms['motion_decoder']:.6g} "
+            f"grad_track={last_gradient_norms['track_head']:.6g}"
+        )
+
+    final_loss, final_error, final_alignment, final_alignment_report = _evaluate(
+        model,
+        scene,
+        correspondences,
+        args.precision,
+        args.huber_delta_m,
+    )
+    embedding_norm = float(embedding.weight.detach().float().norm().item())
+    embedding_change = float(
+        (embedding.weight.detach() - initial_embedding).float().norm().item()
+    )
+    if embedding_change == 0:
+        raise RuntimeError("Temporal embedding did not change")
+    if not final_loss < initial_loss:
+        raise RuntimeError(
+            "One-scene overfit did not reduce position loss: "
+            f"initial={initial_loss:.8f}, final={final_loss:.8f}"
+        )
+    peak_memory_bytes = int(torch.cuda.max_memory_allocated())
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model.set_freeze("temporal_tracking")
+    checkpoint_path = save_temporal_tracking_checkpoint(
+        model,
+        output_dir / "temporal_tracking.pt",
+    )
+    summary = {
+        "scene": args.scene,
+        "cameras": args.cameras,
+        "times": args.times,
+        "observation_count": scene.num_observations,
+        "time_indices": list(scene.time_indices),
+        "max_time_indices": args.max_time_indices,
+        "query_observation_slot": scene.query_observation_slot,
+        "query_camera": query_observation.camera,
+        "query_time": query_observation.original_time,
+        "eligible_query_count": correspondences.count,
+        "initial_alignment": initial_alignment_report,
+        "initial_alignment_scale": float(initial_alignment.scale.item()),
+        "initial_alignment_rotation": initial_alignment.rotation.tolist(),
+        "initial_alignment_translation": initial_alignment.translation.tolist(),
+        "final_alignment": final_alignment_report,
+        "final_alignment_scale": float(final_alignment.scale.item()),
+        "final_alignment_rotation": final_alignment.rotation.tolist(),
+        "final_alignment_translation": final_alignment.translation.tolist(),
+        "initial_position_loss": initial_loss,
+        "final_position_loss": final_loss,
+        "initial_metric_error_m": initial_error,
+        "final_metric_error_m": final_error,
+        "initial_temporal_embedding_norm": initial_embedding_norm,
+        "final_temporal_embedding_norm": embedding_norm,
+        "temporal_embedding_change": embedding_change,
+        "gradient_norms": last_gradient_norms,
+        "trainable_tensor_count": report["tensor_count"],
+        "trainable_parameter_count": report["parameter_count"],
+        "peak_gpu_memory_bytes": peak_memory_bytes,
+        "checkpoint_path": str(checkpoint_path),
+        "seed": args.seed,
+        "precision": args.precision,
+        "steps": args.steps,
+        "learning_rate": args.lr,
+    }
+    summary_path = output_dir / "run_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+    print(f"initial_position_loss={initial_loss:.8f}")
+    print(f"final_position_loss={final_loss:.8f}")
+    print(f"initial_metric_error_m={initial_error:.8f}")
+    print(f"final_metric_error_m={final_error:.8f}")
+    print(
+        "temporal_embedding="
+        f"norm {embedding_norm:.8f}, change {embedding_change:.8f}"
+    )
+    print(f"frozen_gradients=PASS")
+    print(f"peak_gpu_memory_bytes={peak_memory_bytes}")
+    print(f"checkpoint={checkpoint_path}")
+    print(f"summary={summary_path}")
+    print("PASS temporal_tracking one-scene overfit")
+
+
+if __name__ == "__main__":
+    main()
