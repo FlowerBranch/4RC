@@ -1,0 +1,47 @@
+{
+  "include": ["."],
+  "exclude": [
+    "arc/croco",
+    "arc/dust3r",
+    "arc/models/arc/dinov2",
+    "arc/models/arc/layers",
+    "examples",
+    "assets",
+
+    "**/.*",
+    ".venv",
+    "**/node_modules",
+    "**/__pycache__"
+  ],
+
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+
+  "reportUnboundVariable": "error",
+  "reportUndefinedVariable": "error",
+  "reportRedeclaration": "warning",
+  "reportInvalidStringEscapeSequence": "warning",
+  "reportSelfClsParameterName": "warning",
+  "reportUnsupportedDunderAll": "warning",
+
+  "reportPossiblyUnboundVariable": "none",
+  "reportMissingImports": "none",
+  "reportArgumentType": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportCallIssue": "none",
+  "reportIndexIssue": "none",
+  "reportAssignmentType": "none",
+  "reportIncompatibleMethodOverride": "none",
+  "reportOperatorIssue": "none",
+  "reportReturnType": "none",
+  "reportGeneralTypeIssues": "none",
+
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalIterable": "none",
+  "reportOptionalCall": "none",
+  "reportOptionalOperand": "none",
+  "reportInvalidTypeArguments": "none"
+}

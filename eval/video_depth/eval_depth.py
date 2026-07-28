@@ -38,7 +38,7 @@ def main(args):
     if args.eval_dataset == "sintel":
         TAG_FLOAT = 202021.25
 
-        def depth_read(filename):
+        def depth_read_sintel(filename):
             """Read depth data from file, return as numpy array."""
             f = open(filename, "rb")
             check = np.fromfile(f, dtype=np.float32, count=1)[0]
@@ -107,7 +107,7 @@ def main(args):
                 gt_pathes = grouped_gt_depth[key.replace("_pred_depth", "")]
 
                 gt_depth = np.stack(
-                    [depth_read(gt_path) for gt_path in gt_pathes], axis=0
+                    [depth_read_sintel(gt_path) for gt_path in gt_pathes], axis=0
                 )
                 pr_depth = np.stack(
                     [
@@ -174,7 +174,7 @@ def main(args):
         get_video_results()
     elif args.eval_dataset == "bonn":
 
-        def depth_read(filename):
+        def depth_read_bonn(filename):
             # loads depth map D from png file
             # and returns it as a numpy array
             depth_png = np.asarray(Image.open(filename))
@@ -215,7 +215,7 @@ def main(args):
                 pd_pathes = grouped_pred_depth[key[10:]]
                 gt_pathes = grouped_gt_depth[key]
                 gt_depth = np.stack(
-                    [depth_read(gt_path) for gt_path in gt_pathes], axis=0
+                    [depth_read_bonn(gt_path) for gt_path in gt_pathes], axis=0
                 )
                 pr_depth = np.stack(
                     [
@@ -284,7 +284,7 @@ def main(args):
         get_video_results()
     elif args.eval_dataset == "kitti":
 
-        def depth_read(filename):
+        def depth_read_kitti(filename):
             # loads depth map D from png file
             # and returns it as a numpy array,
             # for details see readme.txt
@@ -314,7 +314,7 @@ def main(args):
                 pd_pathes = grouped_pred_depth[key]
                 gt_pathes = grouped_gt_depth[key]
                 gt_depth = np.stack(
-                    [depth_read(gt_path) for gt_path in gt_pathes], axis=0
+                    [depth_read_kitti(gt_path) for gt_path in gt_pathes], axis=0
                 )
                 pr_depth = np.stack(
                     [
