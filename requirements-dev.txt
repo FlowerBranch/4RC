@@ -1,0 +1,27 @@
+# Lean CPU environment for running the test suite and the no-GPU verification
+# steps locally. The cluster env is built from requirements.txt instead
+# (see 4I4/triton/4rc/setup_env.sh: python=3.11, torch from the cu126 index).
+#
+#   uv venv --python 3.11 .venv
+#   uv pip install -r requirements-dev.txt
+#
+# Only packages reachable from arc/training, arc/models/arc, arc/dust3r/utils,
+# inference.py, overfit_temporal_tracking.py and tests/ are listed here.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch
+torchvision
+numpy
+scipy
+einops
+addict
+huggingface_hub
+# Listed explicitly rather than via huggingface-hub[torch]: the alias tests call
+# pytest.importorskip("safetensors") and would otherwise skip silently.
+safetensors
+Pillow
+opencv-python
+matplotlib
+tqdm
+pytest

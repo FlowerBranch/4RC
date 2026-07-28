@@ -391,6 +391,16 @@ def load_dumped_kubric_scene(
                 f"{(transform.output_height, transform.output_width)}, loaded "
                 f"{(actual_height, actual_width)}"
             )
+        # load_images numbers its outputs from its own counter, so this catches a
+        # loader that reordered or dropped images. The shape check above cannot:
+        # every observation in a window is required to share one processed shape,
+        # so a permuted list passes it while every slot holds the wrong picture.
+        if view.get("idx") != slot:
+            raise RuntimeError(
+                f"Observation slot {slot} carries loader index "
+                f"{view.get('idx')!r} for {path}; the loaded images and the "
+                "camera/time grid are out of step"
+            )
         view["time_index"] = torch.tensor(
             [semantic_time_index],
             dtype=torch.long,

@@ -10,6 +10,7 @@ import torch
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".wmv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 TIME_INDEX_KEY = "time_index"
+TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
 
 
 def collect_images(input_path):
@@ -151,6 +152,16 @@ def build_arg_parser():
             "encode camera identity."
         ),
     )
+    parser.add_argument(
+        "--temporal_patch",
+        default=None,
+        help=(
+            "Optional temporal_tracking.pt written by overfit_temporal_tracking.py. "
+            "Overlays the finetuned time embedding, MotionDecoder and track head onto "
+            "the base checkpoint. Without it the time embedding stays zero-initialized "
+            "and --time_indices has no effect on the output."
+        ),
+    )
     parser.add_argument("--refine_track_visualization", action="store_true", default=False)
     return parser
 
@@ -176,7 +187,30 @@ def main():
     from arc.dust3r.inference_multiview import inference
     from arc.dust3r.utils.image import load_images
 
-    model = Arc.from_pretrained(args.checkpoint_dir).to(device).eval()
+    # Bound-check against the default table size before paying for the ~1B-param
+    # checkpoint load. The post-load check below still runs, because a checkpoint
+    # config.json may declare a different max_time_indices.
+    try:
+        validate_time_indices(time_indices, max_time_indices=Arc.MAX_TIME_INDICES)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
+
+    model = Arc.from_pretrained(args.checkpoint_dir).to(device)
+    if args.temporal_patch:
+        from arc.training.checkpoint import load_temporal_tracking_checkpoint
+
+        # set_freeze first: the loader requires it and keys the expected
+        # parameter set off requires_grad.
+        model.set_freeze("temporal_tracking")
+        load_temporal_tracking_checkpoint(model, args.temporal_patch)
+        print(f"Loaded temporal-tracking patch: {args.temporal_patch}")
+    elif TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
+        print(
+            "Warning: this checkpoint has no time-index embedding, so it was "
+            "zero-initialized. --time_indices will not change the output. Pass "
+            "--temporal_patch to load a finetuned embedding."
+        )
+    model = model.eval()
     imgs = load_images(paths, size=512, verbose=True, patch_size=14)
 
     try:

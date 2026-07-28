@@ -1,5 +1,7 @@
 import inspect
 import time
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 from addict import Dict
@@ -29,6 +31,7 @@ class Arc(
 ):
     PATCH_SIZE = 14
     TIME_INDEX_KEY = "time_index"
+    MAX_TIME_INDICES = 32
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
     )
@@ -55,9 +58,13 @@ class Arc(
         motion_decoder_has_cross_attention=True,
         motion_decoder_use_adaln=True,
         track_head_activation="inv_log",
-        max_time_indices=32,
+        max_time_indices=MAX_TIME_INDICES,
     ):
         super().__init__()
+
+        # Keys the checkpoint loader accepted as legacy gaps and zero-filled.
+        # Callers use this to warn that a feature is silently inactive.
+        self.consumed_legacy_missing_keys = frozenset()
 
         if isinstance(max_time_indices, bool) or not isinstance(max_time_indices, int):
             raise TypeError("max_time_indices must be a positive integer")
@@ -325,6 +332,8 @@ class Arc(
                 "Checkpoint is incompatible with Arc; " + "; ".join(details)
             )
 
+        return frozenset(missing_keys & allowed_missing_keys)
+
     @classmethod
     def _load_as_safetensor(
         cls,
@@ -355,7 +364,7 @@ class Arc(
             model.to(map_location)
 
         unexpected_keys = set(unexpected_keys) - verified_legacy_aliases
-        cls._validate_checkpoint_incompatibility(
+        model.consumed_legacy_missing_keys = cls._validate_checkpoint_incompatibility(
             missing_keys,
             unexpected_keys,
             strict=strict,
@@ -408,7 +417,7 @@ class Arc(
             weights_only=True,
         )
         incompatibility = model.load_state_dict(state_dict, strict=False)
-        cls._validate_checkpoint_incompatibility(
+        model.consumed_legacy_missing_keys = cls._validate_checkpoint_incompatibility(
             incompatibility.missing_keys,
             incompatibility.unexpected_keys,
             strict=strict,
@@ -468,8 +477,19 @@ class Arc(
 
         # Process features through depth head
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
-            output = self.head(feats, H, W, patch_start_idx=0)
-            pose_enc = self.cam_dec(feats[-1][1])
+            # Under temporal_tracking the depth head and camera decoder are frozen
+            # and their outputs are consumed only through detached paths
+            # (arc.training.sparse_tracking._predicted_pointmaps is no_grad plus
+            # .detach()), so retaining the dual-pyramid DPT graph costs about
+            # 1.2 GB per observation for nothing. Keep the values, drop the graph.
+            # Nested inside the autocast above, which is doing real work forcing
+            # fp32 for these heads under an outer bf16 autocast.
+            frozen_reconstruction = (
+                getattr(self, "freeze", "none") == "temporal_tracking"
+            )
+            with torch.no_grad() if frozen_reconstruction else nullcontext():
+                output = self.head(feats, H, W, patch_start_idx=0)
+                pose_enc = self.cam_dec(feats[-1][1])
             output["pose_enc"] = pose_enc
             output["pose_enc_list"] = [pose_enc]
             

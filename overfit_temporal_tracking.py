@@ -65,6 +65,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--huber_delta_m", type=float, default=0.05)
     parser.add_argument(
+        "--min_improvement",
+        type=float,
+        default=0.01,
+        help=(
+            "Minimum relative drop in the like-for-like position loss required to "
+            "pass. A zero-margin comparison is dominated by reconstruction drift, "
+            "so require a real margin."
+        ),
+    )
+    parser.add_argument(
         "--parse_only",
         action="store_true",
         help=(
@@ -119,6 +129,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lr must be finite and positive")
     if not math.isfinite(args.huber_delta_m) or args.huber_delta_m <= 0:
         raise ValueError("--huber_delta_m must be finite and positive")
+    if not math.isfinite(args.min_improvement) or not 0 <= args.min_improvement < 1:
+        raise ValueError("--min_improvement must be finite and in [0, 1)")
     if query_time != 0:
         raise ValueError(
             "Sparse training requires --query_time 0 because the dump contains "
@@ -251,7 +263,78 @@ def _tracking_only(raw_predictions: dict) -> dict:
     }
 
 
-def _evaluate(model, scene, correspondences, precision, huber_delta_m):
+def _exit_criteria_failure(
+    *,
+    initial_loss: float,
+    final_loss: float,
+    embedding_change: float,
+    min_improvement: float,
+) -> str | None:
+    """Return why the run failed its exit criteria, or None if it passed.
+
+    ``final_loss`` must be the like-for-like number (initial alignment, initial
+    anchors).  A bare ``final < initial`` is dominated by reconstruction drift,
+    so a relative margin is required.
+    """
+
+    if embedding_change == 0:
+        return "Temporal embedding did not change"
+    required_loss = initial_loss * (1.0 - min_improvement)
+    if not final_loss < required_loss:
+        return (
+            "One-scene overfit did not reduce the like-for-like position loss by "
+            f"at least {min_improvement:.4%}: initial={initial_loss:.8f}, "
+            f"final={final_loss:.8f}, required<{required_loss:.8f}"
+        )
+    return None
+
+
+def _confidence_stats(raw_predictions) -> dict[str, float] | None:
+    """Summarize the track head's confidence channel.
+
+    Nothing supervises it: ``sparse_tracking_loss`` is a position-only Huber, and
+    xyz and confidence are split off the *same* final conv, so the channel gets a
+    zero gradient while its trunk moves.  ``score_joint.py`` thresholds this
+    confidence absolutely to derive occlusion, which feeds OA and AJ, so an
+    unsupervised mean shift is not harmless.  Log it so drift is attributable.
+    """
+
+    confidence = raw_predictions.get("conf_track_multi")
+    if confidence is None:
+        return None
+    values = confidence.detach().float().flatten()
+    if values.numel() == 0:
+        return None
+    quantiles = torch.tensor([0.05, 0.5, 0.95], device=values.device)
+    p05, p50, p95 = torch.quantile(values, quantiles).tolist()
+    return {
+        "mean": float(values.mean().item()),
+        "p05": float(p05),
+        "p50": float(p50),
+        "p95": float(p95),
+    }
+
+
+def _evaluate(
+    model,
+    scene,
+    correspondences,
+    precision,
+    huber_delta_m,
+    initial_alignment,
+    initial_query_anchors,
+):
+    """Score the trained model two ways.
+
+    The refit numbers use a Sim(3) and query anchors re-derived from the trained
+    model, matching how inference would score it.  The like-for-like numbers
+    reuse the *initial* alignment and anchors, so the only thing that differs
+    from ``initial_loss`` is the track head and the time embedding.  The time
+    embedding is injected at ``alt_start`` and every head-feeding out-layer is
+    downstream of it, so a refit moves even though the reconstruction weights
+    are frozen; only the like-for-like number isolates the tracking change.
+    """
+
     model.eval()
     with torch.no_grad(), _autocast_context(precision):
         raw = model(scene.views, force_no_output_conversion=True)
@@ -261,8 +344,9 @@ def _evaluate(model, scene, correspondences, precision, huber_delta_m):
             scene,
             correspondences,
         )
+        confidence_stats = _confidence_stats(raw)
         raw = _tracking_only(raw)
-        result = sparse_tracking_loss(
+        refit = sparse_tracking_loss(
             raw,
             scene,
             correspondences,
@@ -270,12 +354,23 @@ def _evaluate(model, scene, correspondences, precision, huber_delta_m):
             query_anchors,
             huber_delta_m=huber_delta_m,
         )
-    return (
-        float(result.loss.item()),
-        float(result.metric_error.item()),
-        alignment,
-        alignment_report,
-    )
+        like_for_like = sparse_tracking_loss(
+            raw,
+            scene,
+            correspondences,
+            initial_alignment,
+            initial_query_anchors,
+            huber_delta_m=huber_delta_m,
+        )
+    return {
+        "loss_refit": float(refit.loss.item()),
+        "metric_error_refit_m": float(refit.metric_error.item()),
+        "loss": float(like_for_like.loss.item()),
+        "metric_error_m": float(like_for_like.metric_error.item()),
+        "alignment": alignment,
+        "alignment_report": alignment_report,
+        "confidence": confidence_stats,
+    }
 
 
 def main() -> None:
@@ -370,9 +465,12 @@ def main() -> None:
         initial_query_anchors,
         huber_delta_m=args.huber_delta_m,
     )
+    initial_confidence = _confidence_stats(initial_raw)
     initial_loss = float(initial_result.loss.item())
     initial_error = float(initial_result.metric_error.item())
-    del initial_raw, initial_query_anchors, initial_result
+    # initial_query_anchors is deliberately kept: the pass/fail gate re-scores the
+    # trained model against this same alignment and these same anchors.
+    del initial_raw, initial_result
     print(
         "alignment="
         f"{initial_alignment_report['pair_count']} pairs, "
@@ -419,6 +517,7 @@ def main() -> None:
                 scene,
                 correspondences,
             )
+            step_confidence = _confidence_stats(raw)
             raw = _tracking_only(raw)
             result = sparse_tracking_loss(
                 raw,
@@ -456,6 +555,14 @@ def main() -> None:
         scaler.step(optimizer)
         scaler.update()
 
+        confidence_log = (
+            ""
+            if step_confidence is None
+            else (
+                f" conf_mean={step_confidence['mean']:.6g}"
+                f" conf_p50={step_confidence['p50']:.6g}"
+            )
+        )
         print(
             f"step={step + 1}/{args.steps} "
             f"loss={result.loss.detach().item():.8f} "
@@ -463,26 +570,36 @@ def main() -> None:
             f"grad_time={last_gradient_norms['time_embedding']:.6g} "
             f"grad_motion={last_gradient_norms['motion_decoder']:.6g} "
             f"grad_track={last_gradient_norms['track_head']:.6g}"
+            f"{confidence_log}"
         )
 
-    final_loss, final_error, final_alignment, final_alignment_report = _evaluate(
+    evaluation = _evaluate(
         model,
         scene,
         correspondences,
         args.precision,
         args.huber_delta_m,
+        initial_alignment,
+        initial_query_anchors,
     )
+    final_loss = evaluation["loss"]
+    final_error = evaluation["metric_error_m"]
+    final_alignment = evaluation["alignment"]
+    final_alignment_report = evaluation["alignment_report"]
     embedding_norm = float(embedding.weight.detach().float().norm().item())
     embedding_change = float(
         (embedding.weight.detach() - initial_embedding).float().norm().item()
     )
-    if embedding_change == 0:
-        raise RuntimeError("Temporal embedding did not change")
-    if not final_loss < initial_loss:
-        raise RuntimeError(
-            "One-scene overfit did not reduce position loss: "
-            f"initial={initial_loss:.8f}, final={final_loss:.8f}"
-        )
+
+    # Evaluate the exit criteria without raising: the artifacts below are exactly
+    # what a failed run needs for diagnosis, so they are written either way and
+    # the process exits non-zero at the end.
+    failure_reason = _exit_criteria_failure(
+        initial_loss=initial_loss,
+        final_loss=final_loss,
+        embedding_change=embedding_change,
+        min_improvement=args.min_improvement,
+    )
     peak_memory_bytes = int(torch.cuda.max_memory_allocated())
 
     output_dir = Path(args.output_dir)
@@ -511,10 +628,23 @@ def main() -> None:
         "final_alignment_scale": float(final_alignment.scale.item()),
         "final_alignment_rotation": final_alignment.rotation.tolist(),
         "final_alignment_translation": final_alignment.translation.tolist(),
+        "success": failure_reason is None,
+        "failure_reason": failure_reason,
+        "min_improvement": args.min_improvement,
         "initial_position_loss": initial_loss,
+        # Gated on: same alignment and anchors as initial_position_loss, so the
+        # only difference is the trained track head and time embedding.
         "final_position_loss": final_loss,
+        # Diagnostic only: alignment and anchors refit from the trained model,
+        # which is how inference would score it.
+        "final_position_loss_refit": evaluation["loss_refit"],
         "initial_metric_error_m": initial_error,
         "final_metric_error_m": final_error,
+        "final_metric_error_refit_m": evaluation["metric_error_refit_m"],
+        # Unsupervised: see _confidence_stats. Reported so an OA/AJ move can be
+        # attributed to confidence drift rather than to tracking.
+        "initial_track_confidence": initial_confidence,
+        "final_track_confidence": evaluation["confidence"],
         "initial_temporal_embedding_norm": initial_embedding_norm,
         "final_temporal_embedding_norm": embedding_norm,
         "temporal_embedding_change": embedding_change,
@@ -533,8 +663,10 @@ def main() -> None:
 
     print(f"initial_position_loss={initial_loss:.8f}")
     print(f"final_position_loss={final_loss:.8f}")
+    print(f"final_position_loss_refit={evaluation['loss_refit']:.8f}")
     print(f"initial_metric_error_m={initial_error:.8f}")
     print(f"final_metric_error_m={final_error:.8f}")
+    print(f"final_metric_error_refit_m={evaluation['metric_error_refit_m']:.8f}")
     print(
         "temporal_embedding="
         f"norm {embedding_norm:.8f}, change {embedding_change:.8f}"
@@ -543,6 +675,9 @@ def main() -> None:
     print(f"peak_gpu_memory_bytes={peak_memory_bytes}")
     print(f"checkpoint={checkpoint_path}")
     print(f"summary={summary_path}")
+    if failure_reason is not None:
+        print(f"FAIL temporal_tracking one-scene overfit: {failure_reason}")
+        raise SystemExit(1)
     print("PASS temporal_tracking one-scene overfit")
 
 

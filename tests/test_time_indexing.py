@@ -9,6 +9,12 @@ import torch.nn as nn
 import inference as inference_cli
 from arc.models.arc.arc import Arc
 from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
+# Imported from the module rather than the arc.training package to avoid pulling
+# in sparse_tracking (and its eval.* dependency) for these tests.
+from arc.training.checkpoint import (
+    load_temporal_tracking_checkpoint,
+    save_temporal_tracking_checkpoint,
+)
 
 
 def _time_token_model(embed_dim=4, max_time_indices=8):
@@ -144,6 +150,37 @@ class _FakeTrackHead(nn.Module):
         track = query_idx.expand(B, S, H, W, 3).clone()
         confidence = query_idx.expand(B, S, H, W).clone()
         return track, confidence
+
+
+class _GradBackbone(nn.Module):
+    """Features that carry grad history, so head graph retention is observable."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def forward(self, x, ref_view_strategy="first", time_indices=None):
+        B, S = x.shape[:2]
+        feature_dim = 3072
+        patch = torch.zeros(B, S, 1, feature_dim, device=x.device) + self.scale
+        camera = torch.zeros(B, S, feature_dim, device=x.device) + self.scale
+        time = torch.zeros(B, S, feature_dim, device=x.device) + self.scale
+        return tuple((patch, camera, time) for _ in range(4)), []
+
+
+class _GradReconstructionHead(nn.Module):
+    def forward(self, feats, H, W, patch_start_idx):
+        return {"depth": feats[0][0].sum(-1)}
+
+
+class _GradCameraDecoder(nn.Module):
+    def forward(self, camera_tokens):
+        return camera_tokens.sum(-1, keepdim=True)
+
+
+class _GradMotionDecoder(nn.Module):
+    def forward(self, tokens, images, patch_start_idx, track_query_idx):
+        return tokens[:, :, :2, :] + float(track_query_idx)
 
 
 class _TinyPretrained(nn.Module):
@@ -317,6 +354,25 @@ def test_inference_parser_preserves_legacy_defaults_and_multi_query_values():
     assert args.time_indices is None
     assert args.track_query_idx == [0, 12]
     assert args.checkpoint_dir == "Luo-Yihang/4RC"
+    assert args.temporal_patch is None
+
+
+def test_inference_parser_accepts_a_temporal_patch_path():
+    args = inference_cli.build_arg_parser().parse_args(
+        [
+            "--input",
+            "frames",
+            "--save",
+            "output.npz",
+            "--temporal_patch",
+            "runs/overfit/temporal_tracking.pt",
+            "--track_query_idx",
+            "0",
+        ]
+    )
+
+    assert args.temporal_patch == "runs/overfit/temporal_tracking.pt"
+    assert args.track_query_idx == [0]
 
 
 def test_inference_parser_accepts_repeated_semantic_times():
@@ -471,6 +527,85 @@ def test_zero_initialized_time_indices_match_legacy_tokens_and_outputs():
     assert torch.equal(token_model._prepare_time_tokens(1, 3, None), legacy_tokens)
 
 
+def test_time_embedding_is_trainable_through_the_real_transformer():
+    """Guard the premise of the whole temporal-tracking stage.
+
+    A stubbed backbone cannot show this: it must run the real
+    DinoVisionTransformer so that a `.detach()` on the embedding lookup, or any
+    change that drops the embedding off the autograd path, fails here rather
+    than silently producing a flat loss curve on the cluster.
+    """
+
+    model = _configured_time_transformer(max_time_indices=7)
+    with torch.no_grad():
+        for index in range(model.max_time_indices):
+            model.time_index_embedding.weight[index].fill_(0.1 * (index + 1))
+
+    images = torch.zeros(1, 4, 3, 14, 14)
+    time_indices = torch.tensor([[0, 1, 0, 1]])
+
+    legacy_output = _run_pass_through(model, images)
+    indexed_output = _run_pass_through(model, images, time_indices)
+
+    # A non-zero embedding must actually reach the output.
+    assert not torch.equal(indexed_output, legacy_output)
+
+    # ...and it must be on the autograd path, not merely read as a constant.
+    model.zero_grad(set_to_none=True)
+    indexed_output.sum().backward()
+    gradient = model.time_index_embedding.weight.grad
+    assert gradient is not None
+    assert gradient.abs().sum() > 0
+
+    # Only the rows named by time_indices may receive gradient.
+    per_row = gradient.abs().sum(dim=1)
+    used_rows = sorted(set(time_indices.flatten().tolist()))
+    for row in range(model.max_time_indices):
+        if row in used_rows:
+            assert per_row[row] > 0, f"row {row} is used but got no gradient"
+        else:
+            assert per_row[row] == 0, f"row {row} is unused but got gradient"
+
+
+def test_optimizer_step_leaves_frozen_parameter_values_untouched():
+    """requires_grad and a missing .grad are not proof that a weight held still."""
+
+    model = _TinyHubArc(freeze="temporal_tracking")
+    frozen_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad
+    }
+    trainable_before = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    assert frozen_before and trainable_before
+
+    # Built the same way overfit_temporal_tracking.py builds it.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable, lr=1e-2, weight_decay=0.0)
+    optimizer.zero_grad(set_to_none=True)
+    sum(parameter.sum() for parameter in trainable).backward()
+    optimizer.step()
+
+    for name, parameter in model.named_parameters():
+        if name in frozen_before:
+            torch.testing.assert_close(
+                parameter.detach(),
+                frozen_before[name],
+                rtol=0,
+                atol=0,
+                msg=f"frozen parameter {name} moved during an optimizer step",
+            )
+    for name, parameter in model.named_parameters():
+        if name in trainable_before:
+            assert not torch.equal(parameter.detach(), trainable_before[name]), (
+                f"trainable parameter {name} did not move"
+            )
+
+
 def test_synchronized_views_share_an_embedding_and_different_times_do_not():
     model = _time_token_model()
     with torch.no_grad():
@@ -597,6 +732,70 @@ def test_from_pretrained_accepts_only_the_legacy_time_embedding_gap(tmp_path):
 
     with pytest.raises(RuntimeError, match="time_index_embedding"):
         _TinyHubArc.from_pretrained(str(legacy_dir), strict=True)
+
+
+def test_legacy_load_records_the_consumed_time_embedding_gap(tmp_path):
+    """A zero-filled time embedding must be reportable, not silent.
+
+    ``inference.py`` uses this to warn that ``--time_indices`` cannot affect the
+    output, which is otherwise indistinguishable from a finetune that did not help.
+    """
+
+    legacy_dir = tmp_path / "legacy"
+    _save_safetensors_model(_LegacyTinyArc(), legacy_dir)
+
+    restored = _TinyHubArc.from_pretrained(str(legacy_dir))
+
+    assert restored.consumed_legacy_missing_keys == frozenset(
+        Arc.LEGACY_CHECKPOINT_MISSING_KEYS
+    )
+    assert inference_cli.TIME_EMBEDDING_KEY in restored.consumed_legacy_missing_keys
+
+    complete_dir = tmp_path / "complete"
+    source = _TinyHubArc()
+    with torch.no_grad():
+        source.backbone.pretrained.time_index_embedding.weight.fill_(0.5)
+    _save_safetensors_model(source, complete_dir)
+
+    reloaded = _TinyHubArc.from_pretrained(str(complete_dir))
+
+    assert reloaded.consumed_legacy_missing_keys == frozenset()
+
+
+def test_temporal_patch_restores_a_nonzero_time_embedding(tmp_path):
+    """The overfit's output must be loadable back onto a base checkpoint.
+
+    This is the mechanism ``inference.py --temporal_patch`` drives.
+    """
+
+    legacy_dir = tmp_path / "legacy"
+    _save_safetensors_model(_LegacyTinyArc(), legacy_dir)
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    with torch.no_grad():
+        trained.backbone.pretrained.time_index_embedding.weight.fill_(1.75)
+        trained.motion_decoder.weight.fill_(0.25)
+    patch = save_temporal_tracking_checkpoint(
+        trained,
+        tmp_path / "temporal_tracking.pt",
+    )
+
+    restored = _TinyHubArc.from_pretrained(str(legacy_dir))
+    assert torch.count_nonzero(
+        restored.backbone.pretrained.time_index_embedding.weight
+    ) == 0
+
+    restored.set_freeze("temporal_tracking")
+    load_temporal_tracking_checkpoint(restored, patch)
+
+    torch.testing.assert_close(
+        restored.backbone.pretrained.time_index_embedding.weight,
+        trained.backbone.pretrained.time_index_embedding.weight,
+    )
+    torch.testing.assert_close(
+        restored.motion_decoder.weight,
+        trained.motion_decoder.weight,
+    )
 
 
 def test_from_pretrained_accepts_identical_known_safetensor_aliases(tmp_path):
@@ -775,6 +974,54 @@ def test_time_indices_reach_motion_decoder_without_changing_multi_query_semantic
     assert torch.count_nonzero(output["track_multi"][:, 0]) == 0
     assert torch.all(output["track_multi"][:, 1] == 12)
     assert torch.all(output["track_multi"][:, 2] == 23)
+
+
+def test_temporal_tracking_drops_the_frozen_reconstruction_graph():
+    """Frozen depth/camera heads must not retain a backward graph.
+
+    Their outputs are consumed only through detached paths, so the retained
+    dual-pyramid DPT graph is about 1.2 GB per observation of pure waste. Values
+    must be unchanged and the tracking branch must stay differentiable.
+    """
+
+    def build(freeze):
+        model = _arc_shell(max_time_indices=32)
+        model.backbone = _GradBackbone()
+        model.head = _GradReconstructionHead()
+        model.cam_dec = _GradCameraDecoder()
+        model.motion_decoder = _GradMotionDecoder()
+        model.track_head = _FakeTrackHead()
+        model.freeze = freeze
+        return model
+
+    views = [{"img": torch.zeros(1, 3, 2, 2)} for _ in range(4)]
+    inference_cli.attach_frame_metadata(views, track_query_idx=[0])
+
+    trainable = build("none")
+    frozen = build("temporal_tracking")
+    unfrozen_output = trainable(views, force_no_output_conversion=True)
+    frozen_output = frozen(views, force_no_output_conversion=True)
+
+    # Same numbers either way.
+    torch.testing.assert_close(frozen_output["depth"], unfrozen_output["depth"])
+    torch.testing.assert_close(
+        frozen_output["pose_enc"],
+        unfrozen_output["pose_enc"],
+    )
+
+    # But no graph is kept for the frozen reconstruction branch.
+    assert unfrozen_output["depth"].requires_grad
+    assert unfrozen_output["pose_enc"].requires_grad
+    assert not frozen_output["depth"].requires_grad
+    assert not frozen_output["pose_enc"].requires_grad
+
+    # The tracking branch stays differentiable, and gradient still reaches the
+    # backbone through it.
+    assert unfrozen_output["track_multi"].requires_grad
+    assert frozen_output["track_multi"].requires_grad
+    frozen_output["track_multi"].sum().backward()
+    assert frozen.backbone.scale.grad is not None
+    assert frozen.backbone.scale.grad.abs().item() > 0
 
 
 def test_npz_keeps_24_observations_without_serializing_time_metadata(tmp_path):
