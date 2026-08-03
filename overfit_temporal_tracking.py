@@ -314,6 +314,31 @@ def _tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict
     return kept
 
 
+def _breakdown_to_floats(breakdown) -> dict[str, float] | None:
+    """`compose_tracking_loss` hands back detached tensors; JSON needs floats."""
+
+    if breakdown is None:
+        return None
+    return {name: float(value.item()) for name, value in breakdown.items()}
+
+
+def _warn_about_dropped_confidence_samples(dropped, sample_count) -> None:
+    """A silently shrinking confidence set is the failure mode worth shouting about."""
+
+    if not dropped or dropped.get("total", 0) == 0:
+        return
+    total = dropped["total"]
+    print(
+        f"WARNING: {total} sparse sample(s) were dropped from the confidence term as "
+        "non-finite "
+        f"(target={dropped['target_nonfinite']}, "
+        f"prediction={dropped['prediction_nonfinite']}, "
+        f"confidence={dropped['confidence_nonfinite']}); "
+        f"{sample_count} remain. `expp1` is 1+exp(x) and overflows in BF16, so a "
+        "large count here means the confidence figures below describe a subset."
+    )
+
+
 def _implied_optimal_confidence(alpha, diagnostics) -> float | None:
     """Where the confidence term wants confidence to sit, given the current error."""
 
@@ -365,23 +390,40 @@ def _exit_criteria_failure(
     final_loss: float,
     embedding_change: float,
     min_improvement: float,
+    confidence_weight: float = 0.0,
 ) -> str | None:
     """Return why the run failed its exit criteria, or None if it passed.
 
     ``final_loss`` must be the like-for-like number (initial alignment, initial
     anchors).  A bare ``final < initial`` is dominated by reconstruction drift,
     so a relative margin is required.
+
+    The gate stays on the *position* loss even when the optimizer is descending a
+    total that includes the confidence term.  That is deliberate: the question this
+    harness answers is whether supervising sparse tracks moves tracking, and a
+    confidence term that buys calibration by giving up track accuracy should read
+    as a failure here rather than be averaged away.
     """
 
     if embedding_change == 0:
         return "Temporal embedding did not change"
     required_loss = initial_loss * (1.0 - min_improvement)
     if not final_loss < required_loss:
-        return (
+        reason = (
             "One-scene overfit did not reduce the like-for-like position loss by "
             f"at least {min_improvement:.4%}: initial={initial_loss:.8f}, "
             f"final={final_loss:.8f}, required<{required_loss:.8f}"
         )
+        if confidence_weight > 0:
+            # Without this the reader sees a position-loss failure and has no
+            # reason to suspect the term they just switched on.
+            reason += (
+                f". Note --confidence_weight={confidence_weight:.6g} is set, so the "
+                "optimizer descended position + weighted confidence while this gate "
+                "judges position alone; compare final_loss_breakdown before "
+                "concluding that tracking itself regressed"
+            )
+        return reason
     return None
 
 
@@ -478,8 +520,9 @@ def _evaluate(
             else float(like_for_like.confidence_loss.item())
         ),
         "confidence_sample_count": like_for_like.confidence_sample_count,
+        "confidence_dropped": like_for_like.confidence_dropped,
         "confidence_diagnostics": like_for_like.diagnostics,
-        "loss_breakdown": like_for_like.loss_breakdown,
+        "loss_breakdown": _breakdown_to_floats(like_for_like.loss_breakdown),
     }
 
 
@@ -585,6 +628,14 @@ def main() -> None:
     # Resolve alpha once, here, from the untrained model. Re-resolving every step
     # would chase the confidence the term is itself moving, and the optimum would
     # never settle.
+    #
+    # Resolving it from an eval-mode forward and then applying it to train-mode
+    # steps is safe, and checked rather than assumed: nothing on the path is
+    # train/eval sensitive. The DPT head builds no BatchNorm (`bn=False` at
+    # dpt_head.py:321, and ResidualConvUnit leaves norm1/norm2 None regardless),
+    # MotionDecoder has no BatchNorm or dropout, and the ViT's drop_path_rate is
+    # 0.0 and never overridden. train() only turns on activation checkpointing and
+    # the one-frame track-head chunk, both value-preserving.
     confidence_alpha = initial_result.confidence_alpha
     initial_confidence_loss = (
         None
@@ -592,7 +643,8 @@ def main() -> None:
         else float(initial_result.confidence_loss.item())
     )
     initial_confidence_diagnostics = initial_result.diagnostics
-    initial_loss_breakdown = initial_result.loss_breakdown
+    initial_loss_breakdown = _breakdown_to_floats(initial_result.loss_breakdown)
+    initial_confidence_dropped = initial_result.confidence_dropped
     if confidence_enabled:
         print(
             "confidence_term="
@@ -600,6 +652,10 @@ def main() -> None:
             f"({'auto' if requested_alpha is None else 'explicit'}), "
             f"{initial_result.confidence_sample_count} samples "
             f"(position uses {initial_result.sample_count})"
+        )
+        _warn_about_dropped_confidence_samples(
+            initial_confidence_dropped,
+            initial_result.confidence_sample_count,
         )
     # initial_query_anchors is deliberately kept: the pass/fail gate re-scores the
     # trained model against this same alignment and these same anchors.
@@ -662,6 +718,9 @@ def main() -> None:
                 huber_delta_m=args.huber_delta_m,
                 confidence_weight=args.confidence_weight,
                 confidence_alpha=confidence_alpha,
+                # Only the initial and final evaluations are reported; a per-step
+                # occlusion report costs a device sync per figure and is discarded.
+                collect_diagnostics=False,
             )
 
         scaler.scale(result.total_loss).backward()
@@ -739,6 +798,12 @@ def main() -> None:
         confidence_weight=args.confidence_weight,
         confidence_alpha=confidence_alpha,
     )
+    # Re-checked after training: the head has moved, so a run can start clean and
+    # only then push confidence logits far enough to overflow.
+    _warn_about_dropped_confidence_samples(
+        evaluation["confidence_dropped"],
+        evaluation["confidence_sample_count"],
+    )
     final_loss = evaluation["loss"]
     final_error = evaluation["metric_error_m"]
     final_alignment = evaluation["alignment"]
@@ -756,6 +821,7 @@ def main() -> None:
         final_loss=final_loss,
         embedding_change=embedding_change,
         min_improvement=args.min_improvement,
+        confidence_weight=args.confidence_weight,
     )
     peak_memory_bytes = int(torch.cuda.max_memory_allocated())
 
@@ -813,6 +879,10 @@ def main() -> None:
         "initial_confidence_loss": initial_confidence_loss,
         "final_confidence_loss": evaluation["confidence_loss"],
         "confidence_sample_count": evaluation["confidence_sample_count"],
+        # Non-finite samples are filtered rather than fatal, so the count is what
+        # keeps that from being silent. Attributed by cause; the causes overlap.
+        "initial_confidence_dropped": initial_confidence_dropped,
+        "final_confidence_dropped": evaluation["confidence_dropped"],
         # Unweighted per-term values. The position and confidence terms have very
         # different natural scales, so this is what says whether the chosen
         # --confidence_weight actually balances them.

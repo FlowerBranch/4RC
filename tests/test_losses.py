@@ -252,7 +252,8 @@ def test_compose_returns_a_single_unit_weighted_term_unchanged():
     )
 
     assert total is position
-    assert breakdown == {"position": pytest.approx(0.25)}
+    assert list(breakdown) == ["position"]
+    assert breakdown["position"].item() == pytest.approx(0.25)
 
 
 def test_compose_skips_zero_weight_terms_rather_than_multiplying_by_zero():
@@ -280,7 +281,20 @@ def test_compose_weights_each_term():
 
     assert total.item() == pytest.approx(2.0)
     # The breakdown reports unweighted values so runs at different weights compare.
-    assert breakdown == {"a": pytest.approx(1.0), "b": pytest.approx(2.0)}
+    assert {k: v.item() for k, v in breakdown.items()} == {
+        "a": pytest.approx(1.0),
+        "b": pytest.approx(2.0),
+    }
+
+
+def test_compose_breakdown_holds_detached_tensors_not_floats():
+    """This runs every training step; returning floats would force a device sync."""
+
+    a = torch.tensor(1.0, requires_grad=True)
+    _, breakdown = compose_tracking_loss({"a": a}, {"a": 1.0})
+
+    assert isinstance(breakdown["a"], torch.Tensor)
+    assert not breakdown["a"].requires_grad
 
 
 def test_compose_rejects_weights_for_unknown_terms():

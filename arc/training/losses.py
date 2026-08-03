@@ -205,7 +205,7 @@ def resolve_confidence_alpha(
 def compose_tracking_loss(
     terms: Mapping[str, torch.Tensor],
     weights: Mapping[str, float],
-) -> tuple[torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Weighted sum of named loss terms, skipping ablated ones entirely.
 
     A term whose weight is ``0.0`` is not multiplied by zero, it is left out of the
@@ -214,7 +214,10 @@ def compose_tracking_loss(
     confidence-disabled run bit-identical to the position-only path.
 
     Returns the total and a breakdown of each active term's **unweighted** value, so
-    runs at different weights stay comparable.
+    runs at different weights stay comparable.  The breakdown holds detached scalar
+    *tensors*, not floats: this runs every training step, and a tensor-math function
+    has no business forcing a device sync for a figure only the reporting layer
+    reads.  Call ``.item()`` at the point of use.
     """
 
     unknown = set(weights) - set(terms)
@@ -222,7 +225,7 @@ def compose_tracking_loss(
         raise KeyError(f"Weights given for unknown loss terms: {sorted(unknown)}")
 
     total: torch.Tensor | None = None
-    breakdown: dict[str, float] = {}
+    breakdown: dict[str, torch.Tensor] = {}
     for name in terms:
         weight = float(weights.get(name, 0.0))
         if not math.isfinite(weight) or weight < 0:
@@ -232,7 +235,7 @@ def compose_tracking_loss(
         term = terms[name]
         if term.ndim != 0:
             raise ValueError(f"Loss term '{name}' must be a scalar, got {tuple(term.shape)}")
-        breakdown[name] = float(term.detach().item())
+        breakdown[name] = term.detach()
         contribution = term if weight == 1.0 else weight * term
         total = contribution if total is None else total + contribution
 

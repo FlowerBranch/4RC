@@ -168,6 +168,7 @@ class SparseTrackingLossResult:
     confidence_loss: torch.Tensor | None = None
     confidence_mask: torch.Tensor | None = None
     confidence_sample_count: int | None = None
+    confidence_dropped: dict | None = None
     confidence_alpha: float | None = None
     loss_breakdown: dict | None = None
     diagnostics: dict | None = None
@@ -702,6 +703,7 @@ def sparse_tracking_loss(
     huber_delta_m: float = 0.05,
     confidence_weight: float = 0.0,
     confidence_alpha: float | None = None,
+    collect_diagnostics: bool = True,
 ) -> SparseTrackingLossResult:
     """Huber-supervise postprocess-equivalent absolute track positions.
 
@@ -718,6 +720,10 @@ def sparse_tracking_loss(
     error are taken over the same gathered samples.  Callers that train for more
     than one step should resolve it once and pass the value back in, so the target
     does not move underneath the optimizer.
+
+    ``collect_diagnostics=False`` skips the occlusion report.  It costs a device
+    sync per reported figure, and a training step throws the report away -- only
+    the initial and final evaluations are ever written to ``run_summary.json``.
     """
 
     if huber_delta_m <= 0 or not np.isfinite(huber_delta_m):
@@ -852,9 +858,21 @@ def sparse_tracking_loss(
         correspondence,
     )
     predicted_finite = torch.isfinite(predicted_metric).all(dim=-1)
-    confidence_mask = target_finite & predicted_finite & torch.isfinite(confidence)
+    confidence_finite = torch.isfinite(confidence)
+    confidence_mask = target_finite & predicted_finite & confidence_finite
     if not confidence_mask.any():
         raise ValueError("No finite sparse samples for the track confidence loss")
+    # Dropping a non-finite sample is the right call -- `expp1` is 1+exp(x), which
+    # overflows to inf in BF16 for a large enough logit, and that is a property of
+    # the released head rather than a fault in the run. Dropping it *silently* is
+    # not: a model quietly losing most of its confidence samples would otherwise
+    # look identical to a healthy one. Count it, by cause.
+    confidence_dropped = _count_dropped(
+        confidence_mask,
+        target_finite=target_finite,
+        prediction_finite=predicted_finite,
+        confidence_finite=confidence_finite,
+    )
 
     per_sample_error = per_sample_huber_error(
         predicted_metric,
@@ -876,11 +894,15 @@ def sparse_tracking_loss(
         {"position": loss, "confidence": confidence_loss},
         {"position": 1.0, "confidence": confidence_weight},
     )
-    diagnostics = confidence_occlusion_diagnostics(
-        confidence,
-        per_sample_error,
-        target_visible,
-        confidence_mask,
+    diagnostics = (
+        confidence_occlusion_diagnostics(
+            confidence,
+            per_sample_error,
+            target_visible,
+            confidence_mask,
+        )
+        if collect_diagnostics
+        else None
     )
     return SparseTrackingLossResult(
         loss=loss,
@@ -892,6 +914,7 @@ def sparse_tracking_loss(
         confidence_loss=confidence_loss,
         confidence_mask=confidence_mask,
         confidence_sample_count=int(confidence_mask.sum().item()),
+        confidence_dropped=confidence_dropped,
         confidence_alpha=float(confidence_alpha),
         loss_breakdown=breakdown,
         diagnostics=diagnostics,
@@ -923,6 +946,29 @@ def gather_at_correspondences(
         correspondence.rows,
         correspondence.columns,
     ].float()
+
+
+def _count_dropped(
+    confidence_mask: torch.Tensor,
+    *,
+    target_finite: torch.Tensor,
+    prediction_finite: torch.Tensor,
+    confidence_finite: torch.Tensor,
+) -> dict:
+    """Attribute the confidence set's exclusions to their cause.
+
+    The total alone is derivable from ``eligible_query_count * observation_count``
+    minus ``confidence_sample_count``, but nobody performs that subtraction while
+    reading a summary, and the total does not say *which* tensor went non-finite.
+    The per-cause counts overlap where a sample fails more than one predicate.
+    """
+
+    return {
+        "total": int((~confidence_mask).sum().item()),
+        "target_nonfinite": int((~target_finite).sum().item()),
+        "prediction_nonfinite": int((~prediction_finite).sum().item()),
+        "confidence_nonfinite": int((~confidence_finite).sum().item()),
+    }
 
 
 def _validated_track_confidence(

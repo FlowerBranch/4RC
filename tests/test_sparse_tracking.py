@@ -17,6 +17,7 @@ from arc.models.arc.arc import Arc
 from arc.training import (
     DetachedSim3,
     SparseCorrespondences,
+    SparseTrackingLossResult,
     build_anchor_correspondences,
     fit_scene_sim3,
     gather_query_anchor_points,
@@ -25,6 +26,7 @@ from arc.training import (
     save_temporal_tracking_checkpoint,
     sparse_tracking_loss,
 )
+from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
 from arc.training.dumped_kubric import compute_image_transform
 
@@ -1044,6 +1046,39 @@ def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
     assert reason == "Temporal embedding did not change"
 
 
+def test_exit_gate_stays_on_position_but_names_the_confidence_term():
+    """The gate must not soften when a second term is added, only explain itself.
+
+    A confidence term that buys calibration by giving up track accuracy should
+    still read as a failure here -- but a reader who sees a bare position-loss
+    failure has no reason to suspect the term they just switched on.
+    """
+
+    common = dict(initial_loss=1.0, final_loss=0.999, embedding_change=0.5,
+                  min_improvement=0.01)
+
+    position_only = overfit_cli._exit_criteria_failure(**common)
+    with_confidence = overfit_cli._exit_criteria_failure(
+        **common, confidence_weight=0.001
+    )
+
+    # Same verdict either way: the threshold is untouched by the new term.
+    assert position_only is not None and with_confidence is not None
+    assert with_confidence.startswith(position_only)
+    assert "--confidence_weight=0.001" in with_confidence
+    assert "final_loss_breakdown" in with_confidence
+
+    # A passing run is silent about it, and a frozen embedding still wins.
+    assert overfit_cli._exit_criteria_failure(
+        initial_loss=1.0, final_loss=0.5, embedding_change=0.5,
+        min_improvement=0.01, confidence_weight=1.0,
+    ) is None
+    assert overfit_cli._exit_criteria_failure(
+        initial_loss=1.0, final_loss=0.1, embedding_change=0.0,
+        min_improvement=0.01, confidence_weight=1.0,
+    ) == "Temporal embedding did not change"
+
+
 def test_min_improvement_is_validated():
     parser = overfit_cli.build_arg_parser()
     base = [
@@ -1141,6 +1176,8 @@ def test_run_summary_fields_are_only_ever_added_to():
         "final_confidence_diagnostics",
         "initial_loss_breakdown",
         "final_loss_breakdown",
+        "initial_confidence_dropped",
+        "final_confidence_dropped",
     } <= written
 
 
@@ -1165,6 +1202,133 @@ def test_confidence_gradient_norms_split_the_shared_output_conv():
         (2 * 3.0**2) ** 0.5
     )
     assert norms["track_head_output_conv_position_rows"] == pytest.approx(4.0)
+
+
+def test_confidence_gradient_norms_resolve_against_a_real_dpt_head():
+    """The attribute path is the untested part, so walk a real DPTHead, not a stub.
+
+    `_confidence_gradient_norms` reaches `track_head.scratch.output_conv2[2]` and
+    assumes it is the 4-channel xyz+conf conv. The sibling test above checks the
+    arithmetic against a bare Conv2d; this checks that the path and the channel
+    count are actually what the shipped head builds.
+    """
+
+    head = DPTHead(
+        dim_in=8,
+        output_dim=4,
+        features=16,
+        out_channels=[8, 8, 8, 8],
+        intermediate_layer_idx=[0, 1, 2, 3],
+    )
+    output_conv = head.scratch.output_conv2[2]
+    assert isinstance(output_conv, nn.Conv2d)
+    assert output_conv.out_channels == 4
+    assert output_conv.kernel_size == (1, 1)
+
+    output_conv.weight.grad = torch.zeros_like(output_conv.weight)
+    output_conv.bias.grad = torch.zeros_like(output_conv.bias)
+    output_conv.weight.grad[3].fill_(2.0)
+    output_conv.bias.grad[1].fill_(5.0)
+
+    norms = overfit_cli._confidence_gradient_norms(
+        SimpleNamespace(track_head=head)
+    )
+
+    confidence_elements = output_conv.weight[3].numel()
+    assert norms["track_head_output_conv_confidence_row"] == pytest.approx(
+        (confidence_elements * 2.0**2) ** 0.5
+    )
+    assert norms["track_head_output_conv_position_rows"] == pytest.approx(5.0)
+
+
+def test_confidence_gradient_norms_reject_a_head_that_is_not_xyz_plus_conf():
+    """The split is meaningless for another output_dim, so it must fail loudly."""
+
+    head = DPTHead(
+        dim_in=8,
+        output_dim=2,
+        features=16,
+        out_channels=[8, 8, 8, 8],
+        intermediate_layer_idx=[0, 1, 2, 3],
+    )
+
+    with pytest.raises(RuntimeError, match="4-channel track output conv"):
+        overfit_cli._confidence_gradient_norms(SimpleNamespace(track_head=head))
+
+
+def test_diagnostics_can_be_skipped_without_touching_the_loss(dumped_scene):
+    """The training loop discards the report, and it costs a device sync per figure."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["track_multi"] = raw["track_multi"] + 0.3
+    raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 120.0)
+    call = dict(
+        confidence_weight=1.0,
+        confidence_alpha=5.0,
+    )
+
+    with_report = sparse_tracking_loss(
+        raw, dumped_scene, correspondences, _identity_alignment(), query_anchors,
+        **call,
+    )
+    without_report = sparse_tracking_loss(
+        raw, dumped_scene, correspondences, _identity_alignment(), query_anchors,
+        collect_diagnostics=False, **call,
+    )
+
+    assert with_report.diagnostics is not None
+    assert without_report.diagnostics is None
+    # Skipping the report must not change a single trained quantity.
+    assert torch.equal(without_report.loss, with_report.loss)
+    assert torch.equal(without_report.total_loss, with_report.total_loss)
+    assert torch.equal(without_report.confidence_loss, with_report.confidence_loss)
+    assert without_report.confidence_sample_count == with_report.confidence_sample_count
+    assert without_report.confidence_dropped == with_report.confidence_dropped
+
+
+def test_nonfinite_confidence_samples_are_dropped_and_counted(dumped_scene):
+    """`expp1` overflows to inf in BF16, so filtering is right -- but never silent."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    confidence = torch.full(raw["track_multi"].shape[:-1], 80.0)
+    row = int(correspondences.rows[0])
+    column = int(correspondences.columns[0])
+    confidence[0, 0, 3, row, column] = float("inf")
+    confidence[0, 0, 5, row, column] = float("nan")
+    raw["conf_track_multi"] = confidence
+
+    result = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        query_anchors,
+        confidence_weight=1.0,
+        confidence_alpha=1.0,
+    )
+
+    assert result.confidence_dropped["confidence_nonfinite"] == 2
+    assert result.confidence_dropped["total"] == 2
+    assert result.confidence_dropped["target_nonfinite"] == 0
+    assert result.confidence_dropped["prediction_nonfinite"] == 0
+    assert result.confidence_sample_count == correspondences.count * 8 - 2
+    assert torch.isfinite(result.confidence_loss)
+
+
+def test_a_clean_run_reports_zero_dropped_confidence_samples(dumped_scene):
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 80.0)
+
+    result = sparse_tracking_loss(
+        raw, dumped_scene, correspondences, _identity_alignment(), query_anchors,
+        confidence_weight=1.0, confidence_alpha=1.0,
+    )
+
+    assert result.confidence_dropped["total"] == 0
+    assert result.confidence_sample_count == correspondences.count * 8
 
 
 def test_the_loss_modules_introduce_no_trainable_parameters():
@@ -1198,19 +1362,19 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
 
     calls = []
 
-    class _RecordedResult:
-        def __init__(self, value):
-            self.loss = torch.tensor(value)
-            self.metric_error = torch.tensor(value * 2)
-            # This test is about alignment reuse; the confidence term is off.
-            self.confidence_loss = None
-            self.confidence_sample_count = None
-            self.diagnostics = None
-            self.loss_breakdown = None
+    # The real dataclass rather than a hand-rolled stub: a stub has to be updated
+    # every time the result grows a field, and silently fails the test when it is
+    # not. This test is about alignment reuse, so the confidence fields default off.
+    def _recorded_result(value):
+        return SparseTrackingLossResult(
+            loss=torch.tensor(value),
+            metric_error=torch.tensor(value * 2),
+            sample_count=0,
+        )
 
     def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
         calls.append((alignment, anchors))
-        return _RecordedResult(0.25 if len(calls) == 1 else 0.75)
+        return _recorded_result(0.25 if len(calls) == 1 else 0.75)
 
     monkeypatch.setattr(overfit_cli, "sparse_tracking_loss", fake_loss)
     monkeypatch.setattr(
