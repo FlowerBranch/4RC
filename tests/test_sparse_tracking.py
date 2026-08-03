@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -24,6 +25,7 @@ from arc.training import (
     save_temporal_tracking_checkpoint,
     sparse_tracking_loss,
 )
+from arc.models.arc.heads.head_act import activate_head
 from arc.training.dumped_kubric import compute_image_transform
 
 
@@ -1058,6 +1060,130 @@ def test_min_improvement_is_validated():
             overfit_cli._validate_args(rejected)
 
 
+def test_confidence_flags_default_off_and_are_validated():
+    """Defaulting off is what keeps existing invocations byte-for-byte unaffected."""
+
+    parser = overfit_cli.build_arg_parser()
+    base = [
+        "--data_root", "root", "--scene", "0000",
+        "--checkpoint_dir", "ckpt", "--output_dir", "out",
+    ]
+    args = parser.parse_args(base)
+    assert args.confidence_weight == 0.0
+    assert args.confidence_alpha == "auto"
+    overfit_cli._validate_args(args)
+    assert overfit_cli._parse_confidence_alpha(args.confidence_alpha) is None
+
+    for bad in ("-1.0", "nan"):
+        rejected = parser.parse_args(base + ["--confidence_weight", bad])
+        with pytest.raises(ValueError, match="--confidence_weight"):
+            overfit_cli._validate_args(rejected)
+
+    for bad in ("0", "-2", "nan", "sometimes"):
+        rejected = parser.parse_args(base + ["--confidence_alpha", bad])
+        with pytest.raises(ValueError, match="--confidence_alpha"):
+            overfit_cli._validate_args(rejected)
+
+    accepted = parser.parse_args(
+        base + ["--confidence_weight", "0.5", "--confidence_alpha", "330"]
+    )
+    overfit_cli._validate_args(accepted)
+    assert overfit_cli._parse_confidence_alpha(accepted.confidence_alpha) == 330.0
+
+
+# The fields run_summary.json carried before the confidence term existed. Anything
+# consuming an archived summary keeps working only if these all survive, so the
+# rule is add-only. Checked by reading the source: writing a real summary needs a
+# checkpoint and a GPU, and this must stay runnable in CI.
+_BASELINE_RUN_SUMMARY_FIELDS = frozenset({
+    "scene", "cameras", "times", "observation_count", "time_indices",
+    "max_time_indices", "query_observation_slot", "query_camera", "query_time",
+    "eligible_query_count", "initial_alignment", "initial_alignment_scale",
+    "initial_alignment_rotation", "initial_alignment_translation",
+    "final_alignment", "final_alignment_scale", "final_alignment_rotation",
+    "final_alignment_translation", "success", "failure_reason", "min_improvement",
+    "initial_position_loss", "final_position_loss", "final_position_loss_refit",
+    "initial_metric_error_m", "final_metric_error_m", "final_metric_error_refit_m",
+    "initial_track_confidence", "final_track_confidence",
+    "initial_temporal_embedding_norm", "final_temporal_embedding_norm",
+    "temporal_embedding_change", "gradient_norms", "trainable_tensor_count",
+    "trainable_parameter_count", "peak_gpu_memory_bytes", "checkpoint_path",
+    "seed", "precision", "steps", "learning_rate",
+})
+
+
+def test_run_summary_fields_are_only_ever_added_to():
+    source = Path(overfit_cli.__file__).read_text()
+    written = None
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "summary"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Dict)
+        ):
+            written = {key.value for key in node.value.keys}
+    assert written is not None, "could not find the run_summary dict literal"
+
+    assert _BASELINE_RUN_SUMMARY_FIELDS <= written
+    assert {
+        "confidence_weight",
+        "confidence_alpha",
+        "confidence_alpha_mode",
+        "initial_confidence_loss",
+        "final_confidence_loss",
+        "confidence_gradient_norms",
+        "confidence_sample_count",
+        "implied_optimal_confidence",
+        "initial_confidence_diagnostics",
+        "final_confidence_diagnostics",
+        "initial_loss_breakdown",
+        "final_loss_breakdown",
+    } <= written
+
+
+def test_confidence_gradient_norms_split_the_shared_output_conv():
+    """Row 3 and rows 0-2 of the final conv are reported apart, with no extra backward."""
+
+    conv = nn.Conv2d(2, 4, kernel_size=1)
+    conv.weight.grad = torch.zeros_like(conv.weight)
+    conv.bias.grad = torch.zeros_like(conv.bias)
+    conv.weight.grad[3].fill_(3.0)
+    conv.bias.grad[0].fill_(4.0)
+    model = SimpleNamespace(
+        track_head=SimpleNamespace(
+            scratch=SimpleNamespace(output_conv2=[None, None, conv])
+        )
+    )
+
+    norms = overfit_cli._confidence_gradient_norms(model)
+
+    # Row 3 holds two weights of 3.0 and a zero bias.
+    assert norms["track_head_output_conv_confidence_row"] == pytest.approx(
+        (2 * 3.0**2) ** 0.5
+    )
+    assert norms["track_head_output_conv_position_rows"] == pytest.approx(4.0)
+
+
+def test_the_loss_modules_introduce_no_trainable_parameters():
+    """The 231-tensor / 314,600,740-parameter freeze set must stay exact.
+
+    A future term with a learnable temperature would silently break that count, so
+    assert the loss surface is parameter-free rather than assuming it.
+    """
+
+    import arc.training.diagnostics as diagnostics_module
+    import arc.training.losses as losses_module
+
+    for module in (losses_module, diagnostics_module):
+        for name in dir(module):
+            attribute = getattr(module, name)
+            assert not isinstance(attribute, nn.Module), name
+            assert not isinstance(attribute, nn.Parameter), name
+
+
 def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch):
     """The gated number must reuse the initial alignment and anchors.
 
@@ -1076,6 +1202,11 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
         def __init__(self, value):
             self.loss = torch.tensor(value)
             self.metric_error = torch.tensor(value * 2)
+            # This test is about alignment reuse; the confidence term is off.
+            self.confidence_loss = None
+            self.confidence_sample_count = None
+            self.diagnostics = None
+            self.loss_breakdown = None
 
     def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
         calls.append((alignment, anchors))
@@ -1095,7 +1226,7 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
     monkeypatch.setattr(
         overfit_cli,
         "_tracking_only",
-        lambda raw: raw,
+        lambda raw, keep_confidence=False: raw,
     )
 
     class _StubModel:
@@ -1714,6 +1845,261 @@ def test_only_temporal_tracking_parameters_receive_gradients(dumped_scene):
         query_anchors,
     )
     result.loss.backward()
+
+    expected_prefixes = (
+        "backbone.pretrained.time_index_embedding.",
+        "motion_decoder.",
+        "track_head.",
+    )
+    for name, parameter in model.named_parameters():
+        should_train = name.startswith(expected_prefixes)
+        assert parameter.requires_grad is should_train
+        assert (parameter.grad is not None) is should_train
+
+
+def _shared_conv_predictions(scene, seed=0):
+    """Reproduce the track head's real output split: one conv, then `activate_head`.
+
+    The whole reason the confidence channel is delicate is that xyz and confidence
+    come off the *same* ``Conv2d(_, 4, 1)`` and are only separated afterwards in
+    tensor space.  Testing against a hand-built tensor pair would not exercise that;
+    this drives the actual conv and the actual ``inv_log``/``expp1`` activations, so
+    the per-row gradient claims are about the real mechanism.
+    """
+
+    torch.manual_seed(seed)
+    height, width = scene.views[0]["img"].shape[-2:]
+    conv = nn.Conv2d(2, 4, kernel_size=1)
+    features = torch.randn(scene.num_observations, 2, height, width)
+    track, confidence = activate_head(
+        conv(features),
+        activation="inv_log",
+        conf_activation="expp1",
+    )
+    raw = {
+        "track_multi": track[None, None],
+        "conf_track_multi": confidence[None, None],
+        "track_query_idx": scene.track_query_observation_slots.clone(),
+    }
+    return conv, raw
+
+
+def _anchors_for(scene, correspondences):
+    return scene.trajectories_world[
+        correspondences.query_times,
+        correspondences.trajectory_indices,
+    ].clone()
+
+
+def test_confidence_gradient_reaches_the_confidence_row_and_only_it(dumped_scene):
+    """The deliverable's central claim, tested on the real shared conv.
+
+    Row 3 of the output conv must move only because of the confidence term, and
+    rows 0-2 must be exactly what position-only training would have produced.
+    """
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    conv, raw = _shared_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    position_only = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+    )
+    position_only.total_loss.backward(retain_graph=True)
+    position_rows = conv.weight.grad[:3].clone()
+    position_bias = conv.bias.grad[:3].clone()
+    # The position term cannot reach the confidence channel at all.
+    assert torch.count_nonzero(conv.weight.grad[3]) == 0
+    conv.zero_grad(set_to_none=True)
+
+    with_confidence = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        confidence_weight=1.0,
+        confidence_alpha=100.0,
+    )
+    with_confidence.total_loss.backward(retain_graph=True)
+
+    assert torch.count_nonzero(conv.weight.grad[3]) > 0
+    torch.testing.assert_close(conv.weight.grad[:3], position_rows)
+    torch.testing.assert_close(conv.bias.grad[:3], position_bias)
+
+    # The converse: the confidence term on its own contributes nothing to xyz.
+    weight_grad, bias_grad = torch.autograd.grad(
+        with_confidence.confidence_loss,
+        [conv.weight, conv.bias],
+        retain_graph=True,
+    )
+    assert torch.count_nonzero(weight_grad[:3]) == 0
+    assert torch.count_nonzero(bias_grad[:3]) == 0
+    assert torch.count_nonzero(weight_grad[3]) > 0
+
+
+def test_total_loss_is_the_position_loss_when_confidence_is_disabled(dumped_scene):
+    """Off means never built, not multiplied by zero, so archived runs reproduce."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    assert "conf_track_multi" not in raw
+
+    result = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        query_anchors,
+    )
+
+    assert result.total_loss is result.loss
+    assert result.confidence_loss is None
+    assert result.confidence_alpha is None
+    assert result.confidence_sample_count is None
+    assert result.diagnostics is None
+    assert result.loss_breakdown is None
+
+
+def test_confidence_term_supervises_samples_the_position_mask_drops(dumped_scene):
+    """Occluded points are the signal for low confidence, so they must be included."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 50.0)
+    trajectory_index = int(correspondences.trajectory_indices[0])
+    # Slot 7 is camera 1 / time 3.
+    dumped_scene.visibility[1, 3, trajectory_index] = False
+
+    result = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        query_anchors,
+        confidence_weight=1.0,
+        confidence_alpha=1.0,
+    )
+
+    assert result.sample_count == correspondences.count * 8 - 1
+    assert result.confidence_sample_count == correspondences.count * 8
+    assert result.diagnostics["occluded_count"] == 1
+    assert result.diagnostics["visible_count"] == correspondences.count * 8 - 1
+
+
+def test_auto_alpha_puts_the_optimum_at_the_gathered_operating_point(dumped_scene):
+    """Resolved from this call's own samples, so the two statistics are commensurate."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["track_multi"] = raw["track_multi"] + 0.4
+    raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 200.0)
+
+    result = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        query_anchors,
+        confidence_weight=1.0,
+    )
+    diagnostics = result.diagnostics
+
+    assert result.confidence_alpha == pytest.approx(
+        diagnostics["mean_confidence"] * diagnostics["mean_error"]
+    )
+    assert result.confidence_alpha / diagnostics["mean_error"] == pytest.approx(
+        diagnostics["mean_confidence"],
+        rel=1e-5,
+    )
+
+
+def test_confidence_term_requires_the_confidence_prediction(dumped_scene):
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+
+    with pytest.raises(KeyError, match="conf_track_multi"):
+        sparse_tracking_loss(
+            raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            query_anchors,
+            confidence_weight=1.0,
+            confidence_alpha=1.0,
+        )
+
+
+def test_confidence_term_rejects_a_mismatched_confidence_shape(dumped_scene):
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["conf_track_multi"] = torch.ones(1, 1, 2, 3, 4)
+
+    with pytest.raises(ValueError, match="conf_track_multi"):
+        sparse_tracking_loss(
+            raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            query_anchors,
+            confidence_weight=1.0,
+            confidence_alpha=1.0,
+        )
+
+
+def test_negative_confidence_weight_is_rejected(dumped_scene):
+    correspondences = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+
+    with pytest.raises(ValueError, match="confidence_weight"):
+        sparse_tracking_loss(
+            raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            query_anchors,
+            confidence_weight=-1.0,
+        )
+
+
+def test_confidence_term_leaves_frozen_parameters_without_gradients(dumped_scene):
+    """The freeze invariant must survive the extra term, not just the position one."""
+
+    model = _tiny_arc()
+    correspondences = build_anchor_correspondences(dumped_scene)
+    height, width = dumped_scene.views[0]["img"].shape[-2:]
+    value = (
+        model.backbone.pretrained.time_index_embedding.weight.sum()
+        + model.backbone.pretrained.frozen_backbone_weight.sum()
+        + model.head.weight.sum()
+        + model.head.bias.sum()
+        + model.cam_dec.weight.sum()
+        + model.cam_dec.bias.sum()
+        + model.motion_decoder.weight.sum()
+        + model.motion_decoder.bias.sum()
+        + model.track_head.weight.sum()
+        + model.track_head.bias.sum()
+    )
+    shape = (1, 1, dumped_scene.num_observations, height, width)
+    result = sparse_tracking_loss(
+        {
+            "track_multi": value.expand(*shape, 3),
+            # Mirror `expp1`: strictly positive whatever the parameters are.
+            "conf_track_multi": (1 + value.exp()).expand(*shape),
+            "track_query_idx": dumped_scene.track_query_observation_slots,
+        },
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        _anchors_for(dumped_scene, correspondences),
+        confidence_weight=1.0,
+        confidence_alpha=10.0,
+    )
+    result.total_loss.backward()
 
     expected_prefixes = (
         "backbone.pretrained.time_index_embedding.",

@@ -5,6 +5,11 @@ module fits one scene-level Sim(3) from reconstruction geometry and mirrors
 inference by adding the detached query pointmap before transforming absolute
 positions.  Correspondence selection, pointmap anchors, and alignment are
 deliberately detached.
+
+This is the geometry and data-plumbing half.  It assembles predictions, targets and
+masks; every scalar it reports comes from ``losses.py`` (differentiable terms) or
+``diagnostics.py`` (reporting), so a new loss term can be added there without
+touching any of the indexing below.
 """
 
 from __future__ import annotations
@@ -13,14 +18,22 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from arc.models.arc.utils.transform import (
     as_homogeneous,
     pose_encoding_to_extri_intri,
     unproject_depth,
 )
+from arc.training.diagnostics import confidence_occlusion_diagnostics
 from arc.training.dumped_kubric import DumpedKubricScene
+from arc.training.losses import (
+    compose_tracking_loss,
+    per_sample_huber_error,
+    resolve_confidence_alpha,
+    track_confidence_loss,
+    track_metric_error,
+    track_position_loss,
+)
 from eval.track.track_eval_util import estimate_sim3
 
 
@@ -139,9 +152,29 @@ class SparseCorrespondences:
 
 @dataclass(frozen=True)
 class SparseTrackingLossResult:
+    """Position loss, plus whatever else was asked for.
+
+    ``loss`` stays the position-only Huber whatever else is enabled: the overfit
+    exit gate compares it against an archived run, so its meaning must not drift.
+    ``total_loss`` is what to call ``.backward()`` on.
+    """
+
     loss: torch.Tensor
     metric_error: torch.Tensor
     sample_count: int
+    total_loss: torch.Tensor | None = None
+    per_sample_error: torch.Tensor | None = None
+    target_mask: torch.Tensor | None = None
+    confidence_loss: torch.Tensor | None = None
+    confidence_mask: torch.Tensor | None = None
+    confidence_sample_count: int | None = None
+    confidence_alpha: float | None = None
+    loss_breakdown: dict | None = None
+    diagnostics: dict | None = None
+
+    def __post_init__(self) -> None:
+        if self.total_loss is None:
+            object.__setattr__(self, "total_loss", self.loss)
 
 
 def _validate_raw_query_mapping(
@@ -667,11 +700,30 @@ def sparse_tracking_loss(
     query_anchor_points: torch.Tensor,
     *,
     huber_delta_m: float = 0.05,
+    confidence_weight: float = 0.0,
+    confidence_alpha: float | None = None,
 ) -> SparseTrackingLossResult:
-    """Huber-supervise postprocess-equivalent absolute track positions."""
+    """Huber-supervise postprocess-equivalent absolute track positions.
+
+    This assembles predictions, targets and masks; every scalar it reports is
+    computed by ``losses.py`` and ``diagnostics.py``.
+
+    ``confidence_weight`` defaults to 0, which skips the confidence term entirely --
+    not multiplied by zero, but never built -- so the position-only path is exactly
+    what it was before the term existed.
+
+    ``confidence_alpha=None`` with a nonzero weight auto-calibrates alpha from this
+    call's own sparse statistics.  Resolving it here rather than in the caller is
+    what keeps the two inputs commensurate: both the mean confidence and the mean
+    error are taken over the same gathered samples.  Callers that train for more
+    than one step should resolve it once and pass the value back in, so the target
+    does not move underneath the optimizer.
+    """
 
     if huber_delta_m <= 0 or not np.isfinite(huber_delta_m):
         raise ValueError("huber_delta_m must be finite and positive")
+    if confidence_weight < 0 or not np.isfinite(confidence_weight):
+        raise ValueError("confidence_weight must be finite and non-negative")
     if correspondences.count == 0:
         raise ValueError("No eligible sparse correspondences")
     if "track_multi" not in raw_predictions:
@@ -729,13 +781,7 @@ def sparse_tracking_loss(
     ):
         raise ValueError("Sparse correspondence is outside the track-head grid")
 
-    # Rearranging makes q/y/x adjacent advanced indices and yields (M,S,3).
-    per_query_grid = tracks[0].permute(0, 2, 3, 1, 4)
-    predicted_displacement = per_query_grid[
-        correspondence.query_slots,
-        correspondence.rows,
-        correspondence.columns,
-    ].float()
+    predicted_displacement = gather_at_correspondences(tracks, correspondence)
     query_anchor_points = torch.as_tensor(
         query_anchor_points,
         device=device,
@@ -765,7 +811,8 @@ def sparse_tracking_loss(
         slot_times[:, None],
         trajectory_indices[None, :],
     ].mT
-    target_mask = target_visible & torch.isfinite(target_positions).all(dim=-1)
+    target_finite = torch.isfinite(target_positions).all(dim=-1)
+    target_mask = target_visible & target_finite
     if not target_mask.any():
         raise ValueError("No visible finite sparse query-target samples")
     if not torch.isfinite(predicted_displacement[target_mask]).all():
@@ -780,23 +827,117 @@ def sparse_tracking_loss(
         * metric_factor
     )
     target_metric = target_positions * metric_factor
-    selected_prediction = predicted_metric[target_mask]
-    selected_target = target_metric[target_mask]
 
-    loss = F.huber_loss(
-        selected_prediction,
-        selected_target,
-        reduction="mean",
-        delta=huber_delta_m,
+    loss = track_position_loss(
+        predicted_metric,
+        target_metric,
+        target_mask,
+        huber_delta=huber_delta_m,
     )
-    metric_error = torch.linalg.vector_norm(
-        selected_prediction - selected_target,
-        dim=-1,
-    ).mean()
-    if not torch.isfinite(loss) or not torch.isfinite(metric_error):
-        raise FloatingPointError("Sparse tracking loss produced NaN or Inf")
+    metric_error = track_metric_error(predicted_metric, target_metric, target_mask)
+
+    if confidence_weight == 0.0:
+        return SparseTrackingLossResult(
+            loss=loss,
+            metric_error=metric_error,
+            sample_count=int(target_mask.sum().item()),
+            target_mask=target_mask,
+        )
+
+    # The confidence set deliberately drops the visibility mask and keeps only
+    # finiteness. Occluded samples are where the error is large, so they are the
+    # signal for learning low confidence; masking them out would remove it.
+    confidence = gather_at_correspondences(
+        _validated_track_confidence(raw_predictions, tracks),
+        correspondence,
+    )
+    predicted_finite = torch.isfinite(predicted_metric).all(dim=-1)
+    confidence_mask = target_finite & predicted_finite & torch.isfinite(confidence)
+    if not confidence_mask.any():
+        raise ValueError("No finite sparse samples for the track confidence loss")
+
+    per_sample_error = per_sample_huber_error(
+        predicted_metric,
+        target_metric,
+        huber_delta=huber_delta_m,
+    )
+    if confidence_alpha is None:
+        confidence_alpha = resolve_confidence_alpha(
+            float(confidence[confidence_mask].detach().float().mean().item()),
+            float(per_sample_error[confidence_mask].detach().float().mean().item()),
+        )
+    confidence_loss = track_confidence_loss(
+        confidence,
+        per_sample_error,
+        confidence_mask,
+        alpha=float(confidence_alpha),
+    )
+    total_loss, breakdown = compose_tracking_loss(
+        {"position": loss, "confidence": confidence_loss},
+        {"position": 1.0, "confidence": confidence_weight},
+    )
+    diagnostics = confidence_occlusion_diagnostics(
+        confidence,
+        per_sample_error,
+        target_visible,
+        confidence_mask,
+    )
     return SparseTrackingLossResult(
         loss=loss,
         metric_error=metric_error,
         sample_count=int(target_mask.sum().item()),
+        total_loss=total_loss,
+        per_sample_error=per_sample_error,
+        target_mask=target_mask,
+        confidence_loss=confidence_loss,
+        confidence_mask=confidence_mask,
+        confidence_sample_count=int(confidence_mask.sum().item()),
+        confidence_alpha=float(confidence_alpha),
+        loss_breakdown=breakdown,
+        diagnostics=diagnostics,
     )
+
+
+def gather_at_correspondences(
+    grid: torch.Tensor,
+    correspondence: SparseCorrespondences,
+) -> torch.Tensor:
+    """Read a dense track-head grid at the correspondence pixels.
+
+    Accepts ``(1,Q,S,H,W,C)`` or ``(1,Q,S,H,W)`` and returns ``(M,S,C)`` or
+    ``(M,S)``.  Permuting first makes q/y/x adjacent advanced indices, which is what
+    keeps the result ordered by correspondence rather than by the broadcast rules
+    for separated advanced indices.
+    """
+
+    if grid.ndim not in (5, 6) or grid.shape[0] != 1:
+        raise ValueError(
+            "grid must have shape (1,Q,S,H,W[,C]), got " f"{tuple(grid.shape)}"
+        )
+    has_channels = grid.ndim == 6
+    per_query_grid = (
+        grid[0].permute(0, 2, 3, 1, 4) if has_channels else grid[0].permute(0, 2, 3, 1)
+    )
+    return per_query_grid[
+        correspondence.query_slots,
+        correspondence.rows,
+        correspondence.columns,
+    ].float()
+
+
+def _validated_track_confidence(
+    raw_predictions: dict,
+    tracks: torch.Tensor,
+) -> torch.Tensor:
+    if "conf_track_multi" not in raw_predictions:
+        raise KeyError(
+            "Raw predictions do not contain conf_track_multi, which the track "
+            "confidence loss needs"
+        )
+    confidence = raw_predictions["conf_track_multi"]
+    if confidence.shape != tracks.shape[:-1]:
+        raise ValueError(
+            f"conf_track_multi must have shape {tuple(tracks.shape[:-1])} to match "
+            f"track_multi, got {tuple(confidence.shape)}"
+        )
+    return confidence

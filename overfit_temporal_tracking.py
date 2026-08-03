@@ -65,6 +65,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--huber_delta_m", type=float, default=0.05)
     parser.add_argument(
+        "--confidence_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the DUSt3R-style confidence-weighted regression term. "
+            "0 (the default) trains positions only, exactly as before the term "
+            "existed, so archived runs stay reproducible. Note the two terms have "
+            "very different natural scales -- the confidence term carries an "
+            "alpha*log(conf) that is order hundreds when confidence is order "
+            "hundreds, against a position loss of order 0.03 -- so 1.0 is not "
+            "'equal weight'. Start small and read loss_breakdown in run_summary.json."
+        ),
+    )
+    parser.add_argument(
+        "--confidence_alpha",
+        default="auto",
+        help=(
+            "Log-confidence regularizer weight. 'auto' (the default) resolves it to "
+            "mean(initial confidence) * mean(initial error), which puts the term's "
+            "optimum conf*=alpha/err at the released checkpoint's operating point so "
+            "confidence is re-ordered without being level-shifted. Downstream "
+            "occlusion thresholds confidence absolutely, so the level matters."
+        ),
+    )
+    parser.add_argument(
         "--min_improvement",
         type=float,
         default=0.01,
@@ -129,6 +154,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--lr must be finite and positive")
     if not math.isfinite(args.huber_delta_m) or args.huber_delta_m <= 0:
         raise ValueError("--huber_delta_m must be finite and positive")
+    if not math.isfinite(args.confidence_weight) or args.confidence_weight < 0:
+        raise ValueError("--confidence_weight must be finite and non-negative")
+    _parse_confidence_alpha(args.confidence_alpha)
     if not math.isfinite(args.min_improvement) or not 0 <= args.min_improvement < 1:
         raise ValueError("--min_improvement must be finite and in [0, 1)")
     if query_time != 0:
@@ -136,6 +164,22 @@ def _validate_args(args: argparse.Namespace) -> None:
             "Sparse training requires --query_time 0 because the dump contains "
             "only depth0. Use --parse_only for other windows."
         )
+
+
+def _parse_confidence_alpha(value) -> float | None:
+    """Return None for 'auto', otherwise the explicit positive float."""
+
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    try:
+        alpha = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"--confidence_alpha must be 'auto' or a float, got {value!r}"
+        ) from None
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("--confidence_alpha must be finite and positive")
+    return alpha
 
 
 def _validate_scene_layout(scene) -> None:
@@ -254,13 +298,65 @@ def _move_views_to_cuda(views: list[dict]) -> None:
             view[key] = view[key].to("cuda", non_blocking=True)
 
 
-def _tracking_only(raw_predictions: dict) -> dict:
-    """Drop unused reconstruction branches promptly to reduce retained memory."""
+def _tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
+    """Drop unused reconstruction branches promptly to reduce retained memory.
 
-    return {
+    ``conf_track_multi`` is kept only when the confidence term needs it, so a
+    position-only run retains exactly what it retained before.
+    """
+
+    kept = {
         "track_multi": raw_predictions["track_multi"],
         "track_query_idx": raw_predictions["track_query_idx"],
     }
+    if keep_confidence:
+        kept["conf_track_multi"] = raw_predictions["conf_track_multi"]
+    return kept
+
+
+def _implied_optimal_confidence(alpha, diagnostics) -> float | None:
+    """Where the confidence term wants confidence to sit, given the current error."""
+
+    if alpha is None or not diagnostics:
+        return None
+    mean_error = diagnostics.get("mean_error")
+    if mean_error is None or mean_error <= 0:
+        return None
+    return float(alpha) / float(mean_error)
+
+
+def _confidence_gradient_norms(model) -> dict[str, float]:
+    """Attribute the final track conv's gradient to its confidence and xyz rows.
+
+    xyz and confidence come off the same ``Conv2d(_, 4, 1)``: rows 0-2 are the
+    position term's contribution and row 3 is the confidence term's.  Because the
+    confidence term detaches the error, that split is exact -- no second backward
+    pass is needed to attribute it.
+    """
+
+    output_conv = model.track_head.scratch.output_conv2[2]
+    # The split is only meaningful for the 4-channel xyz+conf head. Fail loudly if
+    # the head is ever rebuilt with a different output_dim rather than silently
+    # reporting a norm over the wrong rows.
+    if output_conv.out_channels != 4:
+        raise RuntimeError(
+            "Expected a 4-channel track output conv (3 xyz + 1 confidence), got "
+            f"{output_conv.out_channels}"
+        )
+    norms = {}
+    for label, rows in (
+        ("track_head_output_conv_position_rows", slice(0, 3)),
+        ("track_head_output_conv_confidence_row", slice(3, 4)),
+    ):
+        total = 0.0
+        for parameter in (output_conv.weight, output_conv.bias):
+            if parameter is None or parameter.grad is None:
+                continue
+            total += float(
+                parameter.grad[rows].detach().float().norm().item() ** 2
+            )
+        norms[label] = float(total**0.5)
+    return norms
 
 
 def _exit_criteria_failure(
@@ -323,6 +419,8 @@ def _evaluate(
     huber_delta_m,
     initial_alignment,
     initial_query_anchors,
+    confidence_weight=0.0,
+    confidence_alpha=None,
 ):
     """Score the trained model two ways.
 
@@ -345,7 +443,7 @@ def _evaluate(
             correspondences,
         )
         confidence_stats = _confidence_stats(raw)
-        raw = _tracking_only(raw)
+        raw = _tracking_only(raw, keep_confidence=confidence_weight > 0)
         refit = sparse_tracking_loss(
             raw,
             scene,
@@ -353,6 +451,8 @@ def _evaluate(
             alignment,
             query_anchors,
             huber_delta_m=huber_delta_m,
+            confidence_weight=confidence_weight,
+            confidence_alpha=confidence_alpha,
         )
         like_for_like = sparse_tracking_loss(
             raw,
@@ -361,6 +461,8 @@ def _evaluate(
             initial_alignment,
             initial_query_anchors,
             huber_delta_m=huber_delta_m,
+            confidence_weight=confidence_weight,
+            confidence_alpha=confidence_alpha,
         )
     return {
         "loss_refit": float(refit.loss.item()),
@@ -370,6 +472,14 @@ def _evaluate(
         "alignment": alignment,
         "alignment_report": alignment_report,
         "confidence": confidence_stats,
+        "confidence_loss": (
+            None
+            if like_for_like.confidence_loss is None
+            else float(like_for_like.confidence_loss.item())
+        ),
+        "confidence_sample_count": like_for_like.confidence_sample_count,
+        "confidence_diagnostics": like_for_like.diagnostics,
+        "loss_breakdown": like_for_like.loss_breakdown,
     }
 
 
@@ -457,17 +567,40 @@ def main() -> None:
         scene,
         correspondences,
     )
+    confidence_enabled = args.confidence_weight > 0
+    requested_alpha = _parse_confidence_alpha(args.confidence_alpha)
     initial_result = sparse_tracking_loss(
-        _tracking_only(initial_raw),
+        _tracking_only(initial_raw, keep_confidence=confidence_enabled),
         scene,
         correspondences,
         initial_alignment,
         initial_query_anchors,
         huber_delta_m=args.huber_delta_m,
+        confidence_weight=args.confidence_weight,
+        confidence_alpha=requested_alpha,
     )
     initial_confidence = _confidence_stats(initial_raw)
     initial_loss = float(initial_result.loss.item())
     initial_error = float(initial_result.metric_error.item())
+    # Resolve alpha once, here, from the untrained model. Re-resolving every step
+    # would chase the confidence the term is itself moving, and the optimum would
+    # never settle.
+    confidence_alpha = initial_result.confidence_alpha
+    initial_confidence_loss = (
+        None
+        if initial_result.confidence_loss is None
+        else float(initial_result.confidence_loss.item())
+    )
+    initial_confidence_diagnostics = initial_result.diagnostics
+    initial_loss_breakdown = initial_result.loss_breakdown
+    if confidence_enabled:
+        print(
+            "confidence_term="
+            f"weight {args.confidence_weight:.6g}, alpha {confidence_alpha:.6g} "
+            f"({'auto' if requested_alpha is None else 'explicit'}), "
+            f"{initial_result.confidence_sample_count} samples "
+            f"(position uses {initial_result.sample_count})"
+        )
     # initial_query_anchors is deliberately kept: the pass/fail gate re-scores the
     # trained model against this same alignment and these same anchors.
     del initial_raw, initial_result
@@ -495,6 +628,7 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
 
     last_gradient_norms = None
+    last_confidence_gradient_norms = None
     for step in range(args.steps):
         # Root/backbone training mode enables DINO activation checkpointing and
         # the memory-safe one-frame track-head chunk. ViT-G has zero drop path.
@@ -518,7 +652,7 @@ def main() -> None:
                 correspondences,
             )
             step_confidence = _confidence_stats(raw)
-            raw = _tracking_only(raw)
+            raw = _tracking_only(raw, keep_confidence=confidence_enabled)
             result = sparse_tracking_loss(
                 raw,
                 scene,
@@ -526,9 +660,11 @@ def main() -> None:
                 alignment,
                 query_anchors,
                 huber_delta_m=args.huber_delta_m,
+                confidence_weight=args.confidence_weight,
+                confidence_alpha=confidence_alpha,
             )
 
-        scaler.scale(result.loss).backward()
+        scaler.scale(result.total_loss).backward()
         scaler.unscale_(optimizer)
         _assert_trainable_gradients_finite(model)
         embedding_gradient = embedding.weight.grad
@@ -551,6 +687,19 @@ def main() -> None:
             raise RuntimeError(
                 "MotionDecoder or track-head gradient norm is zero"
             )
+        last_confidence_gradient_norms = (
+            _confidence_gradient_norms(model) if confidence_enabled else None
+        )
+        if (
+            last_confidence_gradient_norms is not None
+            and last_confidence_gradient_norms[
+                "track_head_output_conv_confidence_row"
+            ] == 0
+        ):
+            raise RuntimeError(
+                "Confidence term is enabled but the track head's confidence output "
+                "row received no gradient"
+            )
         _assert_frozen_gradients_absent(model)
         scaler.step(optimizer)
         scaler.update()
@@ -563,6 +712,12 @@ def main() -> None:
                 f" conf_p50={step_confidence['p50']:.6g}"
             )
         )
+        if confidence_enabled:
+            confidence_log += (
+                f" conf_loss={result.confidence_loss.detach().item():.6g}"
+                " grad_conf="
+                f"{last_confidence_gradient_norms['track_head_output_conv_confidence_row']:.6g}"
+            )
         print(
             f"step={step + 1}/{args.steps} "
             f"loss={result.loss.detach().item():.8f} "
@@ -581,6 +736,8 @@ def main() -> None:
         args.huber_delta_m,
         initial_alignment,
         initial_query_anchors,
+        confidence_weight=args.confidence_weight,
+        confidence_alpha=confidence_alpha,
     )
     final_loss = evaluation["loss"]
     final_error = evaluation["metric_error_m"]
@@ -641,10 +798,38 @@ def main() -> None:
         "initial_metric_error_m": initial_error,
         "final_metric_error_m": final_error,
         "final_metric_error_refit_m": evaluation["metric_error_refit_m"],
-        # Unsupervised: see _confidence_stats. Reported so an OA/AJ move can be
-        # attributed to confidence drift rather than to tracking.
+        # Unsupervised unless --confidence_weight is set: see _confidence_stats.
+        # Reported so an OA/AJ move can be attributed to confidence drift rather
+        # than to tracking.
         "initial_track_confidence": initial_confidence,
         "final_track_confidence": evaluation["confidence"],
+        "confidence_weight": args.confidence_weight,
+        "confidence_alpha": confidence_alpha,
+        "confidence_alpha_mode": (
+            None
+            if not confidence_enabled
+            else ("auto" if requested_alpha is None else "explicit")
+        ),
+        "initial_confidence_loss": initial_confidence_loss,
+        "final_confidence_loss": evaluation["confidence_loss"],
+        "confidence_sample_count": evaluation["confidence_sample_count"],
+        # Unweighted per-term values. The position and confidence terms have very
+        # different natural scales, so this is what says whether the chosen
+        # --confidence_weight actually balances them.
+        "initial_loss_breakdown": initial_loss_breakdown,
+        "final_loss_breakdown": evaluation["loss_breakdown"],
+        # conf* = alpha / err is the term's optimum, with err the same per-sample
+        # Huber error alpha was calibrated against -- not the L2 metric error, which
+        # is a different quantity. Compare against the reported track confidence to
+        # see whether the term is holding the pretrained level or dragging it
+        # somewhere the downstream absolute threshold will notice.
+        "implied_optimal_confidence": _implied_optimal_confidence(
+            confidence_alpha,
+            evaluation["confidence_diagnostics"],
+        ),
+        "initial_confidence_diagnostics": initial_confidence_diagnostics,
+        "final_confidence_diagnostics": evaluation["confidence_diagnostics"],
+        "confidence_gradient_norms": last_confidence_gradient_norms,
         "initial_temporal_embedding_norm": initial_embedding_norm,
         "final_temporal_embedding_norm": embedding_norm,
         "temporal_embedding_change": embedding_change,
