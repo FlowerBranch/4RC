@@ -11,6 +11,9 @@ from arc.training import (
     confidence_occlusion_diagnostics,
     per_sample_huber_error,
     resolve_confidence_alpha,
+    synchronized_consistency_loss,
+    synchronized_consistency_stats,
+    synchronized_pair_indices,
     track_confidence_loss,
     track_metric_error,
     track_position_loss,
@@ -378,3 +381,132 @@ def test_diagnostics_mean_error_is_the_denominator_of_the_implied_optimum():
 
     assert report["mean_error"] == pytest.approx(2.0)
     assert math.isclose(report["mean_confidence"], 200.0)
+
+
+# ----------------------------------------------------- synchronized pairs ---
+def test_synchronized_pair_indices_pair_camera_major_layouts():
+    first, second = synchronized_pair_indices(torch.tensor([0, 1, 2, 0, 1, 2]))
+    assert list(zip(first, second)) == [(0, 3), (1, 4), (2, 5)]
+
+    # Three cameras of one instant: all pairs of the triple.
+    first, second = synchronized_pair_indices(torch.tensor([0, 0, 0]))
+    assert list(zip(first, second)) == [(0, 1), (0, 2), (1, 2)]
+
+    # Monocular video: nothing is synchronized.
+    assert synchronized_pair_indices(torch.tensor([0, 1, 2])) == ([], [])
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        synchronized_pair_indices(torch.zeros(2, 2))
+
+
+def _paired_fields(seed=0):
+    """(1,Q,S,H,W,3) fields for a 2-camera x 2-time window, exactly consistent."""
+
+    generator = torch.Generator().manual_seed(seed)
+    fields = torch.randn(1, 1, 4, 2, 2, 3, generator=generator)
+    slot_time_indices = torch.tensor([0, 1, 0, 1])
+    fields[:, :, 2] = fields[:, :, 0]
+    fields[:, :, 3] = fields[:, :, 1]
+    return fields, slot_time_indices
+
+
+def test_sync_loss_is_zero_for_consistent_fields_and_positive_otherwise():
+    fields, slot_time_indices = _paired_fields()
+
+    loss = synchronized_consistency_loss(
+        fields, slot_time_indices, huber_delta=0.05
+    )
+    assert loss.item() == 0.0
+
+    perturbed = fields.clone()
+    perturbed[:, :, 3] += 0.01
+    assert synchronized_consistency_loss(
+        perturbed, slot_time_indices, huber_delta=0.05
+    ).item() > 0.0
+
+
+def test_sync_loss_ignores_differences_between_different_times():
+    """Only same-instant disagreement is a defect; motion across times is not."""
+
+    fields, slot_time_indices = _paired_fields()
+    moved = fields.clone()
+    # Move both time-1 slots identically: cross-time difference changes, the
+    # same-index pairs stay equal.
+    moved[:, :, 1] += 5.0
+    moved[:, :, 3] += 5.0
+
+    loss = synchronized_consistency_loss(moved, slot_time_indices, huber_delta=0.05)
+    assert loss.item() == 0.0
+
+
+def test_sync_loss_metric_scale_is_quadratic_below_the_huber_knee():
+    fields, slot_time_indices = _paired_fields()
+    perturbed = fields.clone()
+    perturbed[:, :, 2] += 1e-3
+
+    small = synchronized_consistency_loss(
+        perturbed, slot_time_indices, huber_delta=1.0, metric_scale=1.0
+    )
+    doubled = synchronized_consistency_loss(
+        perturbed, slot_time_indices, huber_delta=1.0, metric_scale=2.0
+    )
+    assert doubled.item() == pytest.approx(4.0 * small.item(), rel=1e-5)
+
+
+def test_sync_loss_gradient_reaches_only_paired_slots():
+    generator = torch.Generator().manual_seed(1)
+    fields = torch.randn(1, 1, 3, 2, 2, 3, generator=generator).requires_grad_(True)
+    # Slot 1 shares its index with nobody, so no pair touches it.
+    slot_time_indices = torch.tensor([0, 1, 0])
+
+    synchronized_consistency_loss(
+        fields, slot_time_indices, huber_delta=10.0
+    ).backward()
+
+    assert fields.grad is not None
+    assert fields.grad[:, :, 0].abs().sum() > 0
+    assert fields.grad[:, :, 2].abs().sum() > 0
+    assert fields.grad[:, :, 1].abs().sum() == 0
+
+
+def test_sync_loss_validates_inputs():
+    fields, slot_time_indices = _paired_fields()
+
+    with pytest.raises(ValueError, match=r"\(1,Q,S,H,W,3\)"):
+        synchronized_consistency_loss(
+            fields[0], slot_time_indices, huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="one entry per observation slot"):
+        synchronized_consistency_loss(
+            fields, slot_time_indices[:3], huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="No synchronized observation pairs"):
+        synchronized_consistency_loss(
+            fields, torch.tensor([0, 1, 2, 3]), huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="huber_delta"):
+        synchronized_consistency_loss(fields, slot_time_indices, huber_delta=0.0)
+    with pytest.raises(ValueError, match="metric_scale"):
+        synchronized_consistency_loss(
+            fields, slot_time_indices, huber_delta=0.05, metric_scale=0.0
+        )
+
+
+def test_sync_stats_report_metric_disagreement_and_skip_unpaired_windows():
+    fields, slot_time_indices = _paired_fields()
+    perturbed = fields.clone()
+    # A uniform 3 mm offset on one synchronized slot: every pixel of that pair
+    # disagrees by exactly sqrt(3 * 0.003^2) after the metric lift below.
+    perturbed[:, :, 2] += 0.003
+
+    stats = synchronized_consistency_stats(
+        perturbed, slot_time_indices, metric_scale=2.0
+    )
+    expected = 2.0 * (3 * 0.003**2) ** 0.5
+    assert stats["pair_count"] == 2
+    assert stats["p90_m"] >= stats["median_m"] >= 0.0
+    assert stats["mean_m"] == pytest.approx(expected / 2.0, rel=1e-5)
+
+    assert synchronized_consistency_stats(
+        fields, torch.tensor([0, 1, 2, 3])
+    ) is None

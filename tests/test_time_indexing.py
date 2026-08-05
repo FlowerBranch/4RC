@@ -13,6 +13,7 @@ from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
 # in sparse_tracking (and its eval.* dependency) for these tests.
 from arc.training.checkpoint import (
     load_temporal_tracking_checkpoint,
+    read_temporal_patch_metadata,
     save_temporal_tracking_checkpoint,
 )
 
@@ -1092,3 +1093,405 @@ def test_released_checkpoint_load():
     assert torch.count_nonzero(
         model.backbone.pretrained.time_index_embedding.weight
     ) == 0
+
+
+# ------------------------------------------------------------------------------
+# temporal_tracking_global_attention: the freeze mode that can learn fusion
+# ------------------------------------------------------------------------------
+
+
+class _GlobalAttnTinyPretrained(nn.Module):
+    """Minimal encoder shape the new freeze mode needs: blocks plus alt_start."""
+
+    def __init__(self, alt_start=1, block_count=4):
+        super().__init__()
+        self.alt_start = alt_start
+        self.blocks = nn.ModuleList(
+            [nn.Linear(2, 2) for _ in range(block_count)]
+        )
+        self.time_index_embedding = nn.Embedding(4, 2)
+        nn.init.zeros_(self.time_index_embedding.weight)
+
+
+class _GlobalAttnTinyBackbone(nn.Module):
+    def __init__(self, alt_start=1):
+        super().__init__()
+        self.pretrained = _GlobalAttnTinyPretrained(alt_start=alt_start)
+
+
+class _GlobalAttnTinyArc(Arc):
+    def __init__(self, freeze="none", alt_start=1):
+        nn.Module.__init__(self)
+        self.max_time_indices = 4
+        self.backbone = _GlobalAttnTinyBackbone(alt_start=alt_start)
+        self.head = nn.Linear(2, 2)
+        self.cam_dec = nn.Linear(2, 2)
+        self.motion_decoder = nn.Linear(2, 2)
+        self.track_head = nn.Linear(2, 2)
+        self.set_freeze(freeze)
+
+
+def test_global_attention_freeze_unfreezes_only_odd_blocks_from_alt_start():
+    model = _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention")
+
+    trainable_blocks = {
+        index
+        for index, block in enumerate(model.backbone.pretrained.blocks)
+        if any(parameter.requires_grad for parameter in block.parameters())
+    }
+    assert trainable_blocks == {1, 3}
+    for index in (0, 2):
+        assert not any(
+            parameter.requires_grad
+            for parameter in model.backbone.pretrained.blocks[index].parameters()
+        )
+    assert model.backbone.pretrained.time_index_embedding.weight.requires_grad
+    assert model.motion_decoder.weight.requires_grad
+    assert not model.head.weight.requires_grad
+    assert not model.cam_dec.weight.requires_grad
+
+    # Reversible in both directions.
+    model.set_freeze("temporal_tracking")
+    assert not any(
+        parameter.requires_grad
+        for block in model.backbone.pretrained.blocks
+        for parameter in block.parameters()
+    )
+    model.set_freeze("none")
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_global_attention_freeze_requires_alternating_attention():
+    with pytest.raises(ValueError, match="alt_start"):
+        _GlobalAttnTinyArc(
+            freeze="temporal_tracking_global_attention",
+            alt_start=-1,
+        )
+
+
+def test_global_attention_freeze_is_exact_on_the_full_model():
+    """Pin the exact trainable set of the new mode on the real 1.5B Arc.
+
+    The counts are also asserted at runtime by overfit_temporal_tracking.py's
+    EXPECTED_TRAINABLE_SETS; the two must agree.
+    """
+
+    model = _full_meta_arc()
+    model.set_freeze("temporal_tracking_global_attention")
+    report = model.get_trainable_parameter_report()
+
+    encoder = model.backbone.pretrained
+    expected_names = {
+        "backbone.pretrained.time_index_embedding.weight",
+        *{
+            f"motion_decoder.{name}"
+            for name, _ in model.motion_decoder.named_parameters()
+        },
+        *{
+            f"track_head.{name}"
+            for name, _ in model.track_head.named_parameters()
+        },
+        *{
+            f"backbone.pretrained.blocks.{index}.{name}"
+            for index in range(13, 40, 2)
+            for name, _ in encoder.blocks[index].named_parameters()
+        },
+    }
+    assert {name for name, _ in report["parameters"]} == expected_names
+    assert report["tensor_count"] == 483
+    assert report["parameter_count"] == 711_317_284
+
+    # Local blocks, everything below alt_start, and the frozen heads stay put.
+    for index in (0, 12, 14, 38):
+        assert not any(
+            parameter.requires_grad
+            for parameter in encoder.blocks[index].parameters()
+        )
+    assert not any(parameter.requires_grad for parameter in model.head.parameters())
+    assert not any(
+        parameter.requires_grad for parameter in model.cam_dec.parameters()
+    )
+
+    model.set_freeze("temporal_tracking")
+    narrowed = model.get_trainable_parameter_report()
+    assert narrowed["tensor_count"] == 231
+    assert narrowed["parameter_count"] == 314_600_740
+
+
+def test_global_attention_mode_backward_reaches_all_unfrozen_blocks():
+    """Training-path guard for the new mode on a real small encoder.
+
+    Runs the actual DinoVisionTransformer in train mode, so the global blocks
+    go through torch.utils.checkpoint; every parameter of every unfrozen block
+    must come back with a finite gradient, and every frozen block with none.
+    """
+
+    torch.manual_seed(0)
+    encoder = DinoVisionTransformer(
+        img_size=28,
+        patch_size=14,
+        embed_dim=8,
+        depth=6,
+        num_heads=2,
+        ffn_layer="mlp",
+        alt_start=3,
+        qknorm_start=3,
+        rope_start=3,
+        cat_token=True,
+        has_time_token=True,
+        max_time_indices=4,
+    )
+    with torch.no_grad():
+        encoder.camera_token.normal_()
+        encoder.time_token.normal_()
+        encoder.pos_embed.normal_(std=0.02)
+    encoder.reinitialize_time_index_embedding(
+        "orthogonal",
+        scale=0.1,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    class _EncoderBackbone(nn.Module):
+        def __init__(self, pretrained):
+            super().__init__()
+            self.pretrained = pretrained
+
+    model = _arc_shell(max_time_indices=4)
+    model.backbone = _EncoderBackbone(encoder)
+    model.head = nn.Linear(2, 2)
+    model.cam_dec = nn.Linear(2, 2)
+    model.motion_decoder = nn.Linear(2, 2)
+    model.track_head = nn.Linear(2, 2)
+    model.set_freeze("temporal_tracking_global_attention")
+
+    encoder.train()
+    images = torch.randn(1, 4, 3, 28, 28)
+    outputs, _ = encoder._get_intermediate_layers_not_chunked(
+        images,
+        n=[5],
+        ref_view_strategy="first",
+        time_indices=torch.tensor([[0, 1, 0, 1]]),
+    )
+    outputs[0][1].sum().backward()
+
+    global_blocks = {3, 5}
+    for index, block in enumerate(encoder.blocks):
+        for name, parameter in block.named_parameters():
+            if index in global_blocks:
+                assert parameter.requires_grad, f"blocks.{index}.{name}"
+                assert parameter.grad is not None, f"blocks.{index}.{name}"
+                assert torch.isfinite(parameter.grad).all(), f"blocks.{index}.{name}"
+            else:
+                assert not parameter.requires_grad, f"blocks.{index}.{name}"
+                assert parameter.grad is None, f"blocks.{index}.{name}"
+    assert encoder.time_index_embedding.weight.grad is not None
+
+
+# ------------------------------------------------------------------------------
+# reinitialize_time_index_embedding
+# ------------------------------------------------------------------------------
+
+
+def test_reinitialize_orthogonal_writes_scaled_orthonormal_rows():
+    model = _configured_time_transformer()  # 7 rows, embed_dim 8
+
+    model.reinitialize_time_index_embedding(
+        "orthogonal",
+        scale=0.25,
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    weight = model.time_index_embedding.weight
+    expected_row_norm = 0.25 * model.time_token.detach().float().norm()
+    torch.testing.assert_close(
+        weight.norm(dim=1),
+        expected_row_norm.expand(7),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    gram = weight @ weight.T
+    off_diagonal = gram - torch.diag(torch.diagonal(gram))
+    assert off_diagonal.abs().max() < 1e-4
+    assert weight.requires_grad
+
+
+def test_reinitialize_is_deterministic_under_a_seed_and_leaves_the_token_alone():
+    reference = _configured_time_transformer()
+    token_before = reference.time_token.detach().clone()
+
+    reference.reinitialize_time_index_embedding(
+        "orthogonal", generator=torch.Generator().manual_seed(11)
+    )
+    first = reference.time_index_embedding.weight.detach().clone()
+    assert torch.equal(reference.time_token.detach(), token_before)
+
+    repeat = _configured_time_transformer()
+    with torch.no_grad():
+        # Same time_token, so the same seed must reproduce the same rows.
+        repeat.time_token.copy_(token_before)
+    repeat.reinitialize_time_index_embedding(
+        "orthogonal", generator=torch.Generator().manual_seed(11)
+    )
+    assert torch.equal(repeat.time_index_embedding.weight.detach(), first)
+
+    repeat.reinitialize_time_index_embedding(
+        "orthogonal", generator=torch.Generator().manual_seed(12)
+    )
+    assert not torch.equal(repeat.time_index_embedding.weight.detach(), first)
+
+
+def test_reinitialize_zeros_restores_the_constructor_state():
+    model = _configured_time_transformer()
+    model.reinitialize_time_index_embedding(
+        "orthogonal", generator=torch.Generator().manual_seed(0)
+    )
+    assert torch.count_nonzero(model.time_index_embedding.weight) > 0
+
+    model.reinitialize_time_index_embedding("zeros")
+
+    assert torch.count_nonzero(model.time_index_embedding.weight) == 0
+
+
+def test_reinitialize_keeps_the_legacy_no_index_path_bit_identical():
+    """The orthogonal rows enter only through time_indices lookups.
+
+    Complements test_zero_initialized_time_indices_match_legacy_tokens_and_outputs:
+    that test pins the zero table, this one pins that a *nonzero* table still
+    leaves an index-free forward untouched.
+    """
+
+    model = _configured_time_transformer()
+    legacy_tokens = model._prepare_time_tokens(1, 3, None).detach().clone()
+
+    model.reinitialize_time_index_embedding(
+        "orthogonal", generator=torch.Generator().manual_seed(0)
+    )
+
+    assert torch.equal(model._prepare_time_tokens(1, 3, None), legacy_tokens)
+    assert not torch.equal(
+        model._prepare_time_tokens(1, 3, torch.tensor([[0, 1, 2]])),
+        legacy_tokens,
+    )
+
+
+def test_reinitialize_validates_mode_scale_and_table_shape():
+    model = _configured_time_transformer()
+
+    with pytest.raises(ValueError, match="Unknown time-embedding init mode"):
+        model.reinitialize_time_index_embedding("sinusoidal")
+    with pytest.raises(ValueError, match="scale"):
+        model.reinitialize_time_index_embedding("orthogonal", scale=0.0)
+    with pytest.raises(ValueError, match="scale"):
+        model.reinitialize_time_index_embedding("orthogonal", scale=float("nan"))
+
+    oversized = _configured_time_transformer(max_time_indices=9)  # 9 rows > dim 8
+    with pytest.raises(ValueError, match="at most"):
+        oversized.reinitialize_time_index_embedding("orthogonal")
+
+    tokenless = DinoVisionTransformer(
+        img_size=14,
+        patch_size=14,
+        embed_dim=8,
+        depth=3,
+        num_heads=2,
+        mlp_ratio=2,
+        alt_start=2,
+        has_time_token=False,
+        cat_token=False,
+    )
+    with pytest.raises(ValueError, match="no time token"):
+        tokenless.reinitialize_time_index_embedding("orthogonal")
+
+
+# ------------------------------------------------------------------------------
+# patch checkpoint format v2
+# ------------------------------------------------------------------------------
+
+
+def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+    metadata = read_temporal_patch_metadata(patch)
+
+    assert metadata == {
+        "freeze_mode": "temporal_tracking",
+        "max_time_indices": 4,
+    }
+
+
+def test_patch_save_requires_a_temporal_freeze_mode(tmp_path):
+    unfrozen = _TinyHubArc(freeze="none")
+
+    with pytest.raises(ValueError, match="model.freeze"):
+        save_temporal_tracking_checkpoint(unfrozen, tmp_path / "patch.pt")
+
+
+def test_patches_predating_the_freeze_mode_field_are_rejected(tmp_path):
+    """Pre-freeze_mode patches also predate the motion-decoder gradient fix,
+    so they carry weights trained on corrupted gradients; refuse them with an
+    error that says to re-train rather than pretending they are loadable."""
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    payload = {
+        "format_version": torch.tensor(1, dtype=torch.int64),
+        "state_dict": {
+            name: parameter.detach().clone()
+            for name, parameter in trained.named_parameters()
+            if parameter.requires_grad
+        },
+    }
+    path = tmp_path / "legacy_patch.pt"
+    torch.save(payload, path)
+
+    with pytest.raises(RuntimeError, match="re-run the overfit"):
+        read_temporal_patch_metadata(path)
+    with pytest.raises(RuntimeError, match="re-run the overfit"):
+        load_temporal_tracking_checkpoint(
+            _TinyHubArc(freeze="temporal_tracking"), path
+        )
+
+
+def test_patch_freeze_mode_mismatch_is_rejected_and_matching_mode_loads(tmp_path):
+    trained = _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention")
+    with torch.no_grad():
+        trained.backbone.pretrained.blocks[1].weight.fill_(1.25)
+        trained.backbone.pretrained.time_index_embedding.weight.fill_(0.5)
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+    metadata = read_temporal_patch_metadata(patch)
+    assert metadata["freeze_mode"] == "temporal_tracking_global_attention"
+
+    mismatched = _GlobalAttnTinyArc(freeze="temporal_tracking")
+    with pytest.raises(ValueError, match="temporal_tracking_global_attention"):
+        load_temporal_tracking_checkpoint(mismatched, patch)
+
+    restored = _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention")
+    load_temporal_tracking_checkpoint(restored, patch)
+    torch.testing.assert_close(
+        restored.backbone.pretrained.blocks[1].weight,
+        trained.backbone.pretrained.blocks[1].weight,
+    )
+    torch.testing.assert_close(
+        restored.backbone.pretrained.time_index_embedding.weight,
+        trained.backbone.pretrained.time_index_embedding.weight,
+    )
+
+
+def test_new_mode_patch_covers_the_trained_encoder_blocks(tmp_path):
+    """The save path must key off the mode the run trained under.
+
+    Re-asserting the narrower temporal_tracking mode before saving would
+    silently drop every trained encoder tensor from the patch; keyed off the
+    trained mode, the encoder blocks round-trip.
+    """
+
+    trained = _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention")
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+    payload = torch.load(patch, map_location="cpu", weights_only=True)
+    saved_names = set(payload["state_dict"])
+    assert "backbone.pretrained.blocks.1.weight" in saved_names
+    assert "backbone.pretrained.blocks.3.weight" in saved_names
+    assert "backbone.pretrained.blocks.0.weight" not in saved_names
+    assert "backbone.pretrained.blocks.2.weight" not in saved_names

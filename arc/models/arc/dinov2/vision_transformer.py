@@ -344,6 +344,61 @@ class DinoVisionTransformer(nn.Module):
             time_tokens = time_tokens + self.time_index_embedding(time_indices)
         return time_tokens.unsqueeze(2)
 
+    def reinitialize_time_index_embedding(self, mode, *, scale=0.1, generator=None):
+        """Re-seed the time-index table before fine-tuning.
+
+        The constructor zero-initializes the table so that loading the released
+        checkpoint stays bit-identical to upstream. Zero rows carry no
+        information and, at typical fine-tuning learning rates, cannot grow into
+        a signal within a short run, so a training driver calls this *after*
+        ``from_pretrained`` to start from distinct per-index offsets.
+
+        ``mode="zeros"`` resets the table to the constructor state.
+        ``mode="orthogonal"`` writes mutually orthogonal rows, each with norm
+        ``scale * ||time_token||`` of this model's loaded time token, so the
+        perturbation is calibrated to the checkpoint rather than to an absolute
+        constant. Orthogonal rather than sinusoidal because different indices
+        must stay maximally distinguishable — adjacent times most of all — and
+        any ordinal structure can still be learned, since the table remains
+        trainable.
+
+        Rows are generated on the CPU from ``generator`` and copied over, so
+        the result is deterministic for a given seed regardless of the model's
+        device, and the call consumes nothing from the global RNG stream.
+        """
+
+        if not self.has_time_token:
+            raise ValueError("This encoder has no time token to index")
+        weight = self.time_index_embedding.weight
+        if mode == "zeros":
+            with torch.no_grad():
+                weight.zero_()
+            return
+        if mode != "orthogonal":
+            raise ValueError(
+                f"Unknown time-embedding init mode '{mode}'. "
+                "Expected 'zeros' or 'orthogonal'"
+            )
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("scale must be finite and positive")
+        rows, dim = weight.shape
+        if rows > dim:
+            raise ValueError(
+                f"Orthogonal init supports at most embed_dim={dim} rows, "
+                f"got {rows}"
+            )
+        token_norm = self.time_token.detach().float().norm()
+        if not torch.isfinite(token_norm) or token_norm <= 0:
+            raise ValueError(
+                "time_token norm must be finite and positive to calibrate the "
+                f"orthogonal init, got {token_norm.item()}"
+            )
+        with torch.no_grad():
+            basis = torch.empty(rows, dim, dtype=torch.float32)
+            nn.init.orthogonal_(basis, generator=generator)
+            basis = basis * (float(scale) * token_norm.item())
+            weight.copy_(basis.to(device=weight.device, dtype=weight.dtype))
+
     def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=[], **kwargs):
         B, S, _, H, W = x.shape
         time_indices = self._validate_time_indices(
@@ -419,8 +474,13 @@ class DinoVisionTransformer(nn.Module):
             raise ValueError(f"Invalid attention type: {attn_type}")
 
         if attn_type == "global" and self.training:
+            # Non-reentrant checkpointing: unlike the reentrant default it
+            # computes gradients for the block's own parameters even when no
+            # input tensor requires grad, which matters for freeze modes that
+            # train these blocks on inputs produced by frozen layers.
             x = torch.utils.checkpoint.checkpoint(
-                lambda inp, p, m: block(inp, pos=p, attn_mask=m), x, pos, attn_mask
+                lambda inp, p, m: block(inp, pos=p, attn_mask=m), x, pos, attn_mask,
+                use_reentrant=False,
             )
         else:
             x = block(x, pos=pos, attn_mask=attn_mask)

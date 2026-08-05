@@ -32,6 +32,12 @@ class Arc(
     PATCH_SIZE = 14
     TIME_INDEX_KEY = "time_index"
     MAX_TIME_INDICES = 32
+    # Freeze presets that train the temporal-tracking stack; set_freeze is the
+    # single authority on mode names.
+    TEMPORAL_FREEZE_MODES = (
+        "temporal_tracking",
+        "temporal_tracking_global_attention",
+    )
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
     )
@@ -274,18 +280,34 @@ class Arc(
         return output_list
 
     def set_freeze(self, freeze):
-        supported_modes = {"none", "temporal_tracking"}
+        supported_modes = {"none", *self.TEMPORAL_FREEZE_MODES}
         if freeze not in supported_modes:
             raise ValueError(
                 f"Unknown freeze mode '{freeze}'. Expected one of {sorted(supported_modes)}"
             )
 
         self.requires_grad_(True)
-        if freeze == "temporal_tracking":
+        if freeze in self.TEMPORAL_FREEZE_MODES:
             self.requires_grad_(False)
             self.backbone.pretrained.time_index_embedding.requires_grad_(True)
             self.motion_decoder.requires_grad_(True)
             self.track_head.requires_grad_(True)
+        if freeze == "temporal_tracking_global_attention":
+            # Cross-view fusion can only be learned in the blocks that attend
+            # across frames, so this mode adds exactly the global-attention
+            # blocks (i >= alt_start, odd i) and leaves the interleaved local
+            # blocks frozen. Attribute access is deliberately unguarded: a
+            # backbone without `blocks`/`alt_start` must fail loudly here
+            # rather than silently train nothing extra.
+            encoder = self.backbone.pretrained
+            if encoder.alt_start == -1:
+                raise ValueError(
+                    "Freeze mode 'temporal_tracking_global_attention' requires "
+                    "an encoder with alternating attention (alt_start != -1)"
+                )
+            for index in range(encoder.alt_start, len(encoder.blocks)):
+                if index % 2 == 1:
+                    encoder.blocks[index].requires_grad_(True)
 
         self.freeze = freeze
 
@@ -477,15 +499,18 @@ class Arc(
 
         # Process features through depth head
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
-            # Under temporal_tracking the depth head and camera decoder are frozen
-            # and their outputs are consumed only through detached paths
-            # (arc.training.sparse_tracking._predicted_pointmaps is no_grad plus
-            # .detach()), so retaining the dual-pyramid DPT graph costs about
-            # 1.2 GB per observation for nothing. Keep the values, drop the graph.
-            # Nested inside the autocast above, which is doing real work forcing
-            # fp32 for these heads under an outer bf16 autocast.
+            # Under every temporal freeze mode the depth head and camera decoder
+            # are frozen and their outputs are consumed only through detached
+            # paths (arc.training.sparse_tracking._predicted_pointmaps is
+            # no_grad plus .detach()), so retaining the dual-pyramid DPT graph
+            # costs about 1.2 GB per observation for nothing. This holds even
+            # when encoder blocks are trainable: no loss reads these outputs
+            # undetached, so no gradient is lost by cutting the graph here.
+            # Keep the values, drop the graph. Nested inside the autocast
+            # above, which is doing real work forcing fp32 for these heads
+            # under an outer bf16 autocast.
             frozen_reconstruction = (
-                getattr(self, "freeze", "none") == "temporal_tracking"
+                getattr(self, "freeze", "none") in self.TEMPORAL_FREEZE_MODES
             )
             with torch.no_grad() if frozen_reconstruction else nullcontext():
                 output = self.head(feats, H, W, patch_start_idx=0)

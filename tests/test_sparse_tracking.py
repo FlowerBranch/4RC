@@ -23,11 +23,13 @@ from arc.training import (
     gather_query_anchor_points,
     load_dumped_kubric_scene,
     load_temporal_tracking_checkpoint,
+    reconstruction_drift_report,
     save_temporal_tracking_checkpoint,
     sparse_tracking_loss,
 )
 from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
+from arc.models.arc.utils.transform import mat_to_quat
 from arc.training.dumped_kubric import compute_image_transform
 
 
@@ -1010,12 +1012,19 @@ def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
     track head improved by exactly nothing. Require a margin.
     """
 
+    common = dict(
+        baseline_loss=1.0,
+        final_shuffled_loss=None,
+        min_improvement=0.01,
+        min_index_advantage=0.0,
+    )
+
     # Passes: a 5% drop clears the 1% default margin.
     assert overfit_cli._exit_criteria_failure(
         initial_loss=1.0,
         final_loss=0.95,
         embedding_change=0.5,
-        min_improvement=0.01,
+        **common,
     ) is None
 
     # Fails: a 0.1% drop would have passed the old zero-margin comparison.
@@ -1023,7 +1032,7 @@ def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
         initial_loss=1.0,
         final_loss=0.999,
         embedding_change=0.5,
-        min_improvement=0.01,
+        **common,
     )
     assert reason is not None
     assert "like-for-like position loss" in reason
@@ -1033,7 +1042,7 @@ def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
         initial_loss=1.0,
         final_loss=1.5,
         embedding_change=0.5,
-        min_improvement=0.01,
+        **common,
     ) is not None
 
     # A frozen embedding fails regardless of the loss.
@@ -1041,7 +1050,7 @@ def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
         initial_loss=1.0,
         final_loss=0.1,
         embedding_change=0.0,
-        min_improvement=0.01,
+        **common,
     )
     assert reason == "Temporal embedding did not change"
 
@@ -1054,8 +1063,15 @@ def test_exit_gate_stays_on_position_but_names_the_confidence_term():
     failure has no reason to suspect the term they just switched on.
     """
 
-    common = dict(initial_loss=1.0, final_loss=0.999, embedding_change=0.5,
-                  min_improvement=0.01)
+    references = dict(
+        baseline_loss=1.0,
+        final_shuffled_loss=None,
+        min_improvement=0.01,
+        min_index_advantage=0.0,
+    )
+    common = dict(
+        initial_loss=1.0, final_loss=0.999, embedding_change=0.5, **references
+    )
 
     position_only = overfit_cli._exit_criteria_failure(**common)
     with_confidence = overfit_cli._exit_criteria_failure(
@@ -1071,11 +1087,11 @@ def test_exit_gate_stays_on_position_but_names_the_confidence_term():
     # A passing run is silent about it, and a frozen embedding still wins.
     assert overfit_cli._exit_criteria_failure(
         initial_loss=1.0, final_loss=0.5, embedding_change=0.5,
-        min_improvement=0.01, confidence_weight=1.0,
+        confidence_weight=1.0, **references,
     ) is None
     assert overfit_cli._exit_criteria_failure(
         initial_loss=1.0, final_loss=0.1, embedding_change=0.0,
-        min_improvement=0.01, confidence_weight=1.0,
+        confidence_weight=1.0, **references,
     ) == "Temporal embedding did not change"
 
 
@@ -1392,22 +1408,37 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
         "_tracking_only",
         lambda raw, keep_confidence=False: raw,
     )
+    monkeypatch.setattr(
+        overfit_cli,
+        "synchronized_consistency_stats",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        overfit_cli,
+        "reconstruction_drift_report",
+        lambda *args, **kwargs: None,
+    )
 
     class _StubModel:
         def eval(self):
             return self
 
         def __call__(self, views, **kwargs):
-            return {"conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0)}
+            return {
+                "conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0),
+                "track_multi": torch.zeros(1, 1, 2, 2, 2, 3),
+            }
 
     evaluation = overfit_cli._evaluate(
         _StubModel(),
-        SimpleNamespace(views=[]),
+        SimpleNamespace(views=[], slot_time_indices=torch.zeros(0, dtype=torch.long)),
         object(),
         "32",
         0.05,
         initial_alignment,
         initial_anchors,
+        sync_metric_scale=1.0,
+        shuffled_views=None,
     )
 
     assert len(calls) == 2
@@ -2302,3 +2333,430 @@ def test_save_reload_preserves_temporal_embedding(tmp_path):
         target.track_head.bias,
         source.track_head.bias,
     )
+
+
+# ------------------------------------------------------------------------------
+# synchronized-pair consistency term in sparse_tracking_loss
+# ------------------------------------------------------------------------------
+
+
+def test_sparse_loss_sync_term_composes_and_defaults_off(dumped_scene):
+    correspondences = build_anchor_correspondences(dumped_scene)
+    _, raw = _shared_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    base = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+    )
+    with_sync = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        sync_weight=0.5,
+    )
+
+    # Default path untouched: no sync graph is built at weight 0.
+    assert base.sync_loss is None
+    assert base.total_loss is base.loss
+
+    # 2 cameras x 4 times: one synchronized pair per time.
+    assert with_sync.sync_pair_count == 4
+    assert with_sync.sync_loss is not None
+    assert with_sync.sync_loss.item() > 0
+    torch.testing.assert_close(with_sync.loss, base.loss)
+    torch.testing.assert_close(
+        with_sync.total_loss,
+        with_sync.loss + 0.5 * with_sync.sync_loss,
+    )
+    assert set(with_sync.loss_breakdown) == {"position", "sync"}
+
+
+def test_sparse_loss_sync_term_is_zero_for_view_consistent_fields(
+    dumped_scene,
+):
+    """Identical dP fields for synchronized slots cost exactly nothing."""
+
+    correspondences = build_anchor_correspondences(dumped_scene)
+    height, width = dumped_scene.views[0]["img"].shape[-2:]
+    per_time = torch.randn(1, 1, len(dumped_scene.times), height, width, 3)
+    # Camera-major layout: repeat the per-time fields for the second camera.
+    tracks = per_time.repeat(1, 1, len(dumped_scene.cameras), 1, 1, 1)
+    raw = {
+        "track_multi": tracks,
+        "track_query_idx": dumped_scene.track_query_observation_slots.clone(),
+    }
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    result = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        sync_weight=1.0,
+    )
+
+    assert result.sync_loss.item() == 0.0
+    torch.testing.assert_close(result.total_loss, result.loss)
+
+
+# ------------------------------------------------------------------------------
+# reconstruction drift vs. dump ground truth
+# ------------------------------------------------------------------------------
+
+
+def _ground_truth_raw_reconstruction(scene):
+    """depth and pose_enc that reproduce the dump exactly under identity Sim(3)."""
+
+    height, width = scene.views[0]["img"].shape[-2:]
+    depth = torch.full((1, scene.num_observations, height, width), 5.0)
+    pose_encoding = torch.zeros(1, scene.num_observations, 9)
+    for observation in scene.observations:
+        if observation.original_time == 0:
+            rows, columns = observation.image_transform.output_to_original_indices()
+            columns_grid, rows_grid = np.meshgrid(columns, rows)
+            sampled = scene.depth0[observation.camera, 0].numpy()[
+                rows_grid, columns_grid
+            ]
+            depth[0, observation.slot] = torch.from_numpy(sampled).float()
+        world_to_camera = scene.extrinsics_world_to_camera[
+            observation.camera, observation.original_time
+        ].double()
+        rotation = world_to_camera[:3, :3]
+        camera_to_world_rotation = rotation.mT
+        centre = -(rotation.mT @ world_to_camera[:3, 3])
+        pose_encoding[0, observation.slot, :3] = centre.float()
+        pose_encoding[0, observation.slot, 3:7] = mat_to_quat(
+            camera_to_world_rotation
+        ).float()
+        pose_encoding[0, observation.slot, 7:9] = 1.0
+    return {"depth": depth, "pose_enc": pose_encoding}
+
+
+def test_drift_report_is_zero_for_ground_truth_predictions(dumped_scene):
+    raw = _ground_truth_raw_reconstruction(dumped_scene)
+
+    report = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )
+
+    assert set(report["depth"]) == {"0", "1"}
+    for camera_report in report["depth"].values():
+        assert camera_report["median_relative_error"] < 1e-5
+        assert camera_report["p90_relative_error"] < 1e-5
+    assert report["pose"]["rotation_error_deg"]["max"] < 1e-3
+    assert report["pose"]["camera_center_error_m"]["max"] < 1e-4
+
+
+def test_drift_report_reads_a_depth_inflation_as_relative_error(dumped_scene):
+    raw = _ground_truth_raw_reconstruction(dumped_scene)
+    raw["depth"] = raw["depth"] * 1.1
+
+    report = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )
+
+    for camera_report in report["depth"].values():
+        assert camera_report["median_relative_error"] == pytest.approx(0.1, rel=1e-3)
+
+
+def test_drift_report_reads_a_camera_translation_as_center_error(dumped_scene):
+    raw = _ground_truth_raw_reconstruction(dumped_scene)
+    raw["pose_enc"][0, :, 0] += 0.25  # move every camera centre 25 cm in x
+
+    report = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )
+
+    assert report["pose"]["camera_center_error_m"]["mean"] == pytest.approx(
+        0.25, rel=1e-4
+    )
+    assert report["pose"]["rotation_error_deg"]["max"] < 1e-3
+
+
+# ------------------------------------------------------------------------------
+# the three-reference exit gate and the shuffled-index control
+# ------------------------------------------------------------------------------
+
+
+def test_exit_gate_requires_beating_the_baseline():
+    passing = overfit_cli._exit_criteria_failure(
+        baseline_loss=1.0,
+        initial_loss=2.0,
+        final_loss=0.9,
+        final_shuffled_loss=None,
+        embedding_change=0.5,
+        min_improvement=0.01,
+        min_index_advantage=0.0,
+    )
+    assert passing is None
+
+    # Beats the inflated initial handily, but not the released baseline: the
+    # improvement was recovery from a disruptive init, and the gate says so.
+    recovery_only = overfit_cli._exit_criteria_failure(
+        baseline_loss=1.0,
+        initial_loss=2.0,
+        final_loss=0.999,
+        final_shuffled_loss=None,
+        embedding_change=0.5,
+        min_improvement=0.01,
+        min_index_advantage=0.0,
+    )
+    assert recovery_only is not None
+    assert "zero-embedding baseline" in recovery_only
+
+
+def test_exit_gate_requires_an_index_advantage():
+    passing = overfit_cli._exit_criteria_failure(
+        baseline_loss=1.0,
+        initial_loss=1.0,
+        final_loss=0.5,
+        final_shuffled_loss=0.6,
+        embedding_change=0.5,
+        min_improvement=0.01,
+        min_index_advantage=0.01,
+    )
+    assert passing is None
+
+    # Shuffling the indices barely hurts: the improvement is decoder
+    # adaptation, and the run must fail even though both loss gates pass.
+    unexploited = overfit_cli._exit_criteria_failure(
+        baseline_loss=1.0,
+        initial_loss=1.0,
+        final_loss=0.5,
+        final_shuffled_loss=0.502,
+        embedding_change=0.5,
+        min_improvement=0.01,
+        min_index_advantage=0.01,
+    )
+    assert unexploited is not None
+    assert "Shuffling" in unexploited
+
+    # None skips the check: single-camera or single-time windows have no
+    # synchronization to break.
+    assert overfit_cli._exit_criteria_failure(
+        baseline_loss=1.0,
+        initial_loss=1.0,
+        final_loss=0.5,
+        final_shuffled_loss=None,
+        embedding_change=0.5,
+        min_improvement=0.01,
+        min_index_advantage=0.5,
+    ) is None
+
+
+def _shuffle_stub_scene(cameras, times):
+    observations = []
+    views = []
+    for camera in cameras:
+        for position in range(len(times)):
+            observations.append(
+                SimpleNamespace(camera=camera, semantic_time_index=position)
+            )
+            views.append(
+                {
+                    "img": torch.zeros(1),
+                    "time_index": torch.tensor([position]),
+                    "track_query_idx": torch.tensor([0]),
+                }
+            )
+    return SimpleNamespace(
+        cameras=tuple(cameras),
+        times=tuple(times),
+        observations=tuple(observations),
+        views=views,
+    )
+
+
+def test_shuffled_index_views_reverse_only_secondary_cameras():
+    scene = _shuffle_stub_scene([0, 1], [0, 1, 2])
+
+    shuffled = overfit_cli._shuffled_index_views(scene)
+
+    for position in range(3):
+        # Primary camera keeps its indices; the copies share the same tensors.
+        assert torch.equal(
+            shuffled[position]["time_index"], torch.tensor([position])
+        )
+        # Secondary camera is reversed.
+        assert shuffled[3 + position]["time_index"].item() == 2 - position
+        # The scene's own views must be untouched.
+        assert scene.views[3 + position]["time_index"].item() == position
+        assert shuffled[3 + position] is not scene.views[3 + position]
+
+
+def test_shuffled_index_views_skip_windows_with_nothing_to_break():
+    assert overfit_cli._shuffled_index_views(
+        _shuffle_stub_scene([0], [0, 1, 2])
+    ) is None
+    assert overfit_cli._shuffled_index_views(
+        _shuffle_stub_scene([0, 1], [0])
+    ) is None
+
+
+def test_evaluate_scores_the_shuffled_arm_against_the_initial_references(
+    monkeypatch,
+):
+    """The control arm must be scored exactly like the gated number."""
+
+    initial_alignment = _identity_alignment()
+    initial_anchors = torch.full((3, 3), 7.0)
+
+    calls = []
+
+    def _recorded_result(value):
+        return SparseTrackingLossResult(
+            loss=torch.tensor(value),
+            metric_error=torch.tensor(value * 2),
+            sample_count=0,
+        )
+
+    def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
+        calls.append((alignment, anchors))
+        return _recorded_result(0.25 * len(calls))
+
+    monkeypatch.setattr(overfit_cli, "sparse_tracking_loss", fake_loss)
+    monkeypatch.setattr(
+        overfit_cli,
+        "fit_scene_sim3",
+        lambda raw, scene: (_identity_alignment(), {"pair_count": 1}),
+    )
+    monkeypatch.setattr(
+        overfit_cli,
+        "gather_query_anchor_points",
+        lambda raw, scene, correspondences: torch.zeros(3, 3),
+    )
+    monkeypatch.setattr(
+        overfit_cli,
+        "_tracking_only",
+        lambda raw, keep_confidence=False: raw,
+    )
+    monkeypatch.setattr(
+        overfit_cli,
+        "synchronized_consistency_stats",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        overfit_cli,
+        "reconstruction_drift_report",
+        lambda *args, **kwargs: None,
+    )
+
+    class _StubModel:
+        def eval(self):
+            return self
+
+        def __call__(self, views, **kwargs):
+            return {
+                "conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0),
+                "track_multi": torch.zeros(1, 1, 2, 2, 2, 3),
+            }
+
+    shuffled_views = [{"time_index": torch.tensor([1])}]
+    evaluation = overfit_cli._evaluate(
+        _StubModel(),
+        SimpleNamespace(views=[], slot_time_indices=torch.zeros(0, dtype=torch.long)),
+        object(),
+        "32",
+        0.05,
+        initial_alignment,
+        initial_anchors,
+        sync_metric_scale=1.0,
+        shuffled_views=shuffled_views,
+    )
+
+    # refit, like-for-like, then the shuffled arm.
+    assert len(calls) == 3
+    assert calls[1][0] is initial_alignment and calls[1][1] is initial_anchors
+    assert calls[2][0] is initial_alignment and calls[2][1] is initial_anchors
+    assert evaluation["loss"] == pytest.approx(0.5)
+    assert evaluation["loss_shuffled"] == pytest.approx(0.75)
+
+
+def test_new_training_flags_default_to_the_archived_behaviour():
+    """Sync off, temporal_tracking mode: an old command line trains the same
+    parameters it always did; only the init default is deliberately new."""
+
+    parser = overfit_cli.build_arg_parser()
+    args = parser.parse_args(
+        [
+            "--data_root", "root", "--scene", "0000",
+            "--checkpoint_dir", "ckpt", "--output_dir", "out",
+        ]
+    )
+    overfit_cli._validate_args(args)
+
+    assert args.freeze_mode == "temporal_tracking"
+    assert args.sync_weight == 0.0
+    assert args.time_embedding_init == "orthogonal"
+    assert args.time_embedding_init_scale == 0.1
+    assert args.embedding_lr is None
+    assert args.encoder_lr is None
+    assert args.min_index_advantage == 0.01
+
+    for flag, bad in (
+        ("--time_embedding_init_scale", "0"),
+        ("--sync_weight", "-1"),
+        ("--min_index_advantage", "1.0"),
+        ("--embedding_lr", "nan"),
+        ("--encoder_lr", "0"),
+    ):
+        rejected = parser.parse_args(
+            [
+                "--data_root", "root", "--scene", "0000",
+                "--checkpoint_dir", "ckpt", "--output_dir", "out",
+                flag, bad,
+            ]
+        )
+        with pytest.raises(ValueError, match=flag.lstrip("-").replace("-", "_")):
+            overfit_cli._validate_args(rejected)
+
+
+def test_run_summary_includes_the_baseline_and_control_fields():
+    source = Path(overfit_cli.__file__).read_text()
+    written = None
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "summary"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Dict)
+        ):
+            written = {key.value for key in node.value.keys}
+    assert written is not None
+
+    assert {
+        "freeze_mode",
+        "time_embedding_init",
+        "time_embedding_init_scale",
+        "time_embedding_target_row_norm",
+        "learning_rates",
+        "sync_weight",
+        "min_index_advantage",
+        "baseline_position_loss",
+        "baseline_metric_error_m",
+        "baseline_track_confidence",
+        "final_position_loss_shuffled",
+        "final_metric_error_shuffled_m",
+        "baseline_sync_consistency",
+        "initial_sync_consistency",
+        "final_sync_consistency",
+        "temporal_injection",
+        "reconstruction_shift",
+        "baseline_reconstruction_drift",
+        "final_reconstruction_drift",
+    } <= written

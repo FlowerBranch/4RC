@@ -157,7 +157,7 @@ def build_arg_parser():
         default=None,
         help=(
             "Optional temporal_tracking.pt written by overfit_temporal_tracking.py. "
-            "Overlays the finetuned time embedding, MotionDecoder and track head onto "
+            "Overlays the finetuned parameters recorded for its freeze mode onto "
             "the base checkpoint. Without it the time embedding stays zero-initialized "
             "and --time_indices has no effect on the output."
         ),
@@ -187,23 +187,47 @@ def main():
     from arc.dust3r.inference_multiview import inference
     from arc.dust3r.utils.image import load_images
 
-    # Bound-check against the default table size before paying for the ~1B-param
+    patch_metadata = None
+    from_pretrained_kwargs = {}
+    if args.temporal_patch:
+        from arc.training.checkpoint import read_temporal_patch_metadata
+
+        # Read the patch header first: it names the freeze mode the loader will
+        # demand back and, via the stored embedding shape, the table size the
+        # model must be constructed with.
+        patch_metadata = read_temporal_patch_metadata(args.temporal_patch)
+        if patch_metadata["max_time_indices"] is not None:
+            from_pretrained_kwargs["max_time_indices"] = patch_metadata[
+                "max_time_indices"
+            ]
+
+    # Bound-check against the table size before paying for the ~1B-param
     # checkpoint load. The post-load check below still runs, because a checkpoint
     # config.json may declare a different max_time_indices.
     try:
-        validate_time_indices(time_indices, max_time_indices=Arc.MAX_TIME_INDICES)
+        validate_time_indices(
+            time_indices,
+            max_time_indices=from_pretrained_kwargs.get(
+                "max_time_indices",
+                Arc.MAX_TIME_INDICES,
+            ),
+        )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
-    model = Arc.from_pretrained(args.checkpoint_dir).to(device)
+    model = Arc.from_pretrained(args.checkpoint_dir, **from_pretrained_kwargs).to(device)
     if args.temporal_patch:
         from arc.training.checkpoint import load_temporal_tracking_checkpoint
 
-        # set_freeze first: the loader requires it and keys the expected
-        # parameter set off requires_grad.
-        model.set_freeze("temporal_tracking")
+        # set_freeze first, to the mode recorded in the patch: the loader
+        # requires the match and keys the expected parameter set off
+        # requires_grad.
+        model.set_freeze(patch_metadata["freeze_mode"])
         load_temporal_tracking_checkpoint(model, args.temporal_patch)
-        print(f"Loaded temporal-tracking patch: {args.temporal_patch}")
+        print(
+            f"Loaded temporal-tracking patch: {args.temporal_patch} "
+            f"(freeze mode {patch_metadata['freeze_mode']})"
+        )
     elif TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
         print(
             "Warning: this checkpoint has no time-index embedding, so it was "

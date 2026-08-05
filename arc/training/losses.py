@@ -172,6 +172,119 @@ def track_confidence_loss(
     return loss
 
 
+def synchronized_pair_indices(
+    slot_time_indices: torch.Tensor,
+) -> tuple[list[int], list[int]]:
+    """Slot pairs ``(a, b)``, ``a < b``, that share a semantic time index."""
+
+    slot_time_indices = torch.as_tensor(slot_time_indices)
+    if slot_time_indices.ndim != 1:
+        raise ValueError(
+            "slot_time_indices must be one-dimensional, got shape "
+            f"{tuple(slot_time_indices.shape)}"
+        )
+    values = [int(value) for value in slot_time_indices.tolist()]
+    first: list[int] = []
+    second: list[int] = []
+    for later in range(len(values)):
+        for earlier in range(later):
+            if values[earlier] == values[later]:
+                first.append(earlier)
+                second.append(later)
+    return first, second
+
+
+def synchronized_differences(
+    displacements: torch.Tensor,
+    slot_time_indices: torch.Tensor,
+    *,
+    metric_scale: float = 1.0,
+) -> torch.Tensor:
+    """Metric-scaled dP differences over every synchronized slot pair.
+
+    ``displacements`` is the raw ``track_multi`` grid ``(1,Q,S,H,W,3)``; the
+    result stacks one difference per same-time-index slot pair along dim 2.
+    ``metric_scale`` lifts raw differences into metres (the Sim(3) scale times
+    the scene's track upscaling factor; the rotation preserves norms, so one
+    scalar is exact).
+    """
+
+    if (
+        displacements.ndim != 6
+        or displacements.shape[0] != 1
+        or displacements.shape[-1] != 3
+    ):
+        raise ValueError(
+            "displacements must have shape (1,Q,S,H,W,3), got "
+            f"{tuple(displacements.shape)}"
+        )
+    slot_time_indices = torch.as_tensor(slot_time_indices)
+    if slot_time_indices.numel() != displacements.shape[2]:
+        raise ValueError(
+            f"slot_time_indices must have one entry per observation slot "
+            f"({displacements.shape[2]}), got {slot_time_indices.numel()}"
+        )
+    if not math.isfinite(metric_scale) or metric_scale <= 0:
+        raise ValueError("metric_scale must be finite and positive")
+
+    first, second = synchronized_pair_indices(slot_time_indices.reshape(-1))
+    if not first:
+        raise ValueError(
+            "No synchronized observation pairs share a time index; at least "
+            "two observations of one instant are needed"
+        )
+    device = displacements.device
+    first_index = torch.tensor(first, device=device, dtype=torch.long)
+    second_index = torch.tensor(second, device=device, dtype=torch.long)
+    return (
+        displacements.index_select(2, first_index)
+        - displacements.index_select(2, second_index)
+    ) * float(metric_scale)
+
+
+def synchronized_consistency_loss(
+    displacements: torch.Tensor,
+    slot_time_indices: torch.Tensor,
+    *,
+    huber_delta: float,
+    metric_scale: float = 1.0,
+) -> torch.Tensor:
+    """Huber penalty on dP disagreement between synchronized observations.
+
+    The displacement field ``dP_q^{t_q -> tau}`` depends only on the target
+    *time* ``tau``, never on which camera observed it, so observation slots with
+    equal time index owe identical fields; their difference is supervised toward
+    zero at every pixel.  This is the dense, self-supervised counterpart of the
+    sparse position term, whose visibility mask has holes exactly where
+    cross-view hallucination lives.  ``metric_scale`` keeps ``huber_delta``
+    commensurate with the position term's metric threshold.
+    """
+
+    if not math.isfinite(huber_delta) or huber_delta <= 0:
+        raise ValueError("huber_delta must be finite and positive")
+    difference = synchronized_differences(
+        displacements,
+        slot_time_indices,
+        metric_scale=metric_scale,
+    )
+    zero_target = torch.zeros(
+        (),
+        device=difference.device,
+        dtype=difference.dtype,
+    ).expand_as(difference)
+    loss = F.huber_loss(
+        difference,
+        zero_target,
+        reduction="mean",
+        delta=huber_delta,
+    )
+    if not torch.isfinite(loss):
+        raise FloatingPointError(
+            "Synchronized consistency loss produced NaN or Inf"
+        )
+    return loss
+
+
 def resolve_confidence_alpha(
     mean_confidence: float,
     mean_position_error: float,

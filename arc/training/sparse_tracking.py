@@ -30,6 +30,8 @@ from arc.training.losses import (
     compose_tracking_loss,
     per_sample_huber_error,
     resolve_confidence_alpha,
+    synchronized_consistency_loss,
+    synchronized_pair_indices,
     track_confidence_loss,
     track_metric_error,
     track_position_loss,
@@ -170,6 +172,8 @@ class SparseTrackingLossResult:
     confidence_sample_count: int | None = None
     confidence_dropped: dict | None = None
     confidence_alpha: float | None = None
+    sync_loss: torch.Tensor | None = None
+    sync_pair_count: int | None = None
     loss_breakdown: dict | None = None
     diagnostics: dict | None = None
 
@@ -450,6 +454,125 @@ def fit_scene_sim3(
     return sim3, report
 
 
+def reconstruction_drift_report(
+    raw_predictions: dict,
+    scene: DumpedKubricScene,
+    alignment: DetachedSim3,
+) -> dict:
+    """Score the frozen reconstruction against the dump's ground truth.
+
+    The per-step Sim(3) report watches one observation at the top confidence
+    quintile, which is nearly blind to where degradation starts.  This instead
+    compares, fully detached: predicted depth against the dumped ``depth0`` for
+    every camera's time-0 observation (relative error, median and p90), and the
+    token camera against the dumped extrinsics for every observation (rotation
+    geodesic plus metric camera-centre error), composed through the given
+    alignment.  Ground-truth depth and extrinsics live in stored units; the
+    scene's track upscaling factor lifts distances to metres.
+    """
+
+    depth = raw_predictions.get("depth")
+    pose_encoding = raw_predictions.get("pose_enc")
+    if depth is None or pose_encoding is None:
+        raise KeyError("Raw predictions are missing 'depth' or 'pose_enc'")
+    if depth.ndim != 4 or depth.shape[0] != 1:
+        raise ValueError(
+            f"depth must have shape (1,S,H,W), got {tuple(depth.shape)}"
+        )
+    if depth.shape[1] != scene.num_observations:
+        raise ValueError(
+            f"Model returned {depth.shape[1]} observations for "
+            f"{scene.num_observations} inputs"
+        )
+
+    with torch.no_grad(), torch.autocast(
+        device_type=depth.device.type,
+        enabled=False,
+    ):
+        depth = depth.detach().float().cpu()
+        scale = float(alignment.scale.item())
+        upscaling = float(scene.track_upscaling_factor)
+
+        depth_report: dict[str, dict | None] = {}
+        for observation in scene.observations:
+            if observation.original_time != 0:
+                continue
+            transform = observation.image_transform
+            original_rows, original_columns = transform.output_to_original_indices()
+            columns_grid, rows_grid = np.meshgrid(original_columns, original_rows)
+            target = (
+                scene.depth0[observation.camera, 0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)[rows_grid, columns_grid]
+            )
+            predicted = depth[0, observation.slot].numpy().astype(np.float64) * scale
+            valid = (
+                np.isfinite(target)
+                & (target > 1e-6)
+                & np.isfinite(predicted)
+            )
+            if not valid.any():
+                depth_report[str(observation.camera)] = None
+                continue
+            relative = np.abs(predicted[valid] - target[valid]) / target[valid]
+            depth_report[str(observation.camera)] = {
+                "median_relative_error": float(np.median(relative)),
+                "p90_relative_error": float(np.percentile(relative, 90.0)),
+            }
+
+        height, width = depth.shape[-2:]
+        camera_to_world, _ = pose_encoding_to_extri_intri(
+            pose_encoding.detach().float().cpu(),
+            (height, width),
+        )
+        rotation_align = alignment.rotation.detach().cpu().float()
+        rotation_errors = []
+        center_errors = []
+        for observation in scene.observations:
+            rotation_c2w = camera_to_world[0, observation.slot, :3, :3]
+            predicted_center = camera_to_world[0, observation.slot, :3, 3]
+            ground_truth = (
+                scene.extrinsics_world_to_camera[
+                    observation.camera, observation.original_time
+                ]
+                .detach()
+                .cpu()
+                .float()
+            )
+            rotation_gt = ground_truth[:3, :3]
+            center_gt = -(rotation_gt.mT @ ground_truth[:3, 3])
+            # Direction map stored-world -> camera is R_w2c @ R_align^T; its
+            # geodesic distance to the ground-truth rotation is the pose error.
+            aligned_rotation = rotation_c2w.mT @ rotation_align.mT
+            cosine = ((aligned_rotation * rotation_gt).sum() - 1.0) / 2.0
+            rotation_errors.append(
+                float(torch.rad2deg(torch.arccos(cosine.clamp(-1.0, 1.0))).item())
+            )
+            stored_center = alignment.apply_points(predicted_center[None, :])[0]
+            center_errors.append(
+                float(
+                    torch.linalg.vector_norm(stored_center - center_gt).item()
+                )
+                * upscaling
+            )
+
+    return {
+        "depth": depth_report,
+        "pose": {
+            "rotation_error_deg": {
+                "mean": float(np.mean(rotation_errors)),
+                "max": float(np.max(rotation_errors)),
+            },
+            "camera_center_error_m": {
+                "mean": float(np.mean(center_errors)),
+                "max": float(np.max(center_errors)),
+            },
+        },
+    }
+
+
 def gather_query_anchor_points(
     raw_predictions: dict,
     scene: DumpedKubricScene,
@@ -703,6 +826,7 @@ def sparse_tracking_loss(
     huber_delta_m: float = 0.05,
     confidence_weight: float = 0.0,
     confidence_alpha: float | None = None,
+    sync_weight: float = 0.0,
     collect_diagnostics: bool = True,
 ) -> SparseTrackingLossResult:
     """Huber-supervise postprocess-equivalent absolute track positions.
@@ -713,6 +837,11 @@ def sparse_tracking_loss(
     ``confidence_weight`` defaults to 0, which skips the confidence term entirely --
     not multiplied by zero, but never built -- so the position-only path is exactly
     what it was before the term existed.
+
+    ``sync_weight`` weights the dense synchronized-pair consistency term
+    (:func:`arc.training.losses.synchronized_consistency_loss`): same-time-index
+    observation slots owe identical displacement fields, at every pixel and
+    regardless of visibility.  Also 0 by default, also never built when off.
 
     ``confidence_alpha=None`` with a nonzero weight auto-calibrates alpha from this
     call's own sparse statistics.  Resolving it here rather than in the caller is
@@ -730,6 +859,8 @@ def sparse_tracking_loss(
         raise ValueError("huber_delta_m must be finite and positive")
     if confidence_weight < 0 or not np.isfinite(confidence_weight):
         raise ValueError("confidence_weight must be finite and non-negative")
+    if sync_weight < 0 or not np.isfinite(sync_weight):
+        raise ValueError("sync_weight must be finite and non-negative")
     if correspondences.count == 0:
         raise ValueError("No eligible sparse correspondences")
     if "track_multi" not in raw_predictions:
@@ -842,7 +973,7 @@ def sparse_tracking_loss(
     )
     metric_error = track_metric_error(predicted_metric, target_metric, target_mask)
 
-    if confidence_weight == 0.0:
+    if confidence_weight == 0.0 and sync_weight == 0.0:
         return SparseTrackingLossResult(
             loss=loss,
             metric_error=metric_error,
@@ -850,60 +981,84 @@ def sparse_tracking_loss(
             target_mask=target_mask,
         )
 
-    # The confidence set deliberately drops the visibility mask and keeps only
-    # finiteness. Occluded samples are where the error is large, so they are the
-    # signal for learning low confidence; masking them out would remove it.
-    confidence = gather_at_correspondences(
-        _validated_track_confidence(raw_predictions, tracks),
-        correspondence,
-    )
-    predicted_finite = torch.isfinite(predicted_metric).all(dim=-1)
-    confidence_finite = torch.isfinite(confidence)
-    confidence_mask = target_finite & predicted_finite & confidence_finite
-    if not confidence_mask.any():
-        raise ValueError("No finite sparse samples for the track confidence loss")
-    # Dropping a non-finite sample is the right call -- `expp1` is 1+exp(x), which
-    # overflows to inf in BF16 for a large enough logit, and that is a property of
-    # the released head rather than a fault in the run. Dropping it *silently* is
-    # not: a model quietly losing most of its confidence samples would otherwise
-    # look identical to a healthy one. Count it, by cause.
-    confidence_dropped = _count_dropped(
-        confidence_mask,
-        target_finite=target_finite,
-        prediction_finite=predicted_finite,
-        confidence_finite=confidence_finite,
-    )
+    terms: dict = {"position": loss}
+    weights: dict = {"position": 1.0}
 
-    per_sample_error = per_sample_huber_error(
-        predicted_metric,
-        target_metric,
-        huber_delta=huber_delta_m,
-    )
-    if confidence_alpha is None:
-        confidence_alpha = resolve_confidence_alpha(
-            float(confidence[confidence_mask].detach().float().mean().item()),
-            float(per_sample_error[confidence_mask].detach().float().mean().item()),
+    sync_loss = None
+    sync_pair_count = None
+    if sync_weight > 0.0:
+        slot_time_indices = scene.slot_time_indices.reshape(-1)
+        sync_loss = synchronized_consistency_loss(
+            tracks,
+            slot_time_indices.to(device),
+            huber_delta=huber_delta_m,
+            # The rotation preserves norms, so scale times the metric lift is
+            # exactly the factor that puts raw dP differences into metres.
+            metric_scale=float(alignment.scale.item()) * metric_factor,
         )
-    confidence_loss = track_confidence_loss(
-        confidence,
-        per_sample_error,
-        confidence_mask,
-        alpha=float(confidence_alpha),
-    )
-    total_loss, breakdown = compose_tracking_loss(
-        {"position": loss, "confidence": confidence_loss},
-        {"position": 1.0, "confidence": confidence_weight},
-    )
-    diagnostics = (
-        confidence_occlusion_diagnostics(
+        sync_pair_count = len(synchronized_pair_indices(slot_time_indices)[0])
+        terms["sync"] = sync_loss
+        weights["sync"] = sync_weight
+
+    confidence_loss = None
+    confidence_mask = None
+    confidence_sample_count = None
+    confidence_dropped = None
+    per_sample_error = None
+    diagnostics = None
+    if confidence_weight > 0.0:
+        # The confidence set deliberately drops the visibility mask and keeps only
+        # finiteness. Occluded samples are where the error is large, so they are the
+        # signal for learning low confidence; masking them out would remove it.
+        confidence = gather_at_correspondences(
+            _validated_track_confidence(raw_predictions, tracks),
+            correspondence,
+        )
+        predicted_finite = torch.isfinite(predicted_metric).all(dim=-1)
+        confidence_finite = torch.isfinite(confidence)
+        confidence_mask = target_finite & predicted_finite & confidence_finite
+        if not confidence_mask.any():
+            raise ValueError("No finite sparse samples for the track confidence loss")
+        # Dropping a non-finite sample is the right call -- `expp1` is 1+exp(x), which
+        # overflows to inf in BF16 for a large enough logit, and that is a property of
+        # the released head rather than a fault in the run. Dropping it *silently* is
+        # not: a model quietly losing most of its confidence samples would otherwise
+        # look identical to a healthy one. Count it, by cause.
+        confidence_dropped = _count_dropped(
+            confidence_mask,
+            target_finite=target_finite,
+            prediction_finite=predicted_finite,
+            confidence_finite=confidence_finite,
+        )
+
+        per_sample_error = per_sample_huber_error(
+            predicted_metric,
+            target_metric,
+            huber_delta=huber_delta_m,
+        )
+        if confidence_alpha is None:
+            confidence_alpha = resolve_confidence_alpha(
+                float(confidence[confidence_mask].detach().float().mean().item()),
+                float(per_sample_error[confidence_mask].detach().float().mean().item()),
+            )
+        confidence_loss = track_confidence_loss(
             confidence,
             per_sample_error,
-            target_visible,
             confidence_mask,
+            alpha=float(confidence_alpha),
         )
-        if collect_diagnostics
-        else None
-    )
+        terms["confidence"] = confidence_loss
+        weights["confidence"] = confidence_weight
+        confidence_sample_count = int(confidence_mask.sum().item())
+        if collect_diagnostics:
+            diagnostics = confidence_occlusion_diagnostics(
+                confidence,
+                per_sample_error,
+                target_visible,
+                confidence_mask,
+            )
+
+    total_loss, breakdown = compose_tracking_loss(terms, weights)
     return SparseTrackingLossResult(
         loss=loss,
         metric_error=metric_error,
@@ -913,9 +1068,13 @@ def sparse_tracking_loss(
         target_mask=target_mask,
         confidence_loss=confidence_loss,
         confidence_mask=confidence_mask,
-        confidence_sample_count=int(confidence_mask.sum().item()),
+        confidence_sample_count=confidence_sample_count,
         confidence_dropped=confidence_dropped,
-        confidence_alpha=float(confidence_alpha),
+        confidence_alpha=(
+            None if confidence_alpha is None else float(confidence_alpha)
+        ),
+        sync_loss=sync_loss,
+        sync_pair_count=sync_pair_count,
         loss_breakdown=breakdown,
         diagnostics=diagnostics,
     )
