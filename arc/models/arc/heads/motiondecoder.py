@@ -143,12 +143,17 @@ class MotionDecoder(nn.Module):
         query = query.flatten(0, 1)
         kv = kv.flatten(0, 1)
 
+        # The checkpoint lambdas must bind the block index at definition time:
+        # non-reentrant recomputation runs during backward, after this loop has
+        # finished, so a closure over the loop variable would recompute every
+        # checkpointed segment with the last block's weights and silently
+        # corrupt the gradients.
         for cur_i in range(self.depth):
             # Cross Attention
             if self.has_cross_attention:
                 if cur_i > 1 and self.training:
                     query = checkpoint(
-                        lambda q, k, p: self.cross_blocks[cur_i](q, k, pos=p),
+                        lambda q, k, p, i=cur_i: self.cross_blocks[i](q, k, pos=p),
                         query, kv, pos_cross,
                         use_reentrant=False
                     )
@@ -160,13 +165,13 @@ class MotionDecoder(nn.Module):
                 if cur_i > 1 and self.training:
                     if self.use_adaln:
                         query = checkpoint(
-                            lambda q, c, p: self.self_blocks[cur_i](q, cond=c, pos=p),
+                            lambda q, c, p, i=cur_i: self.self_blocks[i](q, cond=c, pos=p),
                             query, time_cond, pos_q,
                             use_reentrant=False
                         )
                     else:
                         query = checkpoint(
-                            lambda q, p: self.self_blocks[cur_i](q, pos=p),
+                            lambda q, p, i=cur_i: self.self_blocks[i](q, pos=p),
                             query, pos_q,
                             use_reentrant=False
                         )
