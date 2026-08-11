@@ -13,6 +13,9 @@ from .diagnostics import (
     temporal_injection_report,
 )
 from .dumped_kubric import (
+    DEPTH_SIDECAR_FLAG,
+    DEPTH_SIDECAR_KEY,
+    DEPTH_SIDECAR_NAME,
     DumpedKubricScene,
     ImageTransform,
     Observation,
@@ -29,6 +32,9 @@ from .losses import (
     track_position_loss,
 )
 from .sparse_tracking import (
+    ELIGIBILITY_ASSIGNMENT_RULE,
+    ELIGIBILITY_REJECTION_STAGES,
+    ELIGIBILITY_ROLLUP_RULE,
     DetachedSim3,
     SparseCorrespondences,
     SparseTrackingLossResult,
@@ -37,11 +43,18 @@ from .sparse_tracking import (
     gather_at_correspondences,
     gather_query_anchor_points,
     reconstruction_drift_report,
+    sparse_targets,
     sparse_tracking_loss,
 )
 
 __all__ = [
     "DEFAULT_CONFIDENCE_TAUS",
+    "DEPTH_SIDECAR_FLAG",
+    "DEPTH_SIDECAR_KEY",
+    "DEPTH_SIDECAR_NAME",
+    "ELIGIBILITY_ASSIGNMENT_RULE",
+    "ELIGIBILITY_REJECTION_STAGES",
+    "ELIGIBILITY_ROLLUP_RULE",
     "DetachedSim3",
     "DumpedKubricScene",
     "ImageTransform",
@@ -62,6 +75,7 @@ __all__ = [
     "per_sample_huber_error",
     "resolve_confidence_alpha",
     "save_temporal_tracking_checkpoint",
+    "sparse_targets",
     "sparse_tracking_loss",
     "synchronized_consistency_loss",
     "synchronized_consistency_stats",

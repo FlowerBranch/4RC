@@ -487,16 +487,58 @@ class Arc(
         inference_track: bool = True,
         time_indices=None,
     ) -> Dict[str, torch.Tensor]:
+        feats = self.encode_features(
+            x,
+            ref_view_strategy=ref_view_strategy,
+            time_indices=time_indices,
+        )
+
+        track_query_idx_list = self._normalize_track_query_idx(track_query_idx, x.shape[1])
+        output_track_query_idx = torch.tensor(track_query_idx_list, device=x.device)
+
+        output = self.reconstruct(feats, x)
+
+        if inference_track:
+            track_list = []
+            conf_list = []
+            for query_idx in track_query_idx_list:
+                track, track_conf = self.track_for_query(feats, x, query_idx)
+                track_list.append(track)
+                conf_list.append(track_conf)
+
+            output["track"] = track_list[0]
+            output["conf_track"] = conf_list[0]
+            output["track_multi"] = torch.stack(track_list, dim=1)
+            output["conf_track_multi"] = torch.stack(conf_list, dim=1)
+
+        output['track_query_idx'] = output_track_query_idx
+
+        return output
+
+    def encode_features(
+        self,
+        x: torch.Tensor,
+        ref_view_strategy: str = "first",
+        time_indices=None,
+    ):
+        """Run the backbone once and return its tap list.
+
+        Split out of :meth:`_forward` so a caller that needs several track
+        queries can pay for the encoder once and drive the per-query heads
+        itself.  ``feats`` does not depend on which frame is the query.
+        """
+
         feats, _ = self.backbone(
             x,
             ref_view_strategy=ref_view_strategy,
             time_indices=time_indices,
         )
+        return feats
+
+    def reconstruct(self, feats, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Depth head and camera decoder, keyed off the shared backbone taps."""
+
         H, W = x.shape[-2], x.shape[-1]
-
-        track_query_idx_list = self._normalize_track_query_idx(track_query_idx, x.shape[1])
-        output_track_query_idx = torch.tensor(track_query_idx_list, device=x.device)
-
         # Process features through depth head
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             # Under every temporal freeze mode the depth head and camera decoder
@@ -517,37 +559,33 @@ class Arc(
                 pose_enc = self.cam_dec(feats[-1][1])
             output["pose_enc"] = pose_enc
             output["pose_enc_list"] = [pose_enc]
-            
-        if inference_track:
-            frames_chunk_size = 1 if self.training else 8
-            track_list = []
-            conf_list = []
-            for query_idx in track_query_idx_list:
-                aggregated_track_tokens_list = []
-                for feature in feats:
-                    feature = torch.cat(
-                        [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
-                        dim=2,
-                    )[..., 1536:] # [cam, time, patch] in global feauture as required by MotionDecoder
-                    track_tokens = self.motion_decoder(
-                        feature, images=x, patch_start_idx=2, track_query_idx=query_idx
-                    )
-                    aggregated_track_tokens_list.append(track_tokens)
-                with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
-                    track, track_conf = self.track_head(
-                        aggregated_track_tokens_list, images=x, patch_start_idx=1, frames_chunk_size=frames_chunk_size
-                    )
-                track_list.append(track)
-                conf_list.append(track_conf)
-
-            output["track"] = track_list[0]
-            output["conf_track"] = conf_list[0]
-            output["track_multi"] = torch.stack(track_list, dim=1)
-            output["conf_track_multi"] = torch.stack(conf_list, dim=1)
-
-        output['track_query_idx'] = output_track_query_idx
-
         return output
+
+    def track_for_query(self, feats, x: torch.Tensor, query_idx: int):
+        """One query frame's dense displacement field and its confidence.
+
+        This is the body of the Q loop.  Its activations are the bulk of a
+        training step's memory, and they are freed once this query's loss has
+        been backwarded -- which is why a caller supervising several anchors
+        drives this per query rather than asking for a stacked Q axis.
+        """
+
+        frames_chunk_size = 1 if self.training else 8
+        aggregated_track_tokens_list = []
+        for feature in feats:
+            feature = torch.cat(
+                [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
+                dim=2,
+            )[..., 1536:] # [cam, time, patch] in global feauture as required by MotionDecoder
+            track_tokens = self.motion_decoder(
+                feature, images=x, patch_start_idx=2, track_query_idx=query_idx
+            )
+            aggregated_track_tokens_list.append(track_tokens)
+        with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
+            track, track_conf = self.track_head(
+                aggregated_track_tokens_list, images=x, patch_start_idx=1, frames_chunk_size=frames_chunk_size
+            )
+        return track, track_conf
 
     def _process_ray_pose_estimation(
         self, output: Dict[str, torch.Tensor], height: int, width: int

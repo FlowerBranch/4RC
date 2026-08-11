@@ -151,6 +151,49 @@ class SparseCorrespondences:
             columns=self.columns.to(device),
         )
 
+    def anchor_rows(self, index: int) -> torch.Tensor:
+        """Boolean mask of the rows belonging to one anchor.
+
+        The companion to :meth:`select_query_slot`: whatever was gathered
+        per-row from the scene-level correspondences -- query pointmap anchors,
+        above all -- is sliced with this so it stays aligned with the rebased
+        correspondences that anchor's head pass is scored against.
+        """
+
+        index = int(index)
+        if index < 0:
+            raise ValueError(f"Query slot index must be non-negative, got {index}")
+        return self.query_slots == index
+
+    def select_query_slot(self, index: int) -> "SparseCorrespondences":
+        """The rows belonging to one anchor, rebased to a single-query grid.
+
+        Supervising several anchors runs one head pass per anchor so that only
+        one query's activations are alive at a time, and each of those passes
+        produces ``Q=1``.  This slices out that anchor's rows and renumbers
+        ``query_slots`` to 0 so they index the single-query output.
+
+        The renumbering is why the result is for :func:`sparse_tracking_loss`
+        only.  It must **not** be handed to
+        :func:`gather_query_anchor_points`, which resolves ``query_slots``
+        against the scene's anchor list and would therefore read anchor 0's
+        pointmaps for anchor *k*'s pixels without complaining.  Gather once from
+        the scene-level correspondences and slice the result with the same row
+        mask; ``anchor_rows`` returns that mask.
+        """
+
+        index = int(index)
+        if index < 0:
+            raise ValueError(f"Query slot index must be non-negative, got {index}")
+        keep = self.anchor_rows(index)
+        return SparseCorrespondences(
+            trajectory_indices=self.trajectory_indices[keep],
+            query_slots=torch.zeros_like(self.query_slots[keep]),
+            query_times=self.query_times[keep],
+            rows=self.rows[keep],
+            columns=self.columns[keep],
+        )
+
 
 @dataclass(frozen=True)
 class SparseTrackingLossResult:
@@ -187,6 +230,15 @@ def _validate_raw_query_mapping(
     scene: DumpedKubricScene,
     correspondences: SparseCorrespondences,
 ) -> torch.Tensor:
+    """Check that a forward's track queries are the anchors it is scored against.
+
+    A run supervising several anchors issues one head pass per anchor, so a
+    given forward carries a *subsequence* of the adapter's anchors rather than
+    all of them.  What must hold is that every query is a declared anchor and
+    that they arrive in the adapter's order -- a reordered or invented query
+    would silently score one anchor's field against another's pixels.
+    """
+
     if "track_query_idx" not in raw_predictions:
         raise KeyError("Raw predictions do not contain track_query_idx")
     query_observations = torch.as_tensor(
@@ -194,54 +246,64 @@ def _validate_raw_query_mapping(
     ).detach().flatten().long().cpu()
     if query_observations.numel() == 0:
         raise ValueError("track_query_idx must contain at least one observation")
-    if query_observations.numel() != scene.track_query_observation_slots.numel():
+    anchors = scene.track_query_observation_slots.cpu().tolist()
+    if query_observations.numel() > len(anchors):
         raise ValueError(
-            "Raw track_query_idx count does not match the adapter's requested "
-            "query observations"
+            f"Raw track_query_idx has {query_observations.numel()} queries but the "
+            f"adapter declared only {len(anchors)} anchors"
         )
-    if not torch.equal(
-        query_observations,
-        scene.track_query_observation_slots.cpu(),
-    ):
-        raise ValueError(
-            "Raw track_query_idx does not match the adapter's query observations: "
-            f"got {query_observations.tolist()}, expected "
-            f"{scene.track_query_observation_slots.tolist()}"
-        )
+    position = 0
+    for observation in query_observations.tolist():
+        while position < len(anchors) and anchors[position] != observation:
+            position += 1
+        if position == len(anchors):
+            raise ValueError(
+                "Raw track_query_idx is not an ordered subsequence of the "
+                f"adapter's query observations: got {query_observations.tolist()}, "
+                f"anchors are {anchors}"
+            )
+        position += 1
     if correspondences.query_slots.min().item() < 0:
         raise ValueError("Correspondence query slots must be non-negative")
     if correspondences.query_slots.max().item() >= query_observations.numel():
         raise ValueError(
             "Correspondence query slot exceeds the number of track queries"
         )
-    if (
-        correspondences.query_slots.max().item()
-        >= scene.track_query_observation_slots.numel()
-    ):
-        raise ValueError(
-            "Correspondence query slot exceeds the adapter's query observations"
-        )
 
     return query_observations
 
 
-def _metric_pointmap_at_depth0(
+def _metric_pointmap_at_anchor(
     scene: DumpedKubricScene,
     observation_slot: int,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Lift one anchor observation's ground-truth depth into world points.
+
+    Works at any original time the scene can supply depth for;
+    :meth:`DumpedKubricScene.surface_depth_map` is what rejects an off-t0 anchor
+    when the per-frame depth sidecar is absent.
+    """
+
     observation = scene.observations[observation_slot]
-    if observation.original_time != 0:
-        raise ValueError(
-            "The current dump can align only an original-time-0 observation"
-        )
     camera = observation.camera
+    original_time = observation.original_time
     transform = observation.image_transform
-    depth = scene.depth0[camera, 0].detach().cpu().numpy().astype(np.float64)
+    depth = (
+        scene.surface_depth_map(camera, original_time)
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
+    )
     intrinsics = (
-        scene.intrinsics[camera, 0].detach().cpu().numpy().astype(np.float64)
+        scene.intrinsics[camera, original_time]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float64)
     )
     world_to_camera = (
-        scene.extrinsics_world_to_camera[camera, 0]
+        scene.extrinsics_world_to_camera[camera, original_time]
         .detach()
         .cpu()
         .numpy()
@@ -341,7 +403,7 @@ def fit_scene_sim3(
     predicted = (
         pointmaps[0, observation_slot].detach().cpu().numpy().astype(np.float64)
     )
-    target, target_valid = _metric_pointmap_at_depth0(scene, observation_slot)
+    target, target_valid = _metric_pointmap_at_anchor(scene, observation_slot)
     if predicted.shape != target.shape:
         raise ValueError(
             f"Predicted and metric pointmaps disagree: {predicted.shape} vs "
@@ -578,13 +640,29 @@ def gather_query_anchor_points(
     scene: DumpedKubricScene,
     correspondences: SparseCorrespondences,
 ) -> torch.Tensor:
-    """Gather the detached query pointmap term used by ``_postprocess_output``."""
+    """Gather the detached query pointmap term used by ``_postprocess_output``.
 
-    query_observations = _validate_raw_query_mapping(
-        raw_predictions,
-        scene,
-        correspondences,
-    )
+    Reads only ``depth`` and ``pose_enc``, so one reconstruction forward serves
+    every anchor: the pointmaps cover all S observations, and an anchor is just
+    one of them.  ``query_slots`` index the adapter's anchor list, which is what
+    that field has always meant, so no ``track_query_idx`` is needed or
+    consulted here -- the loss is where a forward's queries are checked against
+    the anchors it is scored for.
+
+    Pass the **scene-level** correspondences.  A set rebased by
+    :meth:`SparseCorrespondences.select_query_slot` has every ``query_slot`` at
+    0 and would silently gather anchor 0's pointmaps; slice this function's
+    result with :meth:`SparseCorrespondences.anchor_rows` instead.
+    """
+
+    anchor_slots = scene.track_query_observation_slots.cpu()
+    if correspondences.query_slots.numel():
+        if correspondences.query_slots.min().item() < 0:
+            raise ValueError("Correspondence query slots must be non-negative")
+        if correspondences.query_slots.max().item() >= anchor_slots.numel():
+            raise ValueError(
+                "Correspondence query slot exceeds the adapter's query observations"
+            )
     pointmaps = _predicted_pointmaps(raw_predictions)
     if pointmaps.shape[1] != scene.num_observations:
         raise ValueError(
@@ -601,7 +679,7 @@ def gather_query_anchor_points(
         raise ValueError("Sparse correspondence is outside the pointmap grid")
 
     query_slots = correspondences.query_slots.cpu()
-    observation_indices = query_observations[query_slots].to(pointmaps.device)
+    observation_indices = anchor_slots[query_slots].to(pointmaps.device)
     anchors = pointmaps[
         0,
         observation_indices,
@@ -611,19 +689,121 @@ def gather_query_anchor_points(
     return anchors.detach()
 
 
+# The stages a query passes through at one anchor, in the order they are
+# tested. A query is attributed to the first one it fails, so the counts are
+# exclusive; the order is also the "furthest reached" order used to roll a
+# multi-anchor run up into one split.
+ELIGIBILITY_REJECTION_STAGES = (
+    "query_time_mismatch",
+    "not_visible_in_anchor",
+    "projection",
+    "anchor_depth_gate",
+    "pixel_dedup",
+)
+_STAGE_QUERY_TIME = 0
+_STAGE_NOT_VISIBLE = 1
+_STAGE_PROJECTION = 2
+_STAGE_DEPTH_GATE = 3
+_STAGE_PIXEL_DEDUP = 4
+
+ELIGIBILITY_ASSIGNMENT_RULE = (
+    "each query is supervised exactly once, from the anchor whose correspondence "
+    "fits best: smallest anchor-depth error, tie-broken by sub-pixel rounding "
+    "distance then anchor order. Anchor multiplicity is a property of where the "
+    "cameras point rather than of how much a point matters, so one row per query "
+    "keeps every query's influence equal; and the best-fitting anchor is the one "
+    "whose rounded pixel sits closest to the query's own surface, which is the "
+    "label with the least rounding error. Pixel collisions within a single anchor "
+    "are resolved first, by the same ordering, so a query that loses one is still "
+    "available at its OTHER anchors -- but never again at the one it lost, even if "
+    "cross-anchor selection later moves that pixel's winner elsewhere and frees it. "
+    "That is lost supervision rather than wrong supervision, and it is counted as "
+    "pixel_dedup."
+)
+ELIGIBILITY_ROLLUP_RULE = (
+    "a query eligible at no anchor is attributed to the furthest stage it reached "
+    "at any anchor, so the per-reason counts are mutually exclusive and, with "
+    "eligible_query_count, sum to total_query_count."
+)
+
+
+def _anchor_candidate(
+    point: np.ndarray,
+    *,
+    intrinsics: np.ndarray,
+    world_to_camera: np.ndarray,
+    transform,
+    surface_depth: np.ndarray,
+    output_rows_to_original: np.ndarray,
+    output_columns_to_original: np.ndarray,
+    upscaling_factor: float,
+    anchor_depth_tolerance_m: float,
+) -> tuple[int | None, tuple[int, int, float, float] | None]:
+    """Project one query into one anchor.
+
+    Returns ``(failure_stage, None)`` or ``(None, (row, column, depth_error_m,
+    subpixel_distance))``.  The 10 cm depth gate here is the one thing that must
+    not move: it is what keeps an anchor pixel on the query's own surface rather
+    than on whatever occludes it.
+    """
+
+    if not np.isfinite(point).all():
+        return _STAGE_PROJECTION, None
+    camera_point = world_to_camera @ np.append(point, 1.0)
+    if not np.isfinite(camera_point).all() or camera_point[2] <= 1e-6:
+        return _STAGE_PROJECTION, None
+    projected = intrinsics @ camera_point
+    uv_original = projected[:2] / projected[2]
+    if not np.isfinite(uv_original).all():
+        return _STAGE_PROJECTION, None
+    uv_output = transform.original_to_output(uv_original)
+    column = int(np.rint(uv_output[0]))
+    row = int(np.rint(uv_output[1]))
+    if not (
+        0 <= column < transform.output_width
+        and 0 <= row < transform.output_height
+    ):
+        return _STAGE_PROJECTION, None
+
+    # Validate the actual dense anchor pixel after resize/crop/rounding,
+    # using the same inverse grid map as the scene-level alignment.
+    original_column = int(output_columns_to_original[column])
+    original_row = int(output_rows_to_original[row])
+    depth_at_pixel = float(surface_depth[original_row, original_column])
+    depth_error_m = (
+        abs(depth_at_pixel - float(camera_point[2])) * upscaling_factor
+    )
+    if (
+        not np.isfinite(depth_at_pixel)
+        or depth_at_pixel <= 1e-6
+        or depth_error_m > anchor_depth_tolerance_m
+    ):
+        return _STAGE_DEPTH_GATE, None
+    return None, (
+        row,
+        column,
+        depth_error_m,
+        float(np.linalg.norm(uv_output - np.array([column, row]))),
+    )
+
+
 def build_anchor_correspondences(
     scene: DumpedKubricScene,
     *,
     anchor_depth_tolerance_m: float = 0.10,
-) -> SparseCorrespondences:
-    """Project depth-verifiable queries into the selected time-zero anchor.
+) -> tuple[SparseCorrespondences, dict]:
+    """Project depth-verifiable queries into every declared anchor.
 
-    The available depth map rejects rounded pixels whose surface depth differs
-    by more than the existing 10 cm query-association gate.  Every selected
-    observation remains a supervised target.  Queries colliding at one dense
-    pixel are reduced to one deterministic target.  Supervising later query
-    anchors requires full ``depth (V,T,1,H,W)`` rather than silently weakening
-    this check.
+    An anchor is one selected ``(camera, time)`` observation owning a dense
+    query field.  A query can only be anchored where it is the front surface at
+    its own query time, so anchoring in several cameras is what reaches queries
+    occluded in the first, and anchoring at several times is what reaches
+    queries that do not start at frame 0.  Each query is then supervised exactly
+    once, from the anchor it fits best; see :data:`ELIGIBILITY_ASSIGNMENT_RULE`.
+
+    Returns the correspondences and an eligibility report accounting for every
+    query, so the recovery a given anchor set buys is measured rather than
+    asserted.
     """
 
     if (
@@ -633,36 +813,6 @@ def build_anchor_correspondences(
         raise ValueError(
             "anchor_depth_tolerance_m must be finite and positive"
         )
-    query_slot = 0
-    observation_slot = scene.query_observation_slot
-    observation = scene.observations[observation_slot]
-    camera = observation.camera
-    query_time = observation.original_time
-    if query_time != 0:
-        raise ValueError(
-            "Sparse depth0 supervision requires the selected query observation "
-            "to have original time 0. Parsing and Arc forwarding may use other "
-            "times; supervising them requires depth with shape (V,T,1,H,W), "
-            "camera-z convention."
-        )
-    transform = observation.image_transform
-    intrinsics = (
-        scene.intrinsics[camera, query_time]
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.float64)
-    )
-    world_to_camera = (
-        scene.extrinsics_world_to_camera[camera, query_time]
-        .detach()
-        .cpu()
-        .numpy()
-        .astype(np.float64)
-    )
-    output_rows_to_original, output_columns_to_original = (
-        transform.output_to_original_indices()
-    )
 
     query_points = scene.query_points.detach().cpu().numpy().astype(np.float64)
     trajectories = (
@@ -693,126 +843,267 @@ def build_anchor_correspondences(
             "query_points XYZ does not match traj3d_world at its query time"
         )
 
-    eligible_indices = []
-    query_slots = []
-    eligible_query_times = []
-    rows = []
-    columns = []
-    depth_errors_m = []
-    subpixel_distances = []
-    for trajectory_index in track_indices:
-        if int(rounded_query_times[trajectory_index]) != query_time:
-            continue
-        if not visibility[camera, query_time, trajectory_index]:
-            continue
-        point = query_points[trajectory_index, 1:]
-        if not np.isfinite(point).all():
-            continue
+    total_query_count = int(query_points.shape[0])
+    slot_cameras = scene.slot_cameras.detach().cpu().numpy()
+    slot_times = scene.slot_times.detach().cpu().numpy()
+    # Every query that clears an anchor's own visibility test necessarily has a
+    # supervised target, because that anchor's observation is itself one of the
+    # selected slots this reduces over. Kept as the invariant guard below.
+    has_visible_target = visibility[
+        slot_cameras[:, None],
+        slot_times[:, None],
+        track_indices[None, :],
+    ].any(axis=0)
 
-        camera_point = world_to_camera @ np.append(point, 1.0)
-        if not np.isfinite(camera_point).all() or camera_point[2] <= 1e-6:
-            continue
-        projected = intrinsics @ camera_point
-        uv_original = projected[:2] / projected[2]
-        if not np.isfinite(uv_original).all():
-            continue
-        uv_output = transform.original_to_output(uv_original)
-        column = int(np.rint(uv_output[0]))
-        row = int(np.rint(uv_output[1]))
-        if not (
-            0 <= column < transform.output_width
-            and 0 <= row < transform.output_height
-        ):
-            continue
+    furthest_stage = np.full(total_query_count, -1, dtype=np.int64)
+    # trajectory -> [(depth_error_m, subpixel_distance, anchor_index, row, column)]
+    # for every anchor that can supervise it. One is chosen per trajectory after
+    # all anchors have been walked; see ELIGIBILITY_ASSIGNMENT_RULE.
+    candidates: dict[int, list[tuple[float, float, int, int, int]]] = {}
+    anchor_times: list[int] = []
+    per_anchor_report: list[dict] = []
 
-        # Validate the actual dense anchor pixel after resize/crop/rounding,
-        # using the same inverse grid map as the scene-level alignment.
-        original_column = int(output_columns_to_original[column])
-        original_row = int(output_rows_to_original[row])
-        surface_depth = float(
-            scene.depth0[camera, 0, original_row, original_column].item()
+    for anchor_index, observation_slot in enumerate(scene.anchor_observation_slots):
+        observation = scene.observations[observation_slot]
+        camera = observation.camera
+        anchor_time = observation.original_time
+        transform = observation.image_transform
+        intrinsics = (
+            scene.intrinsics[camera, anchor_time]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
         )
-        depth_error_m = (
-            abs(surface_depth - float(camera_point[2]))
-            * scene.track_upscaling_factor
+        world_to_camera = (
+            scene.extrinsics_world_to_camera[camera, anchor_time]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
         )
-        if (
-            not np.isfinite(surface_depth)
-            or surface_depth <= 1e-6
-            or depth_error_m > anchor_depth_tolerance_m
-        ):
-            continue
-
-        eligible_indices.append(trajectory_index)
-        query_slots.append(query_slot)
-        eligible_query_times.append(query_time)
-        rows.append(row)
-        columns.append(column)
-        depth_errors_m.append(depth_error_m)
-        subpixel_distances.append(
-            float(np.linalg.norm(uv_output - np.array([column, row])))
+        surface_depth = (
+            scene.surface_depth_map(camera, anchor_time)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        output_rows_to_original, output_columns_to_original = (
+            transform.output_to_original_indices()
         )
 
-    eligible_indices = np.asarray(eligible_indices, dtype=np.int64)
-    query_slots = np.asarray(query_slots, dtype=np.int64)
-    eligible_query_times = np.asarray(eligible_query_times, dtype=np.int64)
-    rows = np.asarray(rows, dtype=np.int64)
-    columns = np.asarray(columns, dtype=np.int64)
-    depth_errors_m = np.asarray(depth_errors_m, dtype=np.float64)
-    subpixel_distances = np.asarray(subpixel_distances, dtype=np.float64)
-    if eligible_indices.size == 0:
-        raise ValueError(
-            "No eligible sparse queries have a visible, in-bounds, "
-            "depth-consistent anchor correspondence"
+        rejected = dict.fromkeys(ELIGIBILITY_REJECTION_STAGES, 0)
+        indices: list[int] = []
+        rows: list[int] = []
+        columns: list[int] = []
+        depth_errors_m: list[float] = []
+        subpixel_distances: list[float] = []
+        for trajectory_index in track_indices:
+            if int(rounded_query_times[trajectory_index]) != anchor_time:
+                stage = _STAGE_QUERY_TIME
+            elif not visibility[camera, anchor_time, trajectory_index]:
+                stage = _STAGE_NOT_VISIBLE
+            else:
+                stage, candidate = _anchor_candidate(
+                    query_points[trajectory_index, 1:],
+                    intrinsics=intrinsics,
+                    world_to_camera=world_to_camera,
+                    transform=transform,
+                    surface_depth=surface_depth,
+                    output_rows_to_original=output_rows_to_original,
+                    output_columns_to_original=output_columns_to_original,
+                    upscaling_factor=scene.track_upscaling_factor,
+                    anchor_depth_tolerance_m=anchor_depth_tolerance_m,
+                )
+                if stage is None:
+                    row, column, depth_error_m, subpixel = candidate
+                    indices.append(int(trajectory_index))
+                    rows.append(row)
+                    columns.append(column)
+                    depth_errors_m.append(depth_error_m)
+                    subpixel_distances.append(subpixel)
+                    continue
+            rejected[ELIGIBILITY_REJECTION_STAGES[stage]] += 1
+            furthest_stage[trajectory_index] = max(
+                int(furthest_stage[trajectory_index]),
+                stage,
+            )
+
+        # A dense track-head pixel names exactly one trajectory.  Kubric can
+        # provide multiple sparse queries that round to that same pixel, so
+        # retain one unambiguous target deterministically.  Anchors have their
+        # own grids, so this collision is resolved within an anchor, never
+        # across them.
+        best_by_pixel: dict[tuple[int, int], tuple[tuple, int]] = {}
+        for candidate_index, (row, column) in enumerate(zip(rows, columns)):
+            pixel = (int(row), int(column))
+            score = (
+                float(depth_errors_m[candidate_index]),
+                float(subpixel_distances[candidate_index]),
+                int(indices[candidate_index]),
+            )
+            previous = best_by_pixel.get(pixel)
+            if previous is None or score < previous[0]:
+                best_by_pixel[pixel] = (score, candidate_index)
+        kept_set = {candidate_index for _, candidate_index in best_by_pixel.values()}
+        kept = sorted(
+            kept_set,
+            key=lambda candidate_index: int(indices[candidate_index]),
+        )
+        for candidate_index, trajectory_index in enumerate(indices):
+            if candidate_index in kept_set:
+                continue
+            rejected[ELIGIBILITY_REJECTION_STAGES[_STAGE_PIXEL_DEDUP]] += 1
+            furthest_stage[trajectory_index] = max(
+                int(furthest_stage[trajectory_index]),
+                _STAGE_PIXEL_DEDUP,
+            )
+
+        anchor_indices = np.asarray(
+            [indices[candidate_index] for candidate_index in kept],
+            dtype=np.int64,
+        )
+        # Not a filter: a query only reaches here by clearing this anchor's own
+        # visibility test, and this anchor's observation is one of the selected
+        # slots has_visible_target reduces over, so it is necessarily present.
+        # Stated rather than mimed as a live rejection path -- a failure here
+        # would mean an anchor had fallen outside its own window.
+        if anchor_indices.size and not has_visible_target[anchor_indices].all():
+            raise RuntimeError(
+                f"Anchor {anchor_index} (camera {observation.camera_id}, time "
+                f"{anchor_time}) admitted a query with no visible target among "
+                "the selected observations, which is impossible while the anchor "
+                "is one of them"
+            )
+
+        for candidate_index in kept:
+            candidates.setdefault(int(indices[candidate_index]), []).append(
+                (
+                    float(depth_errors_m[candidate_index]),
+                    float(subpixel_distances[candidate_index]),
+                    anchor_index,
+                    int(rows[candidate_index]),
+                    int(columns[candidate_index]),
+                )
+            )
+
+        anchor_times.append(anchor_time)
+        per_anchor_report.append(
+            {
+                "anchor_index": anchor_index,
+                "camera": observation.camera_id,
+                "view_index": camera,
+                "time": anchor_time,
+                "observation_slot": observation_slot,
+                "considered": total_query_count,
+                "eligible": int(anchor_indices.size),
+                "assigned": 0,
+                "sole_anchor": 0,
+                "rejected": rejected,
+            }
         )
 
-    # A dense track-head pixel names exactly one trajectory.  Kubric can
-    # provide multiple sparse queries that round to that same pixel, so retain
-    # one unambiguous target deterministically.
-    best_by_pixel = {}
-    for candidate, (row, column) in enumerate(zip(rows, columns)):
-        pixel = (int(row), int(column))
-        score = (
-            float(depth_errors_m[candidate]),
-            float(subpixel_distances[candidate]),
-            int(eligible_indices[candidate]),
+    # One row per trajectory: the anchor whose correspondence is most
+    # trustworthy wins, by the same (depth error, sub-pixel distance) ordering
+    # the within-anchor pixel dedup already uses, with anchor order as the
+    # deterministic final tiebreak.
+    selected: list[tuple[int, int, int, int]] = []
+    # Per anchor, the depth error of the labels it actually won, and by how much
+    # it beat the runner-up where there was one. Best-fit's whole justification
+    # is that the surviving label is the least noisy one; without these the
+    # report shows only counts and that claim is invisible short of a training
+    # run. Everything here is already computed -- the winner and the runner-up
+    # are both in this trajectory's candidate list.
+    assigned_depth_errors: list[list[float]] = [[] for _ in per_anchor_report]
+    contested_margins: list[list[float]] = [[] for _ in per_anchor_report]
+    for trajectory_index, trajectory_candidates in candidates.items():
+        ranked = sorted(trajectory_candidates)
+        depth_error_m, _, anchor_index, row, column = ranked[0]
+        selected.append((anchor_index, trajectory_index, row, column))
+        per_anchor_report[anchor_index]["assigned"] += 1
+        assigned_depth_errors[anchor_index].append(depth_error_m)
+        if len(ranked) == 1:
+            per_anchor_report[anchor_index]["sole_anchor"] += 1
+        else:
+            contested_margins[anchor_index].append(ranked[1][0] - depth_error_m)
+    selected.sort()
+
+    for anchor_index, anchor in enumerate(per_anchor_report):
+        errors = assigned_depth_errors[anchor_index]
+        margins = contested_margins[anchor_index]
+        anchor["assigned_depth_error_m"] = (
+            None
+            if not errors
+            else {
+                "median": float(np.median(errors)),
+                "p95": float(np.percentile(errors, 95.0)),
+            }
         )
-        previous = best_by_pixel.get(pixel)
-        if previous is None or score < previous[0]:
-            best_by_pixel[pixel] = (score, candidate)
-    selected = np.asarray(
-        sorted(
-            (candidate for _, candidate in best_by_pixel.values()),
-            key=lambda candidate: int(eligible_indices[candidate]),
-        ),
+        # Zero contested wins means this anchor only ever won uncontested, which
+        # is a fact about the anchor set rather than missing data -- so the count
+        # is reported even when the margin is None.
+        anchor["contested_assigned"] = len(margins)
+        anchor["contested_depth_error_margin_m"] = (
+            None if not margins else float(np.median(margins))
+        )
+
+    eligible_indices = np.asarray(
+        [trajectory_index for _, trajectory_index, _, _ in selected],
         dtype=np.int64,
     )
-    eligible_indices = eligible_indices[selected]
-    query_slots = query_slots[selected]
-    eligible_query_times = eligible_query_times[selected]
-    rows = rows[selected]
-    columns = columns[selected]
+    query_slots = np.asarray(
+        [anchor_index for anchor_index, _, _, _ in selected],
+        dtype=np.int64,
+    )
+    eligible_query_times = np.asarray(
+        [anchor_times[anchor_index] for anchor_index, _, _, _ in selected],
+        dtype=np.int64,
+    )
+    rows = np.asarray([row for _, _, row, _ in selected], dtype=np.int64)
+    columns = np.asarray([column for _, _, _, column in selected], dtype=np.int64)
 
-    selected_visibility = visibility[
-        scene.slot_cameras.detach().cpu().numpy()[:, None],
-        scene.slot_times.detach().cpu().numpy()[:, None],
-        eligible_indices[None, :],
-    ]
-    has_target = selected_visibility.any(axis=0)
-    eligible_indices = eligible_indices[has_target]
-    query_slots = query_slots[has_target]
-    eligible_query_times = eligible_query_times[has_target]
-    rows = rows[has_target]
-    columns = columns[has_target]
-    if eligible_indices.size == 0:
-        raise ValueError("No eligible sparse queries have a visible selected target")
+    rolled_up = dict.fromkeys(ELIGIBILITY_REJECTION_STAGES, 0)
+    for trajectory_index in range(total_query_count):
+        if trajectory_index in candidates:
+            continue
+        stage = int(furthest_stage[trajectory_index])
+        # Unreachable: a query eligible at no anchor was rejected at every one,
+        # so its stage is set. Guarded because -1 is a valid Python index that
+        # lands on the last stage, which would inflate that bucket with a
+        # plausible number instead of failing.
+        if stage < 0:
+            raise RuntimeError(
+                f"Query {trajectory_index} is eligible at no anchor yet was "
+                "rejected at none either; the eligibility split cannot account "
+                "for it"
+            )
+        rolled_up[ELIGIBILITY_REJECTION_STAGES[stage]] += 1
+    report = {
+        "total_query_count": total_query_count,
+        "eligible_query_count": len(candidates),
+        # Equal to eligible_query_count by construction: one anchor per point.
+        "supervised_pair_count": int(eligible_indices.size),
+        "anchor_count": len(per_anchor_report),
+        "assignment_rule": ELIGIBILITY_ASSIGNMENT_RULE,
+        "rollup_rule": ELIGIBILITY_ROLLUP_RULE,
+        "rejected": rolled_up,
+        "per_anchor": per_anchor_report,
+    }
 
-    return SparseCorrespondences(
-        trajectory_indices=torch.from_numpy(eligible_indices),
-        query_slots=torch.from_numpy(query_slots),
-        query_times=torch.from_numpy(eligible_query_times),
-        rows=torch.from_numpy(rows),
-        columns=torch.from_numpy(columns),
+    # An anchor set that reaches nothing is a measurement, not a crash: it is
+    # precisely the case worth reporting, so the emptiness is left for the
+    # caller to act on. Training refuses to start on it; the eligibility report
+    # prints the split that explains why.
+    return (
+        SparseCorrespondences(
+            trajectory_indices=torch.from_numpy(eligible_indices),
+            query_slots=torch.from_numpy(query_slots),
+            query_times=torch.from_numpy(eligible_query_times),
+            rows=torch.from_numpy(rows),
+            columns=torch.from_numpy(columns),
+        ),
+        report,
     )
 
 
@@ -933,23 +1224,10 @@ def sparse_tracking_loss(
     if not torch.isfinite(query_anchor_points).all():
         raise FloatingPointError("Query pointmap anchor contains NaN or Inf")
 
-    trajectory = scene.trajectories_world.to(device=device, dtype=torch.float32)
-    slot_times = scene.slot_times.to(device)
-    slot_cameras = scene.slot_cameras.to(device)
-    visibility = scene.visibility.to(device)
-    trajectory_indices = correspondence.trajectory_indices
-
-    target_positions = trajectory[
-        slot_times[:, None],
-        trajectory_indices[None, :],
-    ].permute(1, 0, 2)
-    target_visible = visibility[
-        slot_cameras[:, None],
-        slot_times[:, None],
-        trajectory_indices[None, :],
-    ].mT
-    target_finite = torch.isfinite(target_positions).all(dim=-1)
-    target_mask = target_visible & target_finite
+    target_positions, target_visible, target_finite, target_mask = sparse_targets(
+        scene,
+        correspondence,
+    )
     if not target_mask.any():
         raise ValueError("No visible finite sparse query-target samples")
     if not torch.isfinite(predicted_displacement[target_mask]).all():
@@ -1078,6 +1356,39 @@ def sparse_tracking_loss(
         loss_breakdown=breakdown,
         diagnostics=diagnostics,
     )
+
+
+def sparse_targets(
+    scene: DumpedKubricScene,
+    correspondences: SparseCorrespondences,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Ground-truth positions and masks for one set of correspondences.
+
+    Returns ``(positions, visible, finite, mask)``, each ``(M,S)`` except the
+    ``(M,S,3)`` positions.  Nothing here reads a prediction, so ``mask.sum()``
+    is a property of the scene alone -- which is what lets a run supervising
+    several anchors weight them by sample count *before* the first forward, and
+    keeps that weight from drifting out of step with the loss's own masking.
+    """
+
+    device = correspondences.trajectory_indices.device
+    trajectory = scene.trajectories_world.to(device=device, dtype=torch.float32)
+    slot_times = scene.slot_times.to(device)
+    slot_cameras = scene.slot_cameras.to(device)
+    visibility = scene.visibility.to(device)
+    trajectory_indices = correspondences.trajectory_indices
+
+    positions = trajectory[
+        slot_times[:, None],
+        trajectory_indices[None, :],
+    ].permute(1, 0, 2)
+    visible = visibility[
+        slot_cameras[:, None],
+        slot_times[:, None],
+        trajectory_indices[None, :],
+    ].mT
+    finite = torch.isfinite(positions).all(dim=-1)
+    return positions, visible, finite, visible & finite
 
 
 def gather_at_correspondences(

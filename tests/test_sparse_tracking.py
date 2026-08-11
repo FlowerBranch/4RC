@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -30,6 +31,13 @@ from arc.training import (
 from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
 from arc.models.arc.utils.transform import mat_to_quat
+from arc.training import (
+    ELIGIBILITY_ASSIGNMENT_RULE,
+    compose_tracking_loss,
+    ELIGIBILITY_REJECTION_STAGES,
+    ELIGIBILITY_ROLLUP_RULE,
+    sparse_targets,
+)
 from arc.training.dumped_kubric import compute_image_transform
 
 
@@ -111,7 +119,25 @@ def _write_scene(
     time_count: int = 4,
     view_count: int = 2,
     rotated_camera: int | None = None,
+    depth_sidecar: bool = False,
+    sidecar_dtype=np.float32,
+    view_ids=None,
+    query_times=None,
+    invisible=(),
 ) -> Path:
+    """Write a dump.
+
+    ``depth_sidecar`` also emits ``depth_full.npz``.  The fixture plane is
+    static, so per-frame depth is the same analytic render at every time --
+    which is the point: ``depth0`` is taken from ``depth[:, 0]`` here exactly as
+    the producing side derives it, so the fixture cannot drift away from the
+    contract it is used to test.
+
+    ``query_times`` gives each track its own query frame, ``view_ids`` records
+    original camera ids that need not be ``range(view_count)``, and
+    ``invisible`` marks ``(camera, time, track)`` triples as occluded.
+    """
+
     scene_path = root / scene_name
     track_count = 3
     height = width = 56
@@ -142,10 +168,13 @@ def _write_scene(
         ],
         axis=0,
     ).astype(np.float32)
+    if query_times is None:
+        query_times = np.zeros(track_count, dtype=np.int64)
+    query_times = np.asarray(query_times, dtype=np.int64)
     query_points = np.concatenate(
         (
-            np.zeros((track_count, 1), dtype=np.float32),
-            trajectory[0],
+            query_times.astype(np.float32)[:, None],
+            trajectory[query_times, np.arange(track_count)],
         ),
         axis=-1,
     )
@@ -153,6 +182,8 @@ def _write_scene(
         (view_count, time_count, track_count),
         dtype=bool,
     )
+    for camera, time_index, track in invisible:
+        visibility[camera, time_index, track] = False
     intrinsics = np.zeros((view_count, time_count, 3, 3), dtype=np.float32)
     intrinsics[..., 0, 0] = 30.0
     intrinsics[..., 1, 1] = 30.0
@@ -160,31 +191,48 @@ def _write_scene(
     intrinsics[..., 1, 2] = height / 2
     intrinsics[..., 2, 2] = 1.0
     extrinsics = np.zeros((view_count, time_count, 3, 4), dtype=np.float32)
-    depth0 = np.zeros((view_count, 1, height, width), dtype=np.float32)
+    depth_full = np.zeros(
+        (view_count, time_count, 1, height, width),
+        dtype=np.float32,
+    )
     for camera in range(view_count):
         rotation, translation = _world_to_camera(camera, rotated_camera)
         extrinsics[camera, :, :3, :3] = rotation.astype(np.float32)
         extrinsics[camera, :, :3, 3] = translation.astype(np.float32)
-        # depth0 must agree with the pose: build_anchor_correspondences gates on
-        # |depth0 - camera_z| <= 10 cm, so a pose change without a matching
-        # depth render rejects every candidate.
-        depth0[camera, 0] = _render_plane_depth(
+        # Depth must agree with the pose: build_anchor_correspondences gates on
+        # |depth - camera_z| <= 10 cm, so a pose change without a matching
+        # depth render rejects every candidate. The plane is static, so the
+        # same render is the truth at every time.
+        depth_full[camera, :, 0] = _render_plane_depth(
             rotation,
             translation,
             intrinsics[camera, 0].astype(np.float64),
             height,
             width,
         )
-    np.savez_compressed(
-        scene_path / "meta.npz",
-        query_points=query_points,
-        traj3d_world=trajectory,
-        visibility=visibility,
-        intrs=intrinsics,
-        extrs=extrinsics,
-        depth0=depth0,
-        track_upscaling_factor=np.float64(1.0),
-    )
+    depth_full = depth_full.astype(sidecar_dtype)
+    # Exactly how the producing side derives it, which is what makes
+    # depth[:, 0] == depth0 an invariant rather than a coincidence.
+    depth0 = depth_full[:, 0]
+
+    meta = {
+        "query_points": query_points,
+        "traj3d_world": trajectory,
+        "visibility": visibility,
+        "intrs": intrinsics,
+        "extrs": extrinsics,
+        "depth0": depth0,
+        "track_upscaling_factor": np.float64(1.0),
+    }
+    if view_ids is not None:
+        meta["view_ids"] = np.asarray(view_ids, dtype=np.int64)
+    np.savez_compressed(scene_path / "meta.npz", **meta)
+    if depth_sidecar:
+        np.savez_compressed(
+            scene_path / "depth_full.npz",
+            depth=depth_full,
+            seq_name=scene_name,
+        )
     return scene_path
 
 
@@ -465,7 +513,7 @@ def test_single_camera_window_runs_through_arc_and_sparse_loss(tmp_path):
     )
     assert output["track_multi"].shape[:3] == (1, 1, 3)
 
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
     raw, query_anchors = _perfect_raw_tracks(scene, correspondences)
     result = sparse_tracking_loss(
         raw,
@@ -486,8 +534,7 @@ def test_nonfirst_query_camera_owns_alignment_correspondence(tmp_path):
         "0000",
         cameras=(0, 1),
         times=(0, 3),
-        query_camera=1,
-        query_time=0,
+        query_anchors=((1, 0),),
         size=56,
     )
     query = scene.observations[scene.query_observation_slot]
@@ -497,7 +544,7 @@ def test_nonfirst_query_camera_owns_alignment_correspondence(tmp_path):
     # If correspondence construction accidentally uses camera 0, every
     # candidate will fail its depth-consistency gate.
     scene.depth0[0].fill_(100.0)
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
 
     assert correspondences.count > 0
     assert len(set(zip(
@@ -577,11 +624,27 @@ def test_adapter_parses_nonzero_window_but_sparse_supervision_rejects_it(
     assert scene.time_indices == (0, 1, 2)
     query = scene.observations[scene.query_observation_slot]
     assert (query.camera, query.original_time) == (0, 1)
-    with pytest.raises(ValueError, match="requires.*original time 0"):
+    assert not scene.has_time_varying_depth
+    # The dump is complete-looking without the opt-in sidecar, so the failure
+    # has to name the flag that produces it rather than just refusing.
+    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
         build_anchor_correspondences(scene)
+    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
+        scene.surface_depth_map(0, 1)
+    # Time 0 still resolves from meta.npz's depth0 alone.
+    assert scene.surface_depth_map(0, 0).shape == scene.depth0.shape[-2:]
 
 
-def test_overfit_cli_accepts_dynamic_layouts_and_keeps_depth0_guard():
+def test_overfit_cli_accepts_dynamic_layouts_and_its_flag_requirements():
+    """Camera/time layouts, and which flags a run may omit.
+
+    Named for what it checks now: --checkpoint_dir and --output_dir are required
+    for a training run and exempted by both --parse_only and --eligibility_only,
+    --max_time_indices bounds the semantic times, and an off-t0 anchor is
+    *accepted* here because whether it is supportable depends on the per-frame
+    depth sidecar, which only the loaded scene knows about.
+    """
+
     parser = overfit_cli.build_arg_parser()
     one_camera = parser.parse_args(
         [
@@ -638,7 +701,33 @@ def test_overfit_cli_accepts_dynamic_layouts_and_keeps_depth0_guard():
     assert parse_only.checkpoint_dir is None
     assert parse_only.output_dir is None
 
-    training_without_depth = parser.parse_args(
+    # --eligibility_only exempts them too, and the messages must say so.
+    eligibility_only = parser.parse_args(
+        [
+            "--data_root",
+            "data",
+            "--scene",
+            "1",
+            "--cameras",
+            "1",
+            "--times",
+            "1",
+            "2",
+            "5",
+            "--eligibility_only",
+        ]
+    )
+    overfit_cli._validate_args(eligibility_only)
+    assert eligibility_only.checkpoint_dir is None
+    with pytest.raises(ValueError, match="--parse_only or --eligibility_only"):
+        overfit_cli._validate_args(missing_checkpoint)
+
+    # An off-t0 anchor is no longer refused from the flags alone: whether it is
+    # supportable depends on the per-frame depth sidecar, which only the loaded
+    # scene knows about. The guard moved to DumpedKubricScene.surface_depth_map
+    # and names RCMV_DUMP_DEPTH=1 there; see
+    # test_adapter_parses_nonzero_window_but_sparse_supervision_rejects_it.
+    off_t0_anchor = parser.parse_args(
         [
             "--data_root",
             "data",
@@ -656,8 +745,8 @@ def test_overfit_cli_accepts_dynamic_layouts_and_keeps_depth0_guard():
             "5",
         ]
     )
-    with pytest.raises(ValueError, match="query_time 0"):
-        overfit_cli._validate_args(training_without_depth)
+    overfit_cli._validate_args(off_t0_anchor)
+    assert overfit_cli._resolve_query_anchors(off_t0_anchor) == ((1, 1),)
 
     too_many_times = parser.parse_args(
         [
@@ -720,8 +809,7 @@ def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
         "0000",
         cameras=(0, 1),
         times=(0, 3),
-        query_camera=query_camera,
-        query_time=0,
+        query_anchors=((query_camera, 0),),
         size=56,
     )
 
@@ -740,7 +828,7 @@ def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(
     """
 
     scene = _rotated_two_camera_scene(tmp_path, monkeypatch)
-    world_points, valid = sparse_module._metric_pointmap_at_depth0(
+    world_points, valid = sparse_module._metric_pointmap_at_anchor(
         scene,
         scene.query_observation_slot,
     )
@@ -750,7 +838,7 @@ def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(
 
     # Each anchor pixel must lift back onto its own track, up to the half-pixel
     # rounding in the anchor choice (about 0.18 world units per pixel here).
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
     for item in range(correspondences.count):
         row = int(correspondences.rows[item])
         column = int(correspondences.columns[item])
@@ -769,7 +857,7 @@ def test_fit_scene_sim3_reads_the_query_observation_not_slot_zero(
     query_slot = scene.query_observation_slot
     assert query_slot != 0
 
-    target, _ = sparse_module._metric_pointmap_at_depth0(scene, query_slot)
+    target, _ = sparse_module._metric_pointmap_at_anchor(scene, query_slot)
     angle = np.deg2rad(25.0)
     rotation = np.array(
         [
@@ -851,7 +939,7 @@ def test_fit_scene_sim3_rejects_collinear_predictions(tmp_path, monkeypatch):
     """The collinearity guard exists but no test reached it."""
 
     scene = _rotated_two_camera_scene(tmp_path, monkeypatch)
-    target, _ = sparse_module._metric_pointmap_at_depth0(
+    target, _ = sparse_module._metric_pointmap_at_anchor(
         scene,
         scene.query_observation_slot,
     )
@@ -872,7 +960,7 @@ def test_fit_scene_sim3_rejects_collinear_predictions(tmp_path, monkeypatch):
         fit_scene_sim3(raw, scene, confidence_percentile=0)
 
 
-def _project_expected_anchors(scene, camera, rotated_camera):
+def _project_expected_anchors(scene, camera, rotated_camera, time_index):
     """Independent pinhole oracle for the query anchors.
 
     Derived from the pose and intrinsics directly, not from
@@ -881,9 +969,9 @@ def _project_expected_anchors(scene, camera, rotated_camera):
     """
 
     rotation, translation = _world_to_camera(camera, rotated_camera)
-    intrinsics = scene.intrinsics[camera, 0].numpy().astype(np.float64)
+    intrinsics = scene.intrinsics[camera, time_index].numpy().astype(np.float64)
     expected = []
-    for point in scene.trajectories_world[0].numpy().astype(np.float64):
+    for point in scene.trajectories_world[time_index].numpy().astype(np.float64):
         camera_point = rotation @ point + translation
         homogeneous = intrinsics @ camera_point
         u, v = homogeneous[:2] / homogeneous[2]
@@ -906,8 +994,7 @@ def test_rotated_query_camera_projects_to_independently_derived_pixels(tmp_path)
         "0000",
         cameras=(0, 1),
         times=(0, 3),
-        query_camera=1,
-        query_time=0,
+        query_anchors=((1, 0),),
         size=56,
     )
     assert (
@@ -915,9 +1002,9 @@ def test_rotated_query_camera_projects_to_independently_derived_pixels(tmp_path)
         scene.observations[scene.query_observation_slot].camera,
     ) == (2, 1)
 
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
 
-    expected = _project_expected_anchors(scene, camera=1, rotated_camera=1)
+    expected = _project_expected_anchors(scene, camera=1, rotated_camera=1, time_index=0)
     # Hand-derived from R = pitch(-12) @ yaw(25), C = (1, 0.45, -0.6), fx=fy=30,
     # cx=cy=28: distinct in both axes, unlike the identity-camera fixture.
     assert expected == [(30, 31), (34, 36), (30, 42)]
@@ -943,13 +1030,12 @@ def test_sparse_loss_is_zero_for_a_nonzero_query_slot(tmp_path):
         "0000",
         cameras=(0, 1),
         times=(0, 3),
-        query_camera=1,
-        query_time=0,
+        query_anchors=((1, 0),),
         size=56,
     )
     assert scene.query_observation_slot == 2
 
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
     raw, query_anchors = _perfect_raw_tracks(scene, correspondences)
 
     result = sparse_tracking_loss(
@@ -974,11 +1060,10 @@ def test_query_anchor_gather_follows_the_observation_slot(tmp_path):
         "0000",
         cameras=(0, 1),
         times=(0, 3),
-        query_camera=1,
-        query_time=0,
+        query_anchors=((1, 0),),
         size=56,
     )
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, _ = build_anchor_correspondences(scene)
     height, width = scene.views[0]["img"].shape[-2:]
 
     # Give every observation a distinct constant pointmap so the gather's choice
@@ -1275,7 +1360,7 @@ def test_confidence_gradient_norms_reject_a_head_that_is_not_xyz_plus_conf():
 def test_diagnostics_can_be_skipped_without_touching_the_loss(dumped_scene):
     """The training loop discards the report, and it costs a device sync per figure."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     raw["track_multi"] = raw["track_multi"] + 0.3
     raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 120.0)
@@ -1306,7 +1391,7 @@ def test_diagnostics_can_be_skipped_without_touching_the_loss(dumped_scene):
 def test_nonfinite_confidence_samples_are_dropped_and_counted(dumped_scene):
     """`expp1` overflows to inf in BF16, so filtering is right -- but never silent."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     confidence = torch.full(raw["track_multi"].shape[:-1], 80.0)
     row = int(correspondences.rows[0])
@@ -1334,7 +1419,7 @@ def test_nonfinite_confidence_samples_are_dropped_and_counted(dumped_scene):
 
 
 def test_a_clean_run_reports_zero_dropped_confidence_samples(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 80.0)
 
@@ -1549,7 +1634,7 @@ def test_nonconsecutive_frames_keep_local_semantic_time_indices(
 
 
 def test_known_sim3_is_recovered_and_detached(dumped_scene, monkeypatch):
-    target, _ = sparse_module._metric_pointmap_at_depth0(dumped_scene, 0)
+    target, _ = sparse_module._metric_pointmap_at_anchor(dumped_scene, 0)
     angle = np.deg2rad(25.0)
     rotation = np.array(
         [
@@ -1674,7 +1759,7 @@ def test_detached_sim3_stays_float32_inside_bfloat16_autocast():
 
 
 def test_correspondence_is_direct_projection_and_detached(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
 
     assert correspondences.count == 3
     assert correspondences.trajectory_indices.tolist() == [0, 1, 2]
@@ -1694,7 +1779,7 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
     dumped_scene,
     monkeypatch,
 ):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     height, width = dumped_scene.views[0]["img"].shape[-2:]
     pointmaps = torch.arange(
         dumped_scene.num_observations * height * width * 3,
@@ -1724,16 +1809,50 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
     ]
     torch.testing.assert_close(anchors, expected)
     assert not anchors.requires_grad
-    with pytest.raises(ValueError, match="does not match"):
-        gather_query_anchor_points(
-            {"track_query_idx": torch.tensor([1])},
+    # The anchor gather reads reconstruction only -- depth and pose_enc -- so
+    # one shared forward serves every anchor. It indexes by the adapter's anchor
+    # list, never by a forward's track_query_idx, which is why a dict carrying
+    # no track queries at all still works.
+    torch.testing.assert_close(
+        gather_query_anchor_points({}, dumped_scene, correspondences),
+        expected,
+    )
+    stray = SparseCorrespondences(
+        trajectory_indices=correspondences.trajectory_indices,
+        query_slots=torch.ones_like(correspondences.query_slots),
+        query_times=correspondences.query_times,
+        rows=correspondences.rows,
+        columns=correspondences.columns,
+    )
+    with pytest.raises(ValueError, match="exceeds the adapter's query observations"):
+        gather_query_anchor_points(raw, dumped_scene, stray)
+
+
+def test_sparse_loss_rejects_queries_that_are_not_declared_anchors(dumped_scene):
+    """The query-vs-anchor check lives where the tracks are scored.
+
+    Supervising several anchors runs one head pass per anchor, so a forward
+    carries a subsequence of the adapter's anchors rather than all of them. What
+    must still be impossible is scoring one anchor's field against another's
+    pixels.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+
+    raw["track_query_idx"] = torch.tensor([1])
+    with pytest.raises(ValueError, match="ordered subsequence"):
+        sparse_tracking_loss(
+            raw,
             dumped_scene,
             correspondences,
+            _identity_alignment(),
+            query_anchors,
         )
 
 
 def test_perfect_sparse_tracks_have_numerical_zero_loss(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
 
     result = sparse_tracking_loss(
@@ -1750,7 +1869,7 @@ def test_perfect_sparse_tracks_have_numerical_zero_loss(dumped_scene):
 
 
 def test_known_perturbation_increases_loss(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     perfect, query_anchors = _perfect_raw_tracks(
         dumped_scene,
         correspondences,
@@ -1787,7 +1906,7 @@ def test_known_perturbation_increases_loss(dumped_scene):
 
 
 def test_invisible_target_does_not_contribute(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     trajectory_index = int(correspondences.trajectory_indices[0])
     row = int(correspondences.rows[0])
@@ -1810,7 +1929,7 @@ def test_invisible_target_does_not_contribute(dumped_scene):
 
 
 def test_loss_preserves_eight_observation_axis(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     sparse_tracking_loss(
         raw,
@@ -1834,7 +1953,7 @@ def test_loss_preserves_eight_observation_axis(dumped_scene):
 
 
 def test_nonidentity_sim3_absolute_position_loss_is_zero(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     angle = torch.tensor(0.35)
     rotation = torch.tensor(
         [
@@ -1904,7 +2023,7 @@ def test_nonidentity_sim3_absolute_position_loss_is_zero(dumped_scene):
 
 
 def test_depth_inconsistent_rounded_anchor_is_rejected(dumped_scene):
-    all_correspondences = build_anchor_correspondences(dumped_scene)
+    all_correspondences, _ = build_anchor_correspondences(dumped_scene)
     row = int(all_correspondences.rows[0])
     column = int(all_correspondences.columns[0])
     transform = dumped_scene.observations[0].image_transform
@@ -1914,7 +2033,7 @@ def test_depth_inconsistent_rounded_anchor_is_rejected(dumped_scene):
     )
     dumped_scene.depth0[0, 0, original_row, original_column] = 8.0
 
-    filtered = build_anchor_correspondences(dumped_scene)
+    filtered, _ = build_anchor_correspondences(dumped_scene)
 
     assert filtered.trajectory_indices.tolist() == [1, 2]
 
@@ -1927,7 +2046,7 @@ def test_duplicate_dense_anchor_keeps_the_best_depth_match(dumped_scene):
     dumped_scene.query_points[1, 1:] = nearer
     dumped_scene.trajectories_world[0, 1] = nearer
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
 
     assert correspondences.trajectory_indices.tolist() == [1, 2]
     pixels = list(zip(
@@ -1951,7 +2070,7 @@ def test_sparse_loss_rejects_wrapping_negative_indices(
     value,
     message,
 ):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     values = {
         name: getattr(correspondences, name).clone()
@@ -2003,7 +2122,7 @@ def _tiny_arc():
 
 def test_only_temporal_tracking_parameters_receive_gradients(dumped_scene):
     model = _tiny_arc()
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     height, width = dumped_scene.views[0]["img"].shape[-2:]
     value = (
         model.backbone.pretrained.time_index_embedding.weight.sum()
@@ -2093,7 +2212,7 @@ def test_confidence_gradient_reaches_the_confidence_row_and_only_it(dumped_scene
     rows 0-2 must be exactly what position-only training would have produced.
     """
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     conv, raw = _shared_conv_predictions(dumped_scene)
     anchors = _anchors_for(dumped_scene, correspondences)
 
@@ -2140,7 +2259,7 @@ def test_confidence_gradient_reaches_the_confidence_row_and_only_it(dumped_scene
 def test_total_loss_is_the_position_loss_when_confidence_is_disabled(dumped_scene):
     """Off means never built, not multiplied by zero, so archived runs reproduce."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     assert "conf_track_multi" not in raw
 
@@ -2163,7 +2282,7 @@ def test_total_loss_is_the_position_loss_when_confidence_is_disabled(dumped_scen
 def test_confidence_term_supervises_samples_the_position_mask_drops(dumped_scene):
     """Occluded points are the signal for low confidence, so they must be included."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 50.0)
     trajectory_index = int(correspondences.trajectory_indices[0])
@@ -2189,7 +2308,7 @@ def test_confidence_term_supervises_samples_the_position_mask_drops(dumped_scene
 def test_auto_alpha_puts_the_optimum_at_the_gathered_operating_point(dumped_scene):
     """Resolved from this call's own samples, so the two statistics are commensurate."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     raw["track_multi"] = raw["track_multi"] + 0.4
     raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 200.0)
@@ -2214,7 +2333,7 @@ def test_auto_alpha_puts_the_optimum_at_the_gathered_operating_point(dumped_scen
 
 
 def test_confidence_term_requires_the_confidence_prediction(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
 
     with pytest.raises(KeyError, match="conf_track_multi"):
@@ -2230,7 +2349,7 @@ def test_confidence_term_requires_the_confidence_prediction(dumped_scene):
 
 
 def test_confidence_term_rejects_a_mismatched_confidence_shape(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
     raw["conf_track_multi"] = torch.ones(1, 1, 2, 3, 4)
 
@@ -2247,7 +2366,7 @@ def test_confidence_term_rejects_a_mismatched_confidence_shape(dumped_scene):
 
 
 def test_negative_confidence_weight_is_rejected(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
 
     with pytest.raises(ValueError, match="confidence_weight"):
@@ -2265,7 +2384,7 @@ def test_confidence_term_leaves_frozen_parameters_without_gradients(dumped_scene
     """The freeze invariant must survive the extra term, not just the position one."""
 
     model = _tiny_arc()
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     height, width = dumped_scene.views[0]["img"].shape[-2:]
     value = (
         model.backbone.pretrained.time_index_embedding.weight.sum()
@@ -2341,7 +2460,7 @@ def test_save_reload_preserves_temporal_embedding(tmp_path):
 
 
 def test_sparse_loss_sync_term_composes_and_defaults_off(dumped_scene):
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     _, raw = _shared_conv_predictions(dumped_scene)
     anchors = _anchors_for(dumped_scene, correspondences)
 
@@ -2382,7 +2501,7 @@ def test_sparse_loss_sync_term_is_zero_for_view_consistent_fields(
 ):
     """Identical dP fields for synchronized slots cost exactly nothing."""
 
-    correspondences = build_anchor_correspondences(dumped_scene)
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
     height, width = dumped_scene.views[0]["img"].shape[-2:]
     per_time = torch.randn(1, 1, len(dumped_scene.times), height, width, 3)
     # Camera-major layout: repeat the per-time fields for the second camera.
@@ -2760,3 +2879,1305 @@ def test_run_summary_includes_the_baseline_and_control_fields():
         "baseline_reconstruction_drift",
         "final_reconstruction_drift",
     } <= written
+
+
+# ---------------------------------------------------------------------------
+# Per-frame depth sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_depth0_only_dump_is_unchanged(tmp_path):
+    """No sidecar must mean exactly today's behaviour.
+
+    A dump taken before the sidecar existed, or without RCMV_DUMP_DEPTH=1, is
+    still the common case, and it must keep producing the same correspondences
+    it always has.
+    """
+
+    _write_scene(tmp_path)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+
+    assert scene.depth is None
+    assert not scene.has_time_varying_depth
+    assert scene.depth_sidecar_path is None
+
+    correspondences, report = build_anchor_correspondences(scene)
+    assert correspondences.trajectory_indices.tolist() == [0, 1, 2]
+    assert correspondences.query_slots.tolist() == [0, 0, 0]
+    assert correspondences.query_times.tolist() == [0, 0, 0]
+    assert correspondences.rows.tolist() == [25, 30, 27]
+    assert correspondences.columns.tolist() == [22, 28, 34]
+    assert report["eligible_query_count"] == 3
+    assert report["supervised_pair_count"] == 3
+    assert report["anchor_count"] == 1
+
+
+def test_time_varying_depth_sidecar_is_loaded_beside_meta(tmp_path):
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+
+    assert scene.has_time_varying_depth
+    assert scene.depth.shape == (2, 4, 1, 56, 56)
+    assert scene.depth_sidecar_path == tmp_path / "0000" / "depth_full.npz"
+    # depth[:, 0] is what meta.npz stores as depth0, by construction on the
+    # producing side; the adapter relies on that to anchor time 0 identically
+    # whether or not the sidecar is present.
+    assert torch.equal(scene.depth[:, 0], scene.depth0)
+    for time_index in range(4):
+        assert torch.equal(
+            scene.surface_depth_map(0, time_index),
+            scene.depth[0, time_index, 0],
+        )
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_sidecar_dtype_is_read_not_asserted(tmp_path, dtype):
+    """Kubric's depth TIFFs decide the dtype and the dump passes it through.
+
+    Anything the producing side emits must load, and must produce the same
+    correspondences, so nothing may hardcode or assert float32.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True, sidecar_dtype=dtype)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+
+    assert scene.depth.dtype == torch.float32
+    assert torch.equal(scene.depth[:, 0], scene.depth0)
+    correspondences, _ = build_anchor_correspondences(scene)
+    assert correspondences.trajectory_indices.tolist() == [0, 1, 2]
+    assert correspondences.rows.tolist() == [25, 30, 27]
+    assert correspondences.columns.tolist() == [22, 28, 34]
+
+
+def test_sidecar_disagreeing_with_depth0_is_rejected(tmp_path):
+    scene_path = _write_scene(tmp_path, depth_sidecar=True)
+    with np.load(scene_path / "depth_full.npz") as sidecar:
+        depth = np.array(sidecar["depth"])
+    depth[0, 0, 0, 5, 5] += 1.0
+    np.savez_compressed(scene_path / "depth_full.npz", depth=depth, seq_name="0000")
+
+    with pytest.raises(ValueError, match="different dumps"):
+        load_dumped_kubric_scene(
+            tmp_path,
+            "0000",
+            cameras=(0, 1),
+            times=(0, 1, 2, 3),
+            size=56,
+        )
+
+
+def test_sidecar_shape_mismatch_is_rejected(tmp_path):
+    scene_path = _write_scene(tmp_path, depth_sidecar=True)
+    with np.load(scene_path / "depth_full.npz") as sidecar:
+        depth = np.array(sidecar["depth"])
+    np.savez_compressed(
+        scene_path / "depth_full.npz",
+        depth=depth[:, :2],
+        seq_name="0000",
+    )
+
+    with pytest.raises(ValueError, match="views x .* frames"):
+        load_dumped_kubric_scene(
+            tmp_path,
+            "0000",
+            cameras=(0, 1),
+            times=(0, 1, 2, 3),
+            size=56,
+        )
+
+
+def test_view_ids_resolve_anchor_cameras(tmp_path):
+    """``--cameras`` and anchors speak original camera ids, not view positions.
+
+    Dumps are taken with an ascending, complete view list so the two coincide
+    today. Resolving through the recorded ``view_ids`` is what stops that
+    convention from being load-bearing.
+    """
+
+    _write_scene(tmp_path, view_ids=[4, 7], depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(4, 7),
+        times=(0, 1, 2, 3),
+        query_anchors=((7, 0),),
+        size=56,
+    )
+
+    assert scene.view_ids.tolist() == [4, 7]
+    assert scene.camera_ids == (4, 7)
+    # Arrays stay indexed by view position; only the ids the user types differ.
+    assert scene.cameras == (0, 1)
+    query = scene.observations[scene.query_observation_slot]
+    assert (query.camera, query.camera_id) == (1, 7)
+    assert scene.query_observation_slot == 4
+
+    with pytest.raises(ValueError, match="not among the dumped cameras"):
+        load_dumped_kubric_scene(
+            tmp_path,
+            "0000",
+            cameras=(0, 1),
+            times=(0, 1),
+            size=56,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Anchors at any camera and any time
+# ---------------------------------------------------------------------------
+
+
+def test_nonzero_query_time_anchor_supervises_with_the_sidecar(tmp_path):
+    """A query that starts at t=2 is anchored at t=2, not discarded."""
+
+    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 2),),
+        size=56,
+    )
+
+    correspondences, report = build_anchor_correspondences(scene)
+
+    assert correspondences.count == 3
+    assert correspondences.query_times.tolist() == [2, 2, 2]
+    assert report["eligible_query_count"] == 3
+    expected = _project_expected_anchors(
+        scene,
+        camera=0,
+        rotated_camera=None,
+        time_index=2,
+    )
+    assert list(zip(correspondences.rows.tolist(), correspondences.columns.tolist())) == expected
+
+    # The same window anchored at t=0 reaches nothing: the queries are not at
+    # frame 0, which is exactly the loss the sidecar exists to recover. That is
+    # reported as an empty set with a split explaining it, not raised -- an
+    # anchor set buying nothing is the case most worth measuring.
+    at_time_zero = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0),),
+        size=56,
+    )
+    empty, empty_report = build_anchor_correspondences(at_time_zero)
+    assert empty.count == 0
+    assert empty_report["eligible_query_count"] == 0
+    assert empty_report["rejected"]["query_time_mismatch"] == 3
+
+
+def test_nonzero_query_time_needs_the_sidecar(tmp_path):
+    _write_scene(tmp_path, query_times=[2, 2, 2])
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 2),),
+        size=56,
+    )
+
+    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
+        build_anchor_correspondences(scene)
+
+
+def test_nonzero_query_camera_anchor_uses_its_own_depth(tmp_path):
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((1, 0),),
+        size=56,
+    )
+    # If the anchor accidentally read camera 0, every candidate fails its gate.
+    scene.depth[0].fill_(100.0)
+    scene.depth0[0].fill_(100.0)
+
+    correspondences, report = build_anchor_correspondences(scene)
+
+    assert correspondences.count == 3
+    assert report["per_anchor"][0]["camera"] == 1
+    assert scene.query_observation_slot == 4
+
+
+def test_a_query_visible_from_two_anchors_yields_one_row(tmp_path):
+    """One row per trajectory, whichever anchor wins it.
+
+    Both anchors here can see every query, so under a per-(query, anchor) rule
+    this scene would produce six rows and the doubly-visible queries would carry
+    twice the gradient of a singly-visible one. Anchor multiplicity is a property
+    of where the cameras point, not of how much a point matters, so exactly one
+    anchor supervises each query and the totals stay balanced.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+
+    correspondences, report = build_anchor_correspondences(scene)
+
+    # One row per trajectory, never one per (trajectory, anchor) pair: anchor
+    # multiplicity is a property of where the cameras point, not of how much a
+    # point matters, so a doubly-visible query must not outweigh a singly-visible
+    # one.
+    assert report["eligible_query_count"] == 3
+    assert report["supervised_pair_count"] == 3
+    assert correspondences.count == 3
+    assert sorted(correspondences.trajectory_indices.tolist()) == [0, 1, 2]
+    assert ELIGIBILITY_ASSIGNMENT_RULE == report["assignment_rule"]
+    assert ELIGIBILITY_ROLLUP_RULE == report["rollup_rule"]
+    # Both anchors could take every query here, so the tiebreak decides and the
+    # totals still balance.
+    assert [anchor["eligible"] for anchor in report["per_anchor"]] == [3, 3]
+    assert sum(anchor["assigned"] for anchor in report["per_anchor"]) == 3
+    assert sum(anchor["sole_anchor"] for anchor in report["per_anchor"]) == 0
+
+
+def test_best_fitting_anchor_wins_over_an_earlier_worse_one(tmp_path):
+    """Selection is by fit, not by declaration order.
+
+    Anchor 0 is declared first but its depth map is nudged off the query's
+    surface, so its anchor-depth error is larger than anchor 1's while still
+    inside the 10 cm gate. The later, better-fitting anchor must win -- that is
+    what distinguishes best-fit from first-eligible.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    # Tie-break alone would give every query to anchor 0.
+    baseline, _ = build_anchor_correspondences(scene)
+    assert baseline.query_slots.tolist() == [0, 0, 0]
+
+    # 5 cm of depth error at camera 0: still passes the gate, but is a worse fit
+    # than camera 1's exact render.
+    scene.depth[0, 0, 0] += 0.05
+    scene.depth0[0, 0] += 0.05
+
+    correspondences, report = build_anchor_correspondences(scene)
+
+    assert correspondences.query_slots.tolist() == [1, 1, 1]
+    assert report["per_anchor"][0]["eligible"] == 3
+    assert report["per_anchor"][0]["assigned"] == 0
+    assert report["per_anchor"][1]["assigned"] == 3
+
+
+def test_second_anchor_recovers_a_query_the_first_cannot(tmp_path):
+    """The occlusion recovery, measured.
+
+    Track 1 is invisible in camera 0 at t=0, so no camera-0 anchor can reach
+    it -- its pixel there belongs to whatever occludes it. Camera 1 sees it.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
+    single = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0),),
+        size=56,
+    )
+    both = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+
+    _, single_report = build_anchor_correspondences(single)
+    _, both_report = build_anchor_correspondences(both)
+
+    assert single_report["eligible_query_count"] == 2
+    assert single_report["rejected"]["not_visible_in_anchor"] == 1
+    assert both_report["eligible_query_count"] == 3
+    assert both_report["rejected"]["not_visible_in_anchor"] == 0
+    # Camera 1 is the only anchor that can reach track 1 -- that is the recovery,
+    # and sole_anchor names it without depending on declaration order.
+    assert both_report["per_anchor"][1]["sole_anchor"] == 1
+    assert both_report["per_anchor"][0]["sole_anchor"] == 0
+    assert both_report["per_anchor"][0]["assigned"] == 2
+    assert both_report["per_anchor"][1]["assigned"] == 1
+    assert both_report["per_anchor"][1]["rejected"]["not_visible_in_anchor"] == 0
+
+
+def test_eligibility_split_is_exclusive_and_exhaustive(tmp_path):
+    """Every query is accounted for exactly once, whatever the anchor set."""
+
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        query_times=[0, 2, 2],
+        invisible=[(0, 0, 0)],
+    )
+    for anchors in (((0, 0),), ((0, 0), (1, 0)), ((0, 0), (1, 0), (0, 2))):
+        scene = load_dumped_kubric_scene(
+            tmp_path,
+            "0000",
+            cameras=(0, 1),
+            times=(0, 1, 2, 3),
+            query_anchors=anchors,
+            size=56,
+        )
+        _, report = build_anchor_correspondences(scene)
+        assert set(report["rejected"]) == set(ELIGIBILITY_REJECTION_STAGES)
+        accounted = report["eligible_query_count"] + sum(report["rejected"].values())
+        assert accounted == report["total_query_count"] == 3
+
+
+def test_anchor_depth_gate_still_rejects_at_a_nonzero_time(tmp_path):
+    """The 10 cm gate is unchanged, and applies to per-frame depth too."""
+
+    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 2),),
+        size=56,
+    )
+    baseline, _ = build_anchor_correspondences(scene)
+    assert baseline.trajectory_indices.tolist() == [0, 1, 2]
+
+    observation = scene.observations[scene.query_observation_slot]
+    rows, columns = observation.image_transform.output_to_original_indices()
+    # Move the surface a metre away under track 0's anchor pixel, at t=2 only.
+    scene.depth[0, 2, 0, int(rows[baseline.rows[0]]), int(columns[baseline.columns[0]])] = 8.0
+
+    filtered, report = build_anchor_correspondences(scene)
+
+    assert filtered.trajectory_indices.tolist() == [1, 2]
+    assert report["rejected"]["anchor_depth_gate"] == 1
+
+
+def test_out_of_bounds_projection_is_rejected(tmp_path):
+    """A query projecting outside the crop is counted, not silently kept."""
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+    # Push track 0 far off the image plane; the trajectory and query point must
+    # move together or the adapter's own consistency check fires first.
+    scene.trajectories_world[:, 0, 0] = 500.0
+    scene.query_points[0, 1] = 500.0
+
+    correspondences, report = build_anchor_correspondences(scene)
+
+    assert correspondences.trajectory_indices.tolist() == [1, 2]
+    assert report["rejected"]["projection"] == 1
+    assert report["eligible_query_count"] == 2
+
+
+def test_select_query_slot_slices_and_rebases(tmp_path):
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+
+    for anchor_index in (0, 1):
+        anchor = correspondences.select_query_slot(anchor_index)
+        keep = correspondences.query_slots == anchor_index
+        assert anchor.count == int(keep.sum())
+        # Rebased to zero, because one anchor's head pass produces Q=1.
+        assert anchor.query_slots.tolist() == [0] * anchor.count
+        assert anchor.trajectory_indices.tolist() == (
+            correspondences.trajectory_indices[keep].tolist()
+        )
+        assert anchor.rows.tolist() == correspondences.rows[keep].tolist()
+
+    assert correspondences.select_query_slot(9).count == 0
+    with pytest.raises(ValueError, match="non-negative"):
+        correspondences.select_query_slot(-1)
+
+
+def test_anchor_sample_counts_come_from_the_loss_masking(tmp_path):
+    """The per-anchor weights must be the loss's own mask, not a re-derivation."""
+
+    # Track 1 is reachable only from camera 1, so each anchor owns rows and the
+    # counts cannot both come from the same anchor.
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        invisible=[(1, 2, 0), (0, 0, 1)],
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+
+    counts = overfit_cli._anchor_sample_counts(scene, correspondences, 2)
+
+    for anchor_index, count in enumerate(counts):
+        anchor = correspondences.select_query_slot(anchor_index)
+        _, _, _, mask = sparse_targets(scene, anchor)
+        assert count == int(mask.sum())
+    # Anchor 0 owns tracks 0 and 2 (one of track 0's 8 observations occluded),
+    # anchor 1 owns track 1 (one occluded).
+    assert counts == [15, 7]
+    assert sum(counts) > 0
+
+
+# ---------------------------------------------------------------------------
+# The encoder/head graph cut
+# ---------------------------------------------------------------------------
+
+
+class _CutToy(nn.Module):
+    """A backbone-shaped stand-in: shared trunk, per-query head.
+
+    ``feats`` is a list of tuples of tensors, matching the real backbone's tap
+    structure, so ``_cut_features`` is exercised on the shape it must actually
+    walk rather than on a flat tensor.
+    """
+
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(0)
+        self.encoder = nn.Linear(4, 4)
+        self.head = nn.Linear(4, 3)
+
+    def encode(self, x):
+        first = self.encoder(x)
+        second = self.encoder(x * 0.5)
+        return [(first, second, first + second), (first * 2.0, second - 1.0, first)]
+
+    def anchor_loss(self, feats, anchor_index):
+        tap = feats[anchor_index % len(feats)][anchor_index % 3]
+        return self.head(tap).pow(2).mean()
+
+
+def test_graph_cut_accumulation_equals_one_combined_backward():
+    """Per-anchor backward across the cut must equal the single big backward.
+
+    This is the claim the whole multi-anchor design rests on: the cut exists so
+    that only one track-head graph is alive at a time and the encoder is
+    differentiated once, and it is only admissible because summing gradients at
+    a cut is exactly the chain rule. The assertion deliberately covers
+    parameters *upstream* of the cut, which is where a mis-wired
+    ``torch.autograd.backward(feats, grad_tensors=...)`` would show up.
+    """
+
+    inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    weights = [0.5, 0.3, 0.2]
+
+    combined = _CutToy()
+    feats = combined.encode(inputs)
+    total = sum(
+        weight * combined.anchor_loss(feats, anchor_index)
+        for anchor_index, weight in enumerate(weights)
+    )
+    total.backward()
+    expected = {
+        name: parameter.grad.clone()
+        for name, parameter in combined.named_parameters()
+    }
+
+    cut_model = _CutToy()
+    cut_model.load_state_dict(combined.state_dict())
+    feats = cut_model.encode(inputs)
+    cut_feats, pairs = overfit_cli._cut_features(feats)
+    assert pairs, "the cut must find differentiable taps to detach"
+    cut_total = 0.0
+    for anchor_index, weight in enumerate(weights):
+        loss = weight * cut_model.anchor_loss(cut_feats, anchor_index)
+        # Backward per anchor: this anchor's head graph is freed here, before
+        # the next anchor allocates its own.
+        loss.backward()
+        cut_total += float(loss.detach())
+    assert cut_model.head.weight.grad is not None
+    assert cut_model.encoder.weight.grad is None, (
+        "nothing may reach the encoder until the cut is backwarded"
+    )
+    overfit_cli._backward_through_cut(pairs)
+
+    assert cut_total == pytest.approx(float(total.detach()), rel=1e-6)
+    for name, parameter in cut_model.named_parameters():
+        torch.testing.assert_close(parameter.grad, expected[name], msg=name)
+
+
+def test_graph_cut_leaves_untouched_taps_at_zero():
+    """A tap no anchor read still needs a gradient of the right shape."""
+
+    inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    model = _CutToy()
+    feats = model.encode(inputs)
+    cut_feats, pairs = overfit_cli._cut_features(feats)
+
+    # Read exactly one tap, so every other leaf keeps grad None.
+    model.anchor_loss(cut_feats, 0).backward()
+    assert any(leaf.grad is None for _, leaf in pairs)
+
+    overfit_cli._backward_through_cut(pairs)
+
+    assert model.encoder.weight.grad is not None
+    assert torch.isfinite(model.encoder.weight.grad).all()
+
+
+def test_graph_cut_passes_non_differentiable_values_through():
+    feats = [(torch.ones(2), None, "tap"), 7]
+
+    cut, pairs = overfit_cli._cut_features(feats)
+
+    assert pairs == []
+    assert cut[0][1] is None and cut[0][2] == "tap" and cut[1] == 7
+    # No pairs means nothing to push back; this must be a no-op, not a crash.
+    overfit_cli._backward_through_cut(pairs)
+
+
+# ---------------------------------------------------------------------------
+# CLI surface
+# ---------------------------------------------------------------------------
+
+
+def test_query_anchor_parsing_and_defaults():
+    parser = overfit_cli.build_arg_parser()
+    base = [
+        "--data_root", "data", "--scene", "1",
+        "--cameras", "0", "1",
+        "--times", "0", "2", "6",
+        "--parse_only",
+    ]
+
+    default = parser.parse_args(base)
+    overfit_cli._validate_args(default)
+    assert default.query_anchor is None
+    assert overfit_cli._resolve_query_anchors(default) == ((0, 0),)
+
+    several = parser.parse_args(base + ["--query_anchor", "0:0", "1:0", "0:6"])
+    overfit_cli._validate_args(several)
+    assert overfit_cli._resolve_query_anchors(several) == ((0, 0), (1, 0), (0, 6))
+
+    for flags, message in (
+        (["--query_anchor", "3:0"], "camera 3 is not in --cameras"),
+        (["--query_anchor", "0:1"], "time 1 is not in --times"),
+        (["--query_anchor", "0:0", "0:0"], "listed more than once"),
+        (["--query_anchor", "0"], "CAMERA:TIME"),
+        (["--query_anchor", "0:0:0"], "CAMERA:TIME"),
+        (["--query_anchor", "a:0"], "integers"),
+        (["--query_anchor=-1:0"], "non-negative"),
+    ):
+        args = parser.parse_args(base + flags)
+        with pytest.raises(ValueError, match=message):
+            overfit_cli._validate_args(args)
+
+
+def test_eligibility_only_main_needs_neither_cuda_nor_checkpoint(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """The recovery must be measurable without a GPU allocation."""
+
+    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "overfit_temporal_tracking.py",
+            "--data_root", str(tmp_path),
+            "--scene", "0000",
+            "--cameras", "0", "1",
+            "--times", "0", "1", "2", "3",
+            "--query_anchor", "0:0", "1:0",
+            "--output_dir", str(output_dir),
+            "--eligibility_only",
+        ],
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: pytest.fail("eligibility-only mode must not inspect CUDA"),
+    )
+    monkeypatch.setattr(
+        Arc,
+        "from_pretrained",
+        lambda *args, **kwargs: pytest.fail(
+            "eligibility-only mode must not load an Arc checkpoint"
+        ),
+    )
+
+    overfit_cli.main()
+
+    printed = capsys.readouterr().out
+    assert "eligible_queries=3/3" in printed
+    # N is stated wherever a count or a share is, so a 512-query benchmark
+    # split can never be read against the training dump's 2048.
+    assert "total_query_count=3" in printed
+    assert "PASS eligibility report" in printed
+
+    written = json.loads((output_dir / "eligibility.json").read_text())
+    assert written["query_anchors"] == [[0, 0], [1, 0]]
+    assert written["time_varying_depth"]["present"] is True
+    report = written["eligibility"]
+    assert report["total_query_count"] == 3
+    assert report["eligible_query_count"] == 3
+    # One row per query, whatever the overlap, so pairs == queries.
+    assert report["supervised_pair_count"] == 3
+    # Camera 1 is the only anchor that can reach the query occluded in camera 0.
+    # Which anchor wins the other two is decided by sub-pixel fit and so depends
+    # on the crop; only the totals and the sole-anchor count are invariant.
+    assert report["per_anchor"][1]["sole_anchor"] == 1
+    assert report["per_anchor"][0]["sole_anchor"] == 0
+    assert sum(anchor["assigned"] for anchor in report["per_anchor"]) == 3
+    assert report["per_anchor"][1]["assigned"] >= 1
+    assert report["assignment_rule"] == ELIGIBILITY_ASSIGNMENT_RULE
+    assert report["rollup_rule"] == ELIGIBILITY_ROLLUP_RULE
+
+
+def test_run_summary_includes_the_anchor_and_eligibility_fields():
+    source = Path(overfit_cli.__file__).read_text()
+    written = None
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "summary"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Dict)
+        ):
+            written = {key.value for key in node.value.keys}
+    assert written is not None, "could not find the run_summary dict literal"
+
+    assert {
+        "query_anchors",
+        "query_anchor_slots",
+        "anchor_count",
+        "active_anchor_count",
+        "anchor_sample_counts",
+        "anchor_weights",
+        "eligibility",
+        "view_ids",
+        "time_varying_depth",
+    } <= written
+    # The pre-existing keys keep their meaning; the rule is still add-only.
+    assert _BASELINE_RUN_SUMMARY_FIELDS <= written
+
+
+def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
+    """The training step's arithmetic, pinned against the loss it stands in for.
+
+    A multi-anchor step never forms the stacked Q=A loss: it scores one anchor
+    at a time and backwards each, weighted by that anchor's share of the
+    supervised samples. This asserts the two are the same number and the same
+    gradient -- which is what makes the memory saving free rather than a change
+    of objective.
+    """
+
+    # (0,0,1) makes track 1 reachable only from camera 1, so both anchors own
+    # rows; (1,2,0) puts an occluded target in the mix so the masks differ.
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        invisible=[(1, 2, 0), (0, 0, 1)],
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    anchor_slots = scene.anchor_observation_slots
+    counts = overfit_cli._anchor_sample_counts(scene, correspondences, len(anchor_slots))
+    assert all(count > 0 for count in counts), "both anchors must own rows"
+    weights = [count / sum(counts) for count in counts]
+    anchors = _anchors_for(scene, correspondences)
+    alignment = _identity_alignment()
+
+    generator = torch.Generator().manual_seed(7)
+    field = torch.randn(
+        1,
+        len(anchor_slots),
+        scene.num_observations,
+        56,
+        56,
+        3,
+        generator=generator,
+    ) * 0.05
+
+    combined_field = field.clone().requires_grad_(True)
+    combined = sparse_tracking_loss(
+        {
+            "track_multi": combined_field,
+            "track_query_idx": scene.track_query_observation_slots,
+        },
+        scene,
+        correspondences,
+        alignment,
+        anchors,
+    )
+    combined.loss.backward()
+
+    split_field = field.clone().requires_grad_(True)
+    accumulated = None
+    for anchor_index, (slot, weight) in enumerate(zip(anchor_slots, weights)):
+        rows = torch.nonzero(correspondences.query_slots == anchor_index).flatten()
+        result = sparse_tracking_loss(
+            {
+                "track_multi": split_field[:, anchor_index : anchor_index + 1],
+                "track_query_idx": torch.tensor([slot]),
+            },
+            scene,
+            correspondences.select_query_slot(anchor_index),
+            alignment,
+            anchors[rows],
+        )
+        overfit_cli._weighted_anchor_total(
+            result,
+            position_weight=weight,
+            confidence_weight=0.0,
+            sync_weight=0.0,
+        ).backward()
+        accumulated = overfit_cli._accumulate(accumulated, result.loss, weight)
+
+    assert accumulated == pytest.approx(float(combined.loss.detach()), rel=1e-6)
+    torch.testing.assert_close(split_field.grad, combined_field.grad, rtol=1e-5, atol=1e-7)
+    assert combined.sample_count == sum(counts)
+
+
+def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
+    """The confidence term needs its own shares, not the position term's.
+
+    It deliberately drops the visibility mask -- occluded samples are where the
+    error is large, so they are where a low confidence is learned -- and so it
+    reduces over a strictly larger set. Weighting it by the position share would
+    make the multi-anchor objective quietly differ from the stacked-Q one.
+    """
+
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        invisible=[(1, 2, 0), (0, 1, 2), (0, 0, 1)],
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    anchor_slots = scene.anchor_observation_slots
+    anchor_count = len(anchor_slots)
+    position_counts = overfit_cli._anchor_sample_counts(
+        scene, correspondences, anchor_count
+    )
+    confidence_counts = overfit_cli._anchor_confidence_counts(
+        scene, correspondences, anchor_count
+    )
+    # The two masks really are different sets, or this test proves nothing.
+    assert confidence_counts != position_counts
+    assert all(count > 0 for count in position_counts), "both anchors must own rows"
+    position_weights = [c / sum(position_counts) for c in position_counts]
+    confidence_weights = [c / sum(confidence_counts) for c in confidence_counts]
+    anchors = _anchors_for(scene, correspondences)
+    alignment = _identity_alignment()
+    alpha = 2.0
+
+    generator = torch.Generator().manual_seed(11)
+    field = torch.randn(
+        1, anchor_count, scene.num_observations, 56, 56, 3, generator=generator
+    ) * 0.05
+    confidence = 1.0 + torch.rand(
+        1, anchor_count, scene.num_observations, 56, 56, generator=generator
+    )
+
+    def score(track, conf, corr, query_idx, anchor_points):
+        return sparse_tracking_loss(
+            {
+                "track_multi": track,
+                "conf_track_multi": conf,
+                "track_query_idx": query_idx,
+            },
+            scene,
+            corr,
+            alignment,
+            anchor_points,
+            confidence_weight=1.0,
+            confidence_alpha=alpha,
+        )
+
+    combined_conf = confidence.clone().requires_grad_(True)
+    combined = score(
+        field,
+        combined_conf,
+        correspondences,
+        scene.track_query_observation_slots,
+        anchors,
+    )
+    combined.confidence_loss.backward()
+
+    split_conf = confidence.clone().requires_grad_(True)
+    accumulated = None
+    for anchor_index, slot in enumerate(anchor_slots):
+        rows = torch.nonzero(correspondences.query_slots == anchor_index).flatten()
+        result = score(
+            field[:, anchor_index : anchor_index + 1],
+            split_conf[:, anchor_index : anchor_index + 1],
+            correspondences.select_query_slot(anchor_index),
+            torch.tensor([slot]),
+            anchors[rows],
+        )
+        overfit_cli._weighted_anchor_total(
+            result,
+            position_weight=position_weights[anchor_index],
+            confidence_weight=confidence_weights[anchor_index],
+            sync_weight=0.0,
+        ).backward()
+        accumulated = overfit_cli._accumulate(
+            accumulated,
+            result.confidence_loss,
+            confidence_weights[anchor_index],
+        )
+
+    assert accumulated == pytest.approx(
+        float(combined.confidence_loss.detach()), rel=1e-6
+    )
+    torch.testing.assert_close(
+        split_conf.grad, combined_conf.grad, rtol=1e-5, atol=1e-8
+    )
+
+
+def test_an_anchor_set_that_reaches_nothing_is_reported_not_raised(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """The case most worth measuring must not be the one that crashes.
+
+    An anchor set recovering nothing is a finding about the anchor set. The
+    report has to survive it; only training refuses to start, and it says why.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "overfit_temporal_tracking.py",
+            "--data_root", str(tmp_path),
+            "--scene", "0000",
+            "--cameras", "0", "1",
+            "--times", "0", "1", "2", "3",
+            "--query_anchor", "0:0",
+            "--eligibility_only",
+        ],
+    )
+
+    overfit_cli.main()
+
+    printed = capsys.readouterr().out
+    assert "eligible_queries=0/3" in printed
+    assert "rejected.query_time_mismatch=3/3" in printed
+    assert "accounted=3/3" in printed
+    assert "PASS eligibility report" in printed
+
+
+def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences(tmp_path):
+    """``query_slots`` mean the anchor list to the gather, Q to the loss.
+
+    ``select_query_slot`` rebases to 0 for the loss, so a rebased set handed to
+    ``gather_query_anchor_points`` would read anchor 0's pointmaps for anchor
+    k's pixels and raise nothing. ``anchor_rows`` is the supported pairing, and
+    this pins that it selects the same rows in the same order.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    height = width = 56
+    pointmaps = torch.arange(
+        scene.num_observations * height * width * 3,
+        dtype=torch.float32,
+    ).reshape(1, scene.num_observations, height, width, 3)
+
+    for anchor_index, slot in enumerate(scene.anchor_observation_slots):
+        rows = correspondences.anchor_rows(anchor_index)
+        rebased = correspondences.select_query_slot(anchor_index)
+        assert rows.dtype == torch.bool
+        assert int(rows.sum()) == rebased.count
+        assert correspondences.rows[rows].tolist() == rebased.rows.tolist()
+        assert correspondences.columns[rows].tolist() == rebased.columns.tolist()
+        # The gather reads slot k's pointmap for anchor k, which is exactly what
+        # the rebased set can no longer express on its own.
+        expected = pointmaps[0, slot, rebased.rows, rebased.columns]
+        assert expected.shape == (rebased.count, 3)
+
+    with pytest.raises(ValueError, match="non-negative"):
+        correspondences.anchor_rows(-1)
+
+
+def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
+    """The sync term decomposes over anchors at 1/A, and that was unpinned.
+
+    ``synchronized_consistency_loss`` reduces with ``reduction="mean"`` spanning
+    the Q axis, and every anchor contributes the same element count, so the
+    stacked loss is the plain mean of the per-anchor ones. The step loop relies
+    on that; the other two equivalence tests both run at sync_weight=0.
+    """
+
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        invisible=[(1, 2, 0), (0, 0, 1)],
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    anchor_slots = scene.anchor_observation_slots
+    anchor_count = len(anchor_slots)
+    anchors = _anchors_for(scene, correspondences)
+    alignment = _identity_alignment()
+
+    generator = torch.Generator().manual_seed(13)
+    field = torch.randn(
+        1, anchor_count, scene.num_observations, 56, 56, 3, generator=generator
+    ) * 0.05
+
+    def score(track, corr, query_idx, anchor_points):
+        return sparse_tracking_loss(
+            {"track_multi": track, "track_query_idx": query_idx},
+            scene,
+            corr,
+            alignment,
+            anchor_points,
+            sync_weight=1.0,
+        )
+
+    combined_field = field.clone().requires_grad_(True)
+    combined = score(
+        combined_field,
+        correspondences,
+        scene.track_query_observation_slots,
+        anchors,
+    )
+    assert combined.sync_loss is not None
+    combined.sync_loss.backward()
+
+    split_field = field.clone().requires_grad_(True)
+    accumulated = None
+    for anchor_index, slot in enumerate(anchor_slots):
+        rows = correspondences.anchor_rows(anchor_index)
+        result = score(
+            split_field[:, anchor_index : anchor_index + 1],
+            correspondences.select_query_slot(anchor_index),
+            torch.tensor([slot]),
+            anchors[rows],
+        )
+        overfit_cli._weighted_anchor_total(
+            result,
+            position_weight=0.0,
+            confidence_weight=0.0,
+            sync_weight=1.0 / anchor_count,
+        ).backward()
+        accumulated = overfit_cli._accumulate(
+            accumulated,
+            result.sync_loss,
+            1.0 / anchor_count,
+        )
+
+    assert accumulated == pytest.approx(float(combined.sync_loss.detach()), rel=1e-6)
+    torch.testing.assert_close(
+        split_field.grad, combined_field.grad, rtol=1e-5, atol=1e-8
+    )
+
+
+@pytest.mark.parametrize("confidence_weight", [0.0, 0.75])
+@pytest.mark.parametrize("sync_weight", [0.0, 0.5])
+def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
+    tmp_path,
+    confidence_weight,
+    sync_weight,
+):
+    """A single-anchor step must be the pre-change path, exactly.
+
+    Every archived run is single-anchor. At one anchor the position and
+    confidence shares are both 1.0 and the sync share is 1/1, so
+    ``_weighted_anchor_total`` must reproduce ``sparse_tracking_loss``'s own
+    ``total_loss`` -- and bit-for-bit, not merely close: ``compose_tracking_loss``
+    sums in insertion order and float addition is not associative, so the two
+    must also agree on the order of their terms.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    assert len(scene.anchor_observation_slots) == 1
+
+    conv, raw = _shared_conv_predictions(scene)
+    result = sparse_tracking_loss(
+        raw,
+        scene,
+        correspondences,
+        _identity_alignment(),
+        _anchors_for(scene, correspondences),
+        confidence_weight=confidence_weight,
+        confidence_alpha=3.0,
+        sync_weight=sync_weight,
+    )
+
+    combined = overfit_cli._weighted_anchor_total(
+        result,
+        position_weight=1.0,
+        confidence_weight=confidence_weight,
+        sync_weight=sync_weight,
+    )
+
+    assert torch.equal(combined, result.total_loss)
+
+
+def test_single_anchor_step_bypasses_the_cut_without_changing_gradients():
+    """The bypass must be a memory saving only, never a behaviour change.
+
+    With one anchor the cut buys nothing -- there is a single backward -- but it
+    does hold an accumulated ``.grad`` on every tap for the whole step. Skipping
+    it must leave the same parameters with the same gradients.
+    """
+
+    inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    cut_model = _CutToy()
+    feats = cut_model.encode(inputs)
+    cut_feats, pairs = overfit_cli._cut_features(feats)
+    assert pairs
+    cut_model.anchor_loss(cut_feats, 0).backward()
+    overfit_cli._backward_through_cut(pairs)
+    through_cut = {
+        name: parameter.grad.clone()
+        for name, parameter in cut_model.named_parameters()
+    }
+
+    direct_model = _CutToy()
+    direct_model.load_state_dict(cut_model.state_dict())
+    feats = direct_model.encode(inputs)
+    # The bypass: feats pass straight through, and there is nothing to push back.
+    bypass_feats, bypass_pairs = feats, []
+    assert bypass_pairs == []
+    direct_model.anchor_loss(bypass_feats, 0).backward()
+    overfit_cli._backward_through_cut(bypass_pairs)
+
+    assert {
+        name for name, p in direct_model.named_parameters() if p.grad is not None
+    } == {name for name, p in cut_model.named_parameters() if p.grad is not None}
+    for name, parameter in direct_model.named_parameters():
+        torch.testing.assert_close(parameter.grad, through_cut[name], msg=name)
+
+
+def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
+    tmp_path,
+    monkeypatch,
+):
+    """Term order is load-bearing, because float addition is not associative.
+
+    ``compose_tracking_loss`` sums in dict insertion order, so a single-anchor
+    ``_weighted_anchor_total`` reproduces ``sparse_tracking_loss``'s own
+    ``total_loss`` bit for bit only if both insert their terms in the same order.
+    Asserted on the order itself rather than on a numeric difference: whether two
+    orders actually disagree depends on the values, and on real losses they
+    usually happen to coincide -- which would make a value-based test pass while
+    the hazard stayed.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    _, raw = _shared_conv_predictions(scene)
+
+    seen = []
+
+    def recording_compose(terms, weights):
+        seen.append(list(terms))
+        return compose_tracking_loss(terms, weights)
+
+    monkeypatch.setattr(sparse_module, "compose_tracking_loss", recording_compose)
+    monkeypatch.setattr(overfit_cli, "compose_tracking_loss", recording_compose)
+
+    result = sparse_tracking_loss(
+        raw,
+        scene,
+        correspondences,
+        _identity_alignment(),
+        _anchors_for(scene, correspondences),
+        confidence_weight=0.75,
+        confidence_alpha=3.0,
+        sync_weight=0.5,
+    )
+    overfit_cli._weighted_anchor_total(
+        result,
+        position_weight=1.0,
+        confidence_weight=0.75,
+        sync_weight=0.5,
+    )
+
+    loss_order, anchor_order = seen
+    assert loss_order == ["position", "sync", "confidence"]
+    assert anchor_order == loss_order
+
+
+def test_negative_stage_would_mislabel_which_is_why_the_rollup_guards_it():
+    """Why the roll-up raises on a negative stage rather than indexing with it.
+
+    ``furthest_stage`` starts at -1, and -1 is a valid Python index landing on
+    the LAST stage, so an unaccounted query would inflate that bucket with a
+    plausible number instead of failing. The guard is unreachable today and
+    cannot be driven through the public function -- ``_anchor_candidate`` returns
+    either an eligible candidate or a failure stage, never neither, so every
+    query is always one or the other. This pins the hazard the guard exists for:
+    if the stage list is ever reordered, -1 still silently names a real bucket.
+    """
+
+    assert ELIGIBILITY_REJECTION_STAGES[-1] in ELIGIBILITY_REJECTION_STAGES
+    assert ELIGIBILITY_REJECTION_STAGES[-1] == "pixel_dedup"
+
+
+def test_report_records_the_label_quality_each_anchor_won(tmp_path):
+    """Best-fit's justification, made visible without a training run.
+
+    The rule exists because the surviving label is the least noisy one. Counts
+    alone cannot show that, so each anchor reports the depth error of the labels
+    it won and how much it beat the runner-up where there was one.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    # Push camera 0 off its own surface by 5 cm: still inside the 10 cm gate, so
+    # it stays eligible, but camera 1 now fits every query better and should win
+    # them all by a measurable margin.
+    scene.depth[0, 0, 0] += 0.05
+    scene.depth0[0, 0] += 0.05
+
+    _, report = build_anchor_correspondences(scene)
+
+    loser, winner = report["per_anchor"]
+    assert winner["assigned"] == 3
+    assert loser["assigned"] == 0
+    # An anchor that won nothing has no labels to describe, but its contested
+    # count is still a number rather than missing data.
+    assert loser["assigned_depth_error_m"] is None
+    assert loser["contested_assigned"] == 0
+    assert loser["contested_depth_error_margin_m"] is None
+
+    errors = winner["assigned_depth_error_m"]
+    assert errors is not None
+    assert errors["median"] >= 0.0
+    assert errors["p95"] >= errors["median"]
+    # Every win was contested here, and the margin is the runner-up's depth error
+    # minus the winner's -- in metres, so it should land near the 5 cm offset.
+    assert winner["contested_assigned"] == 3
+    assert winner["contested_depth_error_margin_m"] == pytest.approx(0.05, abs=5e-3)
+    assert winner["sole_anchor"] == 0
+
+
+def test_uncontested_wins_report_a_zero_contested_count(tmp_path):
+    """No runner-up anywhere must read as 'uncontested', not as missing data."""
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+
+    _, report = build_anchor_correspondences(scene)
+
+    only = report["per_anchor"][0]
+    assert only["assigned"] == 3
+    assert only["sole_anchor"] == 3
+    assert only["contested_assigned"] == 0
+    assert only["contested_depth_error_margin_m"] is None
+    assert only["assigned_depth_error_m"]["median"] == pytest.approx(0.0, abs=1e-6)

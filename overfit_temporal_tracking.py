@@ -21,12 +21,14 @@ import torch
 
 from arc.training import (
     build_anchor_correspondences,
+    compose_tracking_loss,
     fit_scene_sim3,
     gather_query_anchor_points,
     load_dumped_kubric_scene,
     reconstruction_drift_report,
     reconstruction_shift_report,
     save_temporal_tracking_checkpoint,
+    sparse_targets,
     sparse_tracking_loss,
     synchronized_consistency_stats,
     temporal_injection_report,
@@ -56,14 +58,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--times", type=int, nargs="+", default=[0, 1, 2, 3])
     parser.add_argument("--max_time_indices", type=int, default=32)
     parser.add_argument(
-        "--query_camera",
-        type=int,
-        help="Selected camera that owns the dense query field (default: first)",
-    )
-    parser.add_argument(
-        "--query_time",
-        type=int,
-        help="Selected original query frame (default: first selected time)",
+        "--query_anchor",
+        nargs="+",
+        metavar="CAMERA:TIME",
+        help=(
+            "Observations that own a dense query field, as CAMERA:TIME pairs, in "
+            "priority order; the first is primary and owns the scene Sim(3). "
+            "Defaults to the first selected camera at the first selected time. "
+            "A query point can only be anchored where it is the front surface at "
+            "its own query time, so extra cameras reach queries occluded in the "
+            "first and extra times reach queries that do not start at frame 0. "
+            "Each query is supervised once, from the anchor it fits best. "
+            "Anchoring at a time other than 0 needs the per-frame depth sidecar "
+            "(RCMV_DUMP_DEPTH=1)."
+        ),
     )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -192,7 +200,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "a checkpoint or CUDA"
         ),
     )
+    parser.add_argument(
+        "--eligibility_only",
+        action="store_true",
+        help=(
+            "Build the sparse correspondences for the selected anchors, print the "
+            "eligibility split and write eligibility.json, then stop. Needs "
+            "neither a checkpoint nor CUDA, so the recovery a given anchor set "
+            "buys is measurable without a GPU allocation."
+        ),
+    )
     return parser
+
+
+def _parse_query_anchor(value: str) -> tuple[int, int]:
+    """Parse one ``CAMERA:TIME`` anchor.
+
+    Rejected explicitly rather than coerced: a silently mis-parsed anchor would
+    supervise the wrong observation and still produce plausible numbers.
+    """
+
+    text = str(value).strip()
+    parts = text.split(":")
+    if len(parts) != 2:
+        raise ValueError(
+            f"--query_anchor entries must look like CAMERA:TIME, got {value!r}"
+        )
+    try:
+        camera, time_index = (int(part) for part in parts)
+    except ValueError:
+        raise ValueError(
+            f"--query_anchor entries must be integers CAMERA:TIME, got {value!r}"
+        ) from None
+    if camera < 0 or time_index < 0:
+        raise ValueError(
+            f"--query_anchor CAMERA and TIME must be non-negative, got {value!r}"
+        )
+    return camera, time_index
+
+
+def _resolve_query_anchors(args: argparse.Namespace) -> tuple[tuple[int, int], ...]:
+    """The anchor list a run will use, defaulted and validated."""
+
+    if not args.query_anchor:
+        return ((args.cameras[0], args.times[0]),)
+    anchors = tuple(_parse_query_anchor(value) for value in args.query_anchor)
+    seen = set()
+    for camera, time_index in anchors:
+        if camera not in args.cameras:
+            raise ValueError(
+                f"--query_anchor camera {camera} is not in --cameras "
+                f"{list(args.cameras)}"
+            )
+        if time_index not in args.times:
+            raise ValueError(
+                f"--query_anchor time {time_index} is not in --times "
+                f"{list(args.times)}"
+            )
+        if (camera, time_index) in seen:
+            raise ValueError(
+                f"--query_anchor {camera}:{time_index} is listed more than once"
+            )
+        seen.add((camera, time_index))
+    return anchors
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -218,21 +288,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"--max_time_indices={args.max_time_indices}"
         )
 
-    query_camera = (
-        args.cameras[0] if args.query_camera is None else args.query_camera
-    )
-    query_time = args.times[0] if args.query_time is None else args.query_time
-    if query_camera not in args.cameras:
-        raise ValueError("--query_camera must be one of --cameras")
-    if query_time not in args.times:
-        raise ValueError("--query_time must be one of --times")
+    _resolve_query_anchors(args)
 
-    if args.parse_only:
+    if args.parse_only or args.eligibility_only:
         return
     if not args.checkpoint_dir:
-        raise ValueError("--checkpoint_dir is required unless --parse_only is set")
+        raise ValueError(
+            "--checkpoint_dir is required unless --parse_only or "
+            "--eligibility_only is set"
+        )
     if not args.output_dir:
-        raise ValueError("--output_dir is required unless --parse_only is set")
+        raise ValueError(
+            "--output_dir is required unless --parse_only or "
+            "--eligibility_only is set"
+        )
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
     if not math.isfinite(args.lr) or args.lr <= 0:
@@ -264,11 +333,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         or not 0 <= args.min_index_advantage < 1
     ):
         raise ValueError("--min_index_advantage must be finite and in [0, 1)")
-    if query_time != 0:
-        raise ValueError(
-            "Sparse training requires --query_time 0 because the dump contains "
-            "only depth0. Use --parse_only for other windows."
-        )
+    # An anchor at a time other than 0 needs the per-frame depth sidecar, which
+    # only the loaded scene can report on. DumpedKubricScene.surface_depth_map
+    # raises there, naming RCMV_DUMP_DEPTH=1, so the guard sits where the fact
+    # is known rather than being guessed from the flags.
 
 
 def _parse_confidence_alpha(value) -> float | None:
@@ -319,14 +387,31 @@ def _validate_scene_layout(scene) -> None:
 def _print_parse_report(scene) -> None:
     query = scene.observations[scene.query_observation_slot]
     print(f"scene={scene.name}")
+    print(f"camera_ids={list(scene.camera_ids)}")
+    print(f"view_ids={scene.view_ids.tolist()}")
     print(f"cameras={list(scene.cameras)}")
     print(f"original_times={list(scene.times)}")
     print(f"time_indices={list(scene.time_indices)}")
     print(f"observations={scene.num_observations}")
     print(
         "query_observation="
-        f"slot {query.slot}, camera {query.camera}, "
+        f"slot {query.slot}, camera {query.camera_id}, "
         f"original_time {query.original_time}"
+    )
+    print(
+        "query_anchors="
+        + " ".join(
+            f"{camera}:{time_index}" for camera, time_index in scene.query_anchors
+        )
+        + f" (slots {list(scene.anchor_observation_slots)})"
+    )
+    print(
+        "time_varying_depth="
+        + (
+            f"{scene.depth_sidecar_path} {tuple(scene.depth.shape)}"
+            if scene.has_time_varying_depth
+            else "absent (depth0 only)"
+        )
     )
     for observation, view in zip(scene.observations, scene.views):
         print(
@@ -515,6 +600,171 @@ def _build_optimizer(model, args) -> tuple[torch.optim.AdamW, dict[str, float], 
         )
     optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
     return optimizer, learning_rates, encoder_parameters
+
+
+def _cut_features(feats):
+    """Detach the backbone taps into leaves, returning the cut and its pairs.
+
+    This is the encoder/head boundary that lets several anchors be supervised
+    without holding several track-head graphs at once.  Each anchor's head pass
+    runs on the leaves and backwards immediately, freeing its own graph and
+    leaving its gradient on the cut; one
+    ``torch.autograd.backward(originals, leaf_grads)`` afterwards pushes the
+    summed gradient through the encoder exactly once.  Summing gradients at a
+    cut is the chain rule, so this is identical to one combined backward -- not
+    an approximation -- while the encoder is neither re-run nor re-differentiated
+    per anchor.
+    """
+
+    pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def cut(value):
+        if torch.is_tensor(value):
+            if not value.requires_grad:
+                return value
+            leaf = value.detach().requires_grad_(True)
+            pairs.append((value, leaf))
+            return leaf
+        if isinstance(value, (list, tuple)):
+            return type(value)(cut(item) for item in value)
+        return value
+
+    return cut(feats), pairs
+
+
+def _backward_through_cut(pairs) -> None:
+    """Push the anchors' accumulated gradients back through the encoder once."""
+
+    if not pairs:
+        return
+    originals = [original for original, _ in pairs]
+    gradients = [
+        torch.zeros_like(leaf) if leaf.grad is None else leaf.grad
+        for _, leaf in pairs
+    ]
+    torch.autograd.backward(originals, gradients)
+
+
+def _encode_and_reconstruct(model, views):
+    """The per-step work that does not depend on which frame is the query."""
+
+    images, _, time_indices = model._preprocess_input(views)
+    feats = model.encode_features(images, time_indices=time_indices)
+    return images, feats, model.reconstruct(feats, images)
+
+
+def _anchor_tracks(model, feats, images, scene, anchor_index):
+    """One anchor's dense field, shaped as the Q=1 raw dict the loss expects."""
+
+    slot = scene.anchor_observation_slots[anchor_index]
+    track, track_conf = model.track_for_query(feats, images, slot)
+    return {
+        "track_multi": track[:, None],
+        "conf_track_multi": track_conf[:, None],
+        "track_query_idx": torch.tensor([slot], device=track.device),
+    }
+
+
+def _anchor_sample_counts(scene, correspondences, anchor_count: int) -> list[int]:
+    """Supervised sample count per anchor, from the scene alone.
+
+    These are the weights that make per-anchor backward equal one combined
+    ``reduction="mean"``.  They come from ``sparse_targets``, the same masking
+    the loss itself applies, so the two cannot drift apart; and because nothing
+    in that mask reads a prediction, they are fixed for the whole run.
+    """
+
+    counts = []
+    for anchor_index in range(anchor_count):
+        anchor = correspondences.select_query_slot(anchor_index)
+        if anchor.count == 0:
+            counts.append(0)
+            continue
+        _, _, _, mask = sparse_targets(scene, anchor)
+        counts.append(int(mask.sum().item()))
+    return counts
+
+
+def _anchor_confidence_counts(
+    scene,
+    correspondences,
+    anchor_count: int,
+) -> list[int]:
+    """Confidence-term sample count per anchor.
+
+    The confidence term deliberately does *not* mask on visibility -- occluded
+    samples are where the error is large, which is the signal it exists to learn
+    -- so it reduces over a strictly larger set than the position term and needs
+    its own weights.  Reusing the position weights here would make the combined
+    objective differ from the stacked-Q one by the ratio between the two masks.
+
+    The remaining predicates in that mask are prediction-dependent
+    (``predicted_finite``, ``confidence_finite``), so this is exact whenever
+    nothing goes non-finite.  When something does, the run says so loudly:
+    the drop is counted by cause in ``confidence_dropped`` and warned about.
+    """
+
+    counts = []
+    for anchor_index in range(anchor_count):
+        anchor = correspondences.select_query_slot(anchor_index)
+        if anchor.count == 0:
+            counts.append(0)
+            continue
+        _, _, finite, _ = sparse_targets(scene, anchor)
+        counts.append(int(finite.sum().item()))
+    return counts
+
+
+def _weighted_anchor_total(
+    result,
+    *,
+    position_weight: float,
+    confidence_weight: float,
+    sync_weight: float,
+) -> torch.Tensor:
+    """One anchor's contribution to the combined objective.
+
+    ``compose_tracking_loss`` is linear in its terms, so backwarding each
+    anchor's weighted total in turn accumulates exactly the gradient of the sum
+    -- which is the combined loss, given the position and confidence weights are
+    that anchor's share of the supervised samples and the sync weight is its
+    share of the anchors.
+
+    One scope limit on that equivalence.  The sync share is
+    ``1 / active_anchor_count``, not ``1 / anchor_count``, so the objective
+    reproduced is a stacked forward over the **active** anchors.  A declared
+    anchor that supervises nothing is skipped entirely, and against the
+    ``Q = anchor_count`` reference ``_evaluate`` computes, its dense field would
+    have contributed a sync term this does not include.  Weighting by the active
+    count is the defensible choice -- an anchor with no supervised query still
+    has a displacement field, but nothing here has any evidence about it -- but
+    it does mean the two numbers differ in that case.
+
+    Terms are inserted in the same order ``sparse_tracking_loss`` uses, because
+    ``compose_tracking_loss`` sums in insertion order and float addition is not
+    associative: with a single anchor at weight 1.0 this must reproduce that
+    function's own ``total_loss`` bit for bit.
+    """
+
+    terms = {"position": result.loss}
+    weights = {"position": position_weight}
+    if result.sync_loss is not None:
+        terms["sync"] = result.sync_loss
+        weights["sync"] = sync_weight
+    if result.confidence_loss is not None:
+        terms["confidence"] = result.confidence_loss
+        weights["confidence"] = confidence_weight
+    total, _ = compose_tracking_loss(terms, weights)
+    return total
+
+
+def _accumulate(total: float | None, value, weight: float) -> float | None:
+    """Running weighted sum of a reported scalar across anchors."""
+
+    if value is None:
+        return total
+    contribution = float(value.detach().item()) * float(weight)
+    return contribution if total is None else total + contribution
 
 
 def _tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
@@ -817,6 +1067,126 @@ def _evaluate(
     }
 
 
+def _print_eligibility(report: dict) -> None:
+    """The split, with N stated everywhere a count or a share is printed.
+
+    The overfit harness runs the benchmark protocol's 512 queries while the
+    training dump draws 2048, so a percentage without its denominator is a
+    number that can be read against the wrong N.
+    """
+
+    total = report["total_query_count"]
+    eligible = report["eligible_query_count"]
+    if total == 0:
+        raise RuntimeError(
+            f"Scene carries no query points at all; nothing to anchor. Report: {report}"
+        )
+    print(
+        f"eligible_queries={eligible}/{total} "
+        f"({eligible / total:.1%} of total_query_count={total}); "
+        f"supervised_pairs={report['supervised_pair_count']} across "
+        f"{report['anchor_count']} anchor(s)"
+    )
+    rejected = report["rejected"]
+    accounted = eligible + sum(rejected.values())
+    for reason, count in rejected.items():
+        print(f"  rejected.{reason}={count}/{total} ({count / total:.1%})")
+    print(f"  accounted={accounted}/{total}")
+    if accounted != total:
+        raise RuntimeError(
+            f"Eligibility split accounts for {accounted} of {total} queries; the "
+            "per-reason counts must be exclusive and exhaustive"
+        )
+    for anchor in report["per_anchor"]:
+        print(
+            f"  anchor[{anchor['anchor_index']}] camera={anchor['camera']} "
+            f"time={anchor['time']} slot={anchor['observation_slot']}: "
+            f"eligible={anchor['eligible']}/{anchor['considered']} "
+            f"assigned={anchor['assigned']} "
+            f"sole_anchor={anchor['sole_anchor']} "
+            f"rejected={anchor['rejected']}"
+        )
+        # The label-quality return on this anchor, in metres. depth_error is how
+        # far the anchor pixel's surface sits from the query point; margin is how
+        # much better than the runner-up anchor, so it is a difference of depth
+        # errors and not a count.
+        errors = anchor["assigned_depth_error_m"]
+        margin = anchor["contested_depth_error_margin_m"]
+        print(
+            "    label_quality_m: "
+            + (
+                "assigned_depth_error median=n/a p95=n/a"
+                if errors is None
+                else (
+                    f"assigned_depth_error median={errors['median']:.4f} "
+                    f"p95={errors['p95']:.4f}"
+                )
+            )
+            + f"; contested_assigned={anchor['contested_assigned']}"
+            + (
+                " (every win uncontested)"
+                if margin is None
+                else f" margin_over_runner_up median={margin:.4f}"
+            )
+        )
+
+
+def _report_eligibility_only(scene, args) -> None:
+    """Build correspondences and report the split, without CUDA or a checkpoint."""
+
+    _, eligibility = build_anchor_correspondences(scene)
+    print(f"scene={scene.name}")
+    print(
+        "query_anchors="
+        + " ".join(
+            f"{camera}:{time_index}" for camera, time_index in scene.query_anchors
+        )
+    )
+    print(
+        "time_varying_depth="
+        + (
+            f"{scene.depth_sidecar_path}"
+            if scene.has_time_varying_depth
+            else "absent (depth0 only)"
+        )
+    )
+    _print_eligibility(eligibility)
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "eligibility.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "scene": scene.name,
+                    "cameras": list(scene.camera_ids),
+                    "times": list(scene.times),
+                    "query_anchors": [list(pair) for pair in scene.query_anchors],
+                    "time_varying_depth": _time_varying_depth_report(scene),
+                    "eligibility": eligibility,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        print(f"eligibility={path}")
+    print("PASS eligibility report")
+
+
+def _time_varying_depth_report(scene) -> dict:
+    return {
+        "present": scene.has_time_varying_depth,
+        "path": (
+            None
+            if scene.depth_sidecar_path is None
+            else str(scene.depth_sidecar_path)
+        ),
+        "shape": (
+            None if scene.depth is None else list(scene.depth.shape)
+        ),
+    }
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -830,13 +1200,15 @@ def main() -> None:
         args.scene,
         cameras=args.cameras,
         times=args.times,
-        query_camera=args.query_camera,
-        query_time=args.query_time,
+        query_anchors=_resolve_query_anchors(args),
         verbose=True,
     )
     _validate_scene_layout(scene)
     if args.parse_only:
         _print_parse_report(scene)
+        return
+    if args.eligibility_only:
+        _report_eligibility_only(scene, args)
         return
     query_observation = scene.observations[scene.query_observation_slot]
     print(
@@ -844,7 +1216,7 @@ def main() -> None:
         f"{len(scene.cameras)} cameras x {len(scene.times)} times = "
         f"{scene.num_observations} observations; "
         f"time_indices={list(scene.time_indices)}; "
-        f"query=(camera {query_observation.camera}, "
+        f"query=(camera {query_observation.camera_id}, "
         f"time {query_observation.original_time}, "
         f"slot {query_observation.slot})"
     )
@@ -905,7 +1277,60 @@ def main() -> None:
         baseline_raw,
         scene,
     )
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, eligibility = build_anchor_correspondences(scene)
+    _print_eligibility(eligibility)
+    anchor_count = len(scene.anchor_observation_slots)
+    per_anchor_correspondences = [
+        correspondences.select_query_slot(anchor_index)
+        for anchor_index in range(anchor_count)
+    ]
+    # The query pointmap anchors are gathered once from the scene-level
+    # correspondences; these masks keep each anchor's slice of them aligned with
+    # the rebased correspondences its head pass is scored against.
+    per_anchor_rows = [
+        correspondences.anchor_rows(anchor_index)
+        for anchor_index in range(anchor_count)
+    ]
+    anchor_sample_counts = _anchor_sample_counts(
+        scene,
+        correspondences,
+        anchor_count,
+    )
+    total_anchor_samples = sum(anchor_sample_counts)
+    if total_anchor_samples == 0:
+        raise RuntimeError(
+            "No anchor contributes a supervised sample, so there is nothing to "
+            "train on. The split above says why: of "
+            f"{eligibility['total_query_count']} queries, "
+            f"{eligibility['rejected']}. Anchoring at a time other than 0 needs "
+            "the per-frame depth sidecar; anchoring in another camera is what "
+            "reaches queries occluded in the first."
+        )
+    # Each anchor's share of the supervised samples. Weighting by this and
+    # backwarding per anchor is exactly one combined reduction="mean"; the
+    # counts come from the same masking the loss applies and never move,
+    # because nothing in that mask reads a prediction.
+    anchor_weights = [
+        count / total_anchor_samples for count in anchor_sample_counts
+    ]
+    active_anchor_count = sum(1 for weight in anchor_weights if weight > 0)
+    # The confidence term reduces over a different (larger) set than the
+    # position term, so it needs its own shares; see _anchor_confidence_counts.
+    anchor_confidence_counts = _anchor_confidence_counts(
+        scene,
+        correspondences,
+        anchor_count,
+    )
+    total_confidence_samples = sum(anchor_confidence_counts)
+    anchor_confidence_weights = [
+        count / total_confidence_samples if total_confidence_samples else 0.0
+        for count in anchor_confidence_counts
+    ]
+    print(
+        "anchor_sample_counts="
+        f"{anchor_sample_counts} (total {total_anchor_samples}); "
+        f"active_anchors={active_anchor_count}/{anchor_count}"
+    )
     initial_query_anchors = gather_query_anchor_points(
         baseline_raw,
         scene,
@@ -1076,36 +1501,98 @@ def main() -> None:
         model.track_head.train()
         optimizer.zero_grad(set_to_none=True)
 
+        # Encode once: the backbone does not depend on which frame is the query,
+        # so every anchor shares this forward and the reconstruction built on it.
         with _autocast_context(args.precision):
-            raw = model(scene.views, force_no_output_conversion=True)
-            if raw["track_multi"].shape[2] != scene.num_observations:
-                raise RuntimeError(
-                    "Output observation axis changed during optimization"
-                )
-            alignment, alignment_report = fit_scene_sim3(raw, scene)
+            images, feats, recon = _encode_and_reconstruct(model, scene.views)
+            alignment, alignment_report = fit_scene_sim3(recon, scene)
             query_anchors = gather_query_anchor_points(
-                raw,
+                recon,
                 scene,
                 correspondences,
             )
-            step_confidence = _confidence_stats(raw)
-            raw = _tracking_only(raw, keep_confidence=confidence_enabled)
-            result = sparse_tracking_loss(
-                raw,
-                scene,
-                correspondences,
-                alignment,
-                query_anchors,
-                huber_delta_m=args.huber_delta_m,
-                confidence_weight=args.confidence_weight,
-                confidence_alpha=confidence_alpha,
-                sync_weight=args.sync_weight,
-                # Only the initial and final evaluations are reported; a per-step
-                # occlusion report costs a device sync per figure and is discarded.
-                collect_diagnostics=False,
-            )
+            if active_anchor_count == 1:
+                # One anchor needs no cut: its backward is the only one, so it
+                # can run straight through the encoder as it did before. The cut
+                # is not free -- it holds an accumulated .grad on every backbone
+                # tap for the whole step instead of letting the backward free
+                # them as it walks -- and every archived run is single-anchor
+                # and was sized against the memory ceiling.
+                cut_feats, cut_pairs = feats, []
+            else:
+                cut_feats, cut_pairs = _cut_features(feats)
 
-        scaler.scale(result.total_loss).backward()
+        step_confidence = None
+        step_loss = None
+        step_metric_error = None
+        step_confidence_loss = None
+        step_sync_loss = None
+        for anchor_index, anchor_weight in enumerate(anchor_weights):
+            if anchor_weight == 0.0:
+                continue
+            anchor_correspondences = per_anchor_correspondences[anchor_index]
+            with _autocast_context(args.precision):
+                raw = _anchor_tracks(model, cut_feats, images, scene, anchor_index)
+                if raw["track_multi"].shape[2] != scene.num_observations:
+                    raise RuntimeError(
+                        "Output observation axis changed during optimization"
+                    )
+                if step_confidence is None:
+                    # First *active* anchor: anchor 0 is skipped when it has no
+                    # supervised samples, and the log must not go silent for it.
+                    step_confidence = _confidence_stats(raw)
+                raw = _tracking_only(raw, keep_confidence=confidence_enabled)
+                result = sparse_tracking_loss(
+                    raw,
+                    scene,
+                    anchor_correspondences,
+                    alignment,
+                    query_anchors[
+                        per_anchor_rows[anchor_index].to(query_anchors.device)
+                    ],
+                    huber_delta_m=args.huber_delta_m,
+                    confidence_weight=args.confidence_weight,
+                    confidence_alpha=confidence_alpha,
+                    sync_weight=args.sync_weight,
+                    # Only the initial and final evaluations are reported; a
+                    # per-step occlusion report costs a device sync per figure
+                    # and is discarded.
+                    collect_diagnostics=False,
+                )
+                anchor_total = _weighted_anchor_total(
+                    result,
+                    position_weight=anchor_weight,
+                    confidence_weight=(
+                        args.confidence_weight
+                        * anchor_confidence_weights[anchor_index]
+                    ),
+                    sync_weight=args.sync_weight / active_anchor_count,
+                )
+
+            # Backward per anchor, so this anchor's track-head graph is freed
+            # before the next one allocates its own. The gradient lands on the
+            # cut and is pushed through the encoder once, after the loop.
+            scaler.scale(anchor_total).backward()
+            step_loss = _accumulate(step_loss, result.loss, anchor_weight)
+            step_metric_error = _accumulate(
+                step_metric_error,
+                result.metric_error,
+                anchor_weight,
+            )
+            step_confidence_loss = _accumulate(
+                step_confidence_loss,
+                result.confidence_loss,
+                anchor_confidence_weights[anchor_index],
+            )
+            step_sync_loss = _accumulate(
+                step_sync_loss,
+                result.sync_loss,
+                1.0 / active_anchor_count,
+            )
+            del raw, result, anchor_total
+
+        _backward_through_cut(cut_pairs)
+        del cut_feats, cut_pairs, feats, recon, images
         scaler.unscale_(optimizer)
         _assert_trainable_gradients_finite(model)
         embedding_gradient = embedding.weight.grad
@@ -1165,33 +1652,34 @@ def main() -> None:
         )
         if confidence_enabled:
             confidence_log += (
-                f" conf_loss={result.confidence_loss.detach().item():.6g}"
+                f" conf_loss={step_confidence_loss:.6g}"
                 " grad_conf="
                 f"{last_confidence_gradient_norms['track_head_output_conv_confidence_row']:.6g}"
             )
         sync_log = (
-            ""
-            if result.sync_loss is None
-            else f" sync_loss={result.sync_loss.detach().item():.6g}"
+            "" if step_sync_loss is None else f" sync_loss={step_sync_loss:.6g}"
         )
         encoder_log = (
             ""
             if last_gradient_norms["encoder_blocks"] is None
             else f" grad_encoder={last_gradient_norms['encoder_blocks']:.6g}"
         )
+        anchor_log = (
+            "" if active_anchor_count == 1 else f" anchors={active_anchor_count}"
+        )
         # The per-step drift watch: the alignment is refit each step anyway,
         # so its scale and residual are free, and a trending scale or residual
         # is the first sign the geometry is being traded for tracking loss.
         print(
             f"step={step + 1}/{args.steps} "
-            f"loss={result.loss.detach().item():.8f} "
-            f"metric_error_m={result.metric_error.detach().item():.8f} "
+            f"loss={step_loss:.8f} "
+            f"metric_error_m={step_metric_error:.8f} "
             f"align_scale={alignment_report['scale']:.6f} "
             f"align_residual_m={alignment_report['median_residual_metric']:.6f} "
             f"grad_time={last_gradient_norms['time_embedding']:.6g} "
             f"grad_motion={last_gradient_norms['motion_decoder']:.6g} "
             f"grad_track={last_gradient_norms['track_head']:.6g}"
-            f"{encoder_log}{sync_log}{confidence_log}"
+            f"{anchor_log}{encoder_log}{sync_log}{confidence_log}"
         )
 
     evaluation = _evaluate(
@@ -1256,9 +1744,12 @@ def main() -> None:
         "time_indices": list(scene.time_indices),
         "max_time_indices": args.max_time_indices,
         "query_observation_slot": scene.query_observation_slot,
-        "query_camera": query_observation.camera,
+        # Primary anchor; unchanged meaning. The full list is query_anchors.
+        "query_camera": query_observation.camera_id,
         "query_time": query_observation.original_time,
-        "eligible_query_count": correspondences.count,
+        # Distinct supervised trajectories, comparable across anchor sets.
+        # eligibility.supervised_pair_count is the (query, anchor) row count.
+        "eligible_query_count": eligibility["eligible_query_count"],
         "initial_alignment": initial_alignment_report,
         "initial_alignment_scale": float(initial_alignment.scale.item()),
         "initial_alignment_rotation": initial_alignment.rotation.tolist(),
@@ -1360,6 +1851,25 @@ def main() -> None:
         # Reconstruction vs. dump ground truth, before and after training.
         "baseline_reconstruction_drift": baseline_drift,
         "final_reconstruction_drift": evaluation["reconstruction_drift"],
+        # --- Multi-anchor supervision. Anchors are (camera, time) observations
+        # owning a dense query field, in priority order; the first is primary.
+        "query_anchors": [list(pair) for pair in scene.query_anchors],
+        "query_anchor_slots": list(scene.anchor_observation_slots),
+        "anchor_count": anchor_count,
+        "active_anchor_count": active_anchor_count,
+        # Each anchor's share of the supervised samples: the weights that make
+        # per-anchor backward equal one combined mean.
+        "anchor_sample_counts": anchor_sample_counts,
+        "anchor_weights": anchor_weights,
+        # The confidence term does not mask on visibility, so it reduces over a
+        # larger set than the position term and carries its own shares.
+        "anchor_confidence_sample_counts": anchor_confidence_counts,
+        "anchor_confidence_weights": anchor_confidence_weights,
+        # The full split, accounting for every query, with both rules stated in
+        # it as strings so a summary is self-describing.
+        "eligibility": eligibility,
+        "view_ids": scene.view_ids.tolist(),
+        "time_varying_depth": _time_varying_depth_report(scene),
     }
     summary_path = output_dir / "run_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")

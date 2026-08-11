@@ -1,5 +1,6 @@
 import json
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -977,6 +978,61 @@ def test_time_indices_reach_motion_decoder_without_changing_multi_query_semantic
     assert torch.all(output["track_multi"][:, 2] == 23)
 
 
+def test_forward_recomposes_from_its_three_public_pieces():
+    """``_forward`` must equal encode + reconstruct + per-query track.
+
+    Supervising several anchors drives those three directly so the encoder is
+    paid for once and only one track-head graph is alive at a time.  That is
+    only sound if composing them by hand reproduces ``_forward`` exactly, which
+    is what keeps ``inference.py`` and ``app.py`` unaffected by the split.
+    """
+
+    def build():
+        model = _arc_shell(max_time_indices=32)
+        model.backbone = _FakeBackbone()
+        model.head = _FakeReconstructionHead()
+        model.cam_dec = _FakeCameraDecoder()
+        model.motion_decoder = _FakeMotionDecoder()
+        model.track_head = _FakeTrackHead()
+        return model
+
+    queries = [0, 3, 7]
+    views = [{"img": torch.zeros(1, 3, 2, 2)} for _ in range(8)]
+    inference_cli.attach_frame_metadata(
+        views,
+        track_query_idx=queries,
+        time_indices=list(range(8)),
+    )
+
+    whole = build()
+    expected = whole(views, force_no_output_conversion=True)
+
+    piecewise = build()
+    images, track_query_idx, time_indices = piecewise._preprocess_input(views)
+    feats = piecewise.encode_features(images, time_indices=time_indices)
+    actual = piecewise.reconstruct(feats, images)
+    tracks = [
+        piecewise.track_for_query(feats, images, query_idx)
+        for query_idx in track_query_idx
+    ]
+    actual["track"] = tracks[0][0]
+    actual["conf_track"] = tracks[0][1]
+    actual["track_multi"] = torch.stack([track for track, _ in tracks], dim=1)
+    actual["conf_track_multi"] = torch.stack([conf for _, conf in tracks], dim=1)
+    actual["track_query_idx"] = torch.tensor(track_query_idx)
+
+    assert set(actual) == set(expected)
+    for key, value in expected.items():
+        if torch.is_tensor(value):
+            assert torch.equal(actual[key], value), key
+        elif isinstance(value, list):
+            assert len(actual[key]) == len(value), key
+            for left, right in zip(actual[key], value):
+                assert torch.equal(left, right), key
+        else:
+            assert actual[key] == value, key
+
+
 def test_temporal_tracking_drops_the_frozen_reconstruction_graph():
     """Frozen depth/camera heads must not retain a backward graph.
 
@@ -1495,3 +1551,54 @@ def test_new_mode_patch_covers_the_trained_encoder_blocks(tmp_path):
     assert "backbone.pretrained.blocks.3.weight" in saved_names
     assert "backbone.pretrained.blocks.0.weight" not in saved_names
     assert "backbone.pretrained.blocks.2.weight" not in saved_names
+
+
+def test_harness_step_helpers_drive_the_split_forward():
+    """The multi-anchor step's glue, exercised on the real Arc methods.
+
+    ``_encode_and_reconstruct`` and ``_anchor_tracks`` are what a training step
+    calls instead of ``model(views)``. They are thin, but they are the only new
+    code between the model and the loss, and a shape or key mistake in them
+    would surface as a wasted GPU allocation rather than a test failure.
+    """
+
+    import overfit_temporal_tracking as overfit_cli
+
+    model = _arc_shell(max_time_indices=32)
+    model.backbone = _FakeBackbone()
+    model.head = _FakeReconstructionHead()
+    model.cam_dec = _FakeCameraDecoder()
+    model.motion_decoder = _FakeMotionDecoder()
+    model.track_head = _FakeTrackHead()
+
+    anchor_slots = (0, 3)
+    views = [{"img": torch.zeros(1, 3, 2, 2)} for _ in range(4)]
+    inference_cli.attach_frame_metadata(
+        views,
+        track_query_idx=list(anchor_slots),
+        time_indices=list(range(4)),
+    )
+    scene = SimpleNamespace(
+        anchor_observation_slots=anchor_slots,
+        num_observations=len(views),
+    )
+
+    images, feats, recon = overfit_cli._encode_and_reconstruct(model, views)
+
+    assert images.shape == (1, 4, 3, 2, 2)
+    # The reconstruction is built once and shared: it is what the Sim(3) fit and
+    # the query pointmap anchors read, for every anchor. This stack's fake depth
+    # head returns nothing, so only the camera branch is asserted here; the real
+    # dict is pinned by test_forward_recomposes_from_its_three_public_pieces.
+    assert {"pose_enc", "pose_enc_list"} <= set(recon)
+    assert recon["pose_enc"].shape == (1, 4, 1)
+    assert len(feats) == 4
+
+    for anchor_index, slot in enumerate(anchor_slots):
+        raw = overfit_cli._anchor_tracks(model, feats, images, scene, anchor_index)
+        # Shaped as the Q=1 raw dict the loss expects, so sparse_tracking_loss
+        # keeps its contract whether it is scoring one anchor or a stacked Q=A.
+        assert raw["track_multi"].shape == (1, 1, 4, 2, 2, 3)
+        assert raw["conf_track_multi"].shape == (1, 1, 4, 2, 2)
+        assert raw["track_query_idx"].tolist() == [slot]
+        assert torch.all(raw["track_multi"] == slot)
