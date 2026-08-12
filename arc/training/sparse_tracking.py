@@ -1329,11 +1329,16 @@ def sparse_tracking_loss(
         weights["confidence"] = confidence_weight
         confidence_sample_count = int(confidence_mask.sum().item())
         if collect_diagnostics:
+            # Alpha is what sets the run's own confidence scale (conf* = alpha/err), so
+            # the report needs it to put its tau grid where this model actually is.
+            # Resolved just above, so it is a float here whether it was passed or
+            # auto-calibrated.
             diagnostics = confidence_occlusion_diagnostics(
                 confidence,
                 per_sample_error,
                 target_visible,
                 confidence_mask,
+                confidence_alpha=float(confidence_alpha),
             )
 
     total_loss, breakdown = compose_tracking_loss(terms, weights)

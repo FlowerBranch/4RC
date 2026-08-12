@@ -1873,6 +1873,69 @@ def test_diagnostics_can_be_skipped_without_touching_the_loss(dumped_scene):
     assert without_report.confidence_dropped == with_report.confidence_dropped
 
 
+def test_collecting_the_report_moves_no_gradient(dumped_scene):
+    """Diagnostics are read-only measurement and must not be able to move a weight.
+
+    The loss values are pinned above; this pins the backward too, which is what the
+    exit gates ultimately read through the trained model.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+
+    def run(collect):
+        raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+        tracks = (raw["track_multi"] + 0.3).detach().requires_grad_(True)
+        confidence = torch.full(
+            raw["track_multi"].shape[:-1], 120.0, requires_grad=True
+        )
+        result = sparse_tracking_loss(
+            {**raw, "track_multi": tracks, "conf_track_multi": confidence},
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            query_anchors,
+            confidence_weight=1.0,
+            confidence_alpha=5.0,
+            collect_diagnostics=collect,
+        )
+        result.total_loss.backward()
+        return result, tracks.grad, confidence.grad
+
+    with_report, with_track_grad, with_confidence_grad = run(True)
+    without_report, without_track_grad, without_confidence_grad = run(False)
+
+    assert with_report.diagnostics is not None
+    assert without_report.diagnostics is None
+    assert torch.equal(with_track_grad, without_track_grad)
+    assert torch.equal(with_confidence_grad, without_confidence_grad)
+
+
+def test_the_resolved_alpha_anchors_the_reported_relative_grid(dumped_scene):
+    """Auto-alpha is resolved inside the loss and is what sets the run's own
+    confidence scale.  If it did not reach the report, the relative grid would have
+    nothing to anchor to and would silently go missing."""
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    raw, query_anchors = _perfect_raw_tracks(dumped_scene, correspondences)
+    raw["track_multi"] = raw["track_multi"] + 0.3
+    raw["conf_track_multi"] = torch.full(raw["track_multi"].shape[:-1], 120.0)
+
+    result = sparse_tracking_loss(
+        raw, dumped_scene, correspondences, _identity_alignment(), query_anchors,
+        confidence_weight=1.0,
+    )
+    report = result.diagnostics
+
+    assert result.confidence_alpha is not None
+    assert report["implied_optimal_confidence"] == pytest.approx(
+        result.confidence_alpha / report["mean_error"]
+    )
+    first = report["relative_tau_grid"][0]
+    assert first["tau"] == pytest.approx(
+        first["multiple"] * report["implied_optimal_confidence"]
+    )
+
+
 def test_nonfinite_confidence_samples_are_dropped_and_counted(dumped_scene):
     """`expp1` overflows to inf in BF16, so filtering is right -- but never silent."""
 

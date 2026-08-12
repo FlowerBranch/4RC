@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 
 from arc.training import (
+    CONFIDENCE_DIAGNOSTICS_VERSION,
+    DEFAULT_CONFIDENCE_TAU_MULTIPLES,
+    DEFAULT_CONFIDENCE_TAUS,
     compose_tracking_loss,
     confidence_occlusion_diagnostics,
     per_sample_huber_error,
@@ -381,6 +384,202 @@ def test_diagnostics_mean_error_is_the_denominator_of_the_implied_optimum():
 
     assert report["mean_error"] == pytest.approx(2.0)
     assert math.isclose(report["mean_confidence"], 200.0)
+
+
+# ------------------------------------------------ relative tau grid ---
+# A tau is a property of a model state, not of the protocol: the confidence term's
+# optimum is conf*=alpha/err, so the whole channel level climbs as training drives the
+# error down.  The archived weight sweep moved mean visible confidence from 6175 to
+# 25452, which is why a grid fixed in absolute units samples a different part of every
+# run's curve and their occlusion accuracies cannot be compared.
+def _scale_free_sample(scale=1.0):
+    """A separating visible/occluded split whose confidences rescale wholesale.
+
+    Powers of two throughout so rescaling only shifts exponents and the comparisons
+    stay bit-exact -- the test is about the grid, not about float rounding.
+    """
+
+    visible = torch.tensor([[True] * 6 + [False] * 4])
+    confidence = scale * torch.tensor(
+        [[1024.0, 2048.0, 2048.0, 4096.0, 4096.0, 8192.0, 64.0, 128.0, 128.0, 256.0]]
+    )
+    # mean = 1.0, so alpha passes straight through as implied_optimal_confidence.
+    error = torch.tensor([[0.1] * 6 + [2.35] * 4])
+    return confidence, error, visible
+
+
+def test_relative_grid_is_invariant_to_the_runs_confidence_scale():
+    """The whole point: two runs at different confidence scales become comparable.
+
+    Scaling the channel and alpha together scales the implied optimum with them, so a
+    grid anchored to it lands on the same points of each run's curve.  Every accuracy
+    must be identical and only the absolute taus may move.
+    """
+
+    base = confidence_occlusion_diagnostics(
+        *_scale_free_sample(1.0), confidence_alpha=100.0
+    )
+    scaled = confidence_occlusion_diagnostics(
+        *_scale_free_sample(1024.0), confidence_alpha=1024 * 100.0
+    )
+
+    assert scaled["implied_optimal_confidence"] == 1024 * base["implied_optimal_confidence"]
+    assert len(scaled["relative_tau_grid"]) == len(base["relative_tau_grid"])
+    for base_row, scaled_row in zip(base["relative_tau_grid"], scaled["relative_tau_grid"]):
+        assert scaled_row["multiple"] == base_row["multiple"]
+        assert scaled_row["tau"] == 1024 * base_row["tau"]
+        for key in (
+            "occlusion_accuracy",
+            "occlusion_accuracy_for_vis1",
+            "occlusion_accuracy_for_vis0",
+            "predicted_visible_fraction",
+        ):
+            assert scaled_row[key] == base_row[key], key
+    assert scaled["best"]["relative"]["occlusion_accuracy"] == (
+        base["best"]["relative"]["occlusion_accuracy"]
+    )
+
+    # The fixed grid is what this replaces: same two runs, different answers.
+    assert scaled["best"]["absolute"]["occlusion_accuracy"] != (
+        base["best"]["absolute"]["occlusion_accuracy"]
+    )
+
+
+def test_relative_grid_extends_past_the_optimum_instead_of_stopping_on_it():
+    """The archived defect: accuracy still rising at the last tau, so the best
+    reported value was set by where the grid stopped rather than by the model."""
+
+    report = confidence_occlusion_diagnostics(
+        *_scale_free_sample(1.0), confidence_alpha=100.0
+    )
+    grid = report["relative_tau_grid"]
+
+    # The top of the grid is above every confidence, so nothing is called visible and
+    # accuracy has fallen to the all-occluded value -- it is provably past the turn.
+    assert grid[-1]["predicted_visible_fraction"] == pytest.approx(0.0)
+    assert grid[-1]["occlusion_accuracy"] == pytest.approx(0.4)
+    assert grid[0]["predicted_visible_fraction"] == pytest.approx(1.0)
+    assert grid[0]["occlusion_accuracy"] == pytest.approx(0.6)
+
+    best = report["best"]["relative"]
+    assert best["occlusion_accuracy"] == pytest.approx(1.0)
+    assert not best["at_grid_edge"]
+    assert best["basis"] == report["relative_tau_grid_basis"]
+
+
+def test_a_grid_that_stops_before_the_optimum_says_so():
+    """The flag that would have caught the archived runs, where the argmax sat on the
+    last point of a grid whose top was 0.35x the run's own implied optimum."""
+
+    report = confidence_occlusion_diagnostics(
+        *_scale_free_sample(1.0),
+        confidence_alpha=100.0,
+        multiples=(0.01, 0.1, 1.0),
+    )
+
+    best = report["best"]["relative"]
+    assert best["tau"] == pytest.approx(100.0)
+    assert best["at_grid_edge"]
+    # Six visible above it, and only 64 of the four occluded below it.
+    assert best["occlusion_accuracy"] == pytest.approx(0.7)
+    # Still rising where it stopped, which is exactly the archived failure.
+    assert best["occlusion_accuracy"] > report["relative_tau_grid"][-2]["occlusion_accuracy"]
+
+
+def test_the_argmax_is_reported_against_the_trivial_all_visible_baseline():
+    """Calling everything visible needs no model, so it is the bar a threshold must
+    clear; at the released checkpoint none did (0.684 against 0.700)."""
+
+    confidence = torch.tensor([[300.0, 20.0, 400.0, 30.0, 25.0]])
+    error = torch.tensor([[0.1, 1.0, 0.1, 1.0, 1.0]])
+    visible = torch.tensor([[True, False, True, False, True]])
+
+    report = confidence_occlusion_diagnostics(confidence, error, visible)
+
+    assert report["trivial_all_visible_occlusion_accuracy"] == pytest.approx(3 / 5)
+    best = report["best"]["absolute"]
+    assert best["occlusion_accuracy"] == max(
+        row["occlusion_accuracy"] for row in report["tau_grid"]
+    )
+    assert best["tau"] in [row["tau"] for row in report["tau_grid"]]
+    assert best["multiple"] is None
+
+
+def test_the_trivial_baseline_counts_only_valid_samples():
+    confidence = torch.tensor([[10.0, 20.0, 999.0]])
+    error = torch.tensor([[1.0, 1.0, 1.0]])
+    visible = torch.tensor([[True, False, False]])
+    valid = torch.tensor([[True, True, False]])
+
+    report = confidence_occlusion_diagnostics(confidence, error, visible, valid)
+
+    assert report["trivial_all_visible_occlusion_accuracy"] == pytest.approx(0.5)
+
+
+def test_a_degenerate_all_equal_confidence_still_produces_a_grid():
+    """Every sample at one confidence is the case a quantile-derived grid collapses
+    on -- every quantile is the same number.  Anchoring to alpha/mean_error instead
+    depends on no spread at all, so the grid survives and simply reports that no
+    threshold separates anything."""
+
+    confidence = torch.full((1, 8), 500.0)
+    error = torch.tensor([[0.5, 0.5, 0.5, 0.5, 1.5, 1.5, 1.5, 1.5]])
+    visible = torch.tensor([[True] * 5 + [False] * 3])
+
+    report = confidence_occlusion_diagnostics(confidence, error, visible, confidence_alpha=100.0)
+    grid = report["relative_tau_grid"]
+
+    assert len(grid) == len(DEFAULT_CONFIDENCE_TAU_MULTIPLES)
+    assert all(row["occlusion_accuracy"] is not None for row in grid)
+    assert all(math.isfinite(row["occlusion_accuracy"]) for row in grid)
+    # One flat step from all-visible to all-occluded, and nothing in between.
+    assert {row["predicted_visible_fraction"] for row in grid} == {0.0, 1.0}
+    assert report["best"]["relative"] is not None
+    # Nothing was located, and the flat grid ties at its first row, so it reads as an
+    # edge rather than as a discovered optimum.
+    assert report["best"]["relative"]["at_grid_edge"]
+
+
+def test_a_zero_error_run_reports_no_relative_grid_rather_than_a_nan_one():
+    """conf* = alpha/err has no finite value once the error reaches zero.  A missing
+    grid is diagnosable; a grid of infinities silently poisons every row."""
+
+    confidence = torch.tensor([[100.0, 200.0]])
+    error = torch.zeros(1, 2)
+    visible = torch.tensor([[True, False]])
+
+    report = confidence_occlusion_diagnostics(confidence, error, visible, confidence_alpha=1.0)
+
+    assert report["implied_optimal_confidence"] is None
+    assert report["relative_tau_grid"] is None
+    assert report["relative_tau_grid_basis"] is None
+    assert report["best"]["relative"] is None
+    assert report["best"]["absolute"] is not None
+
+
+def test_without_alpha_there_is_no_relative_grid_and_the_report_says_so():
+    """Rather than quietly falling back to the absolute grid under a relative name."""
+
+    report = confidence_occlusion_diagnostics(*_scale_free_sample(1.0))
+
+    assert report["implied_optimal_confidence"] is None
+    assert report["relative_tau_grid"] is None
+    assert report["tau_grid"] is not None
+    assert report["confidence_diagnostics_version"] == CONFIDENCE_DIAGNOSTICS_VERSION
+
+
+def test_the_absolute_grid_keeps_its_archived_thresholds_and_basis():
+    """Four archived cluster runs were scored on exactly these taus.  Moving them
+    would strand those numbers, so the relative grid is added beside this one."""
+
+    report = confidence_occlusion_diagnostics(
+        *_scale_free_sample(1.0), confidence_alpha=100.0
+    )
+
+    assert [row["tau"] for row in report["tau_grid"]] == list(DEFAULT_CONFIDENCE_TAUS)
+    assert "absolute" in report["tau_grid_basis"]
+    assert "implied_optimal_confidence" in report["relative_tau_grid_basis"]
+    assert report["best"]["absolute"]["basis"] == report["tau_grid_basis"]
 
 
 # ----------------------------------------------------- synchronized pairs ---

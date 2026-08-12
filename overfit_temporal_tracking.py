@@ -808,15 +808,43 @@ def _warn_about_dropped_confidence_samples(dropped, sample_count) -> None:
     )
 
 
-def _implied_optimal_confidence(alpha, diagnostics) -> float | None:
-    """Where the confidence term wants confidence to sit, given the current error."""
+def _from_diagnostics(diagnostics, *keys):
+    """Read a nested value out of a confidence diagnostics block, or None."""
 
-    if alpha is None or not diagnostics:
+    value = diagnostics
+    for key in keys:
+        if not value:
+            return None
+        value = value.get(key)
+    return value
+
+
+def _confidence_threshold_line(diagnostics) -> str | None:
+    """The one line that says whether any threshold on this run is worth having.
+
+    A grid in the summary is not the same as an answer: the archived runs all had
+    their best accuracy pinned to the last grid point, which is only obvious once the
+    argmax and the trivial baseline are printed next to each other.
+    """
+
+    best = _from_diagnostics(diagnostics, "best", "relative") or _from_diagnostics(
+        diagnostics, "best", "absolute"
+    )
+    if best is None:
         return None
-    mean_error = diagnostics.get("mean_error")
-    if mean_error is None or mean_error <= 0:
-        return None
-    return float(alpha) / float(mean_error)
+    trivial = diagnostics.get("trivial_all_visible_occlusion_accuracy")
+    verdict = "beats" if trivial is None or best["occlusion_accuracy"] > trivial else "loses to"
+    line = (
+        f"best_occlusion_accuracy={best['occlusion_accuracy']:.6f} "
+        f"at tau={best['tau']:.6g}"
+    )
+    if best["multiple"] is not None:
+        line += f" ({best['multiple']:.6g}x implied_optimal_confidence)"
+    if trivial is not None:
+        line += f", {verdict} the trivial all-visible {trivial:.6f}"
+    if best["at_grid_edge"]:
+        line += "; AT GRID EDGE, so the optimum may lie outside the grid"
+    return line
 
 
 def _confidence_gradient_norms(model) -> dict[str, float]:
@@ -1799,10 +1827,13 @@ def main() -> None:
         # Huber error alpha was calibrated against -- not the L2 metric error, which
         # is a different quantity. Compare against the reported track confidence to
         # see whether the term is holding the pretrained level or dragging it
-        # somewhere the downstream absolute threshold will notice.
-        "implied_optimal_confidence": _implied_optimal_confidence(
-            confidence_alpha,
+        # somewhere the downstream absolute threshold will notice. Computed inside the
+        # diagnostics, which is also what anchors their relative tau grid; lifted here
+        # unchanged because this key predates that block. The initial evaluation's
+        # counterpart is inside initial_confidence_diagnostics.
+        "implied_optimal_confidence": _from_diagnostics(
             evaluation["confidence_diagnostics"],
+            "implied_optimal_confidence",
         ),
         "initial_confidence_diagnostics": initial_confidence_diagnostics,
         "final_confidence_diagnostics": evaluation["confidence_diagnostics"],
@@ -1883,6 +1914,9 @@ def main() -> None:
     print(f"initial_metric_error_m={initial_error:.8f}")
     print(f"final_metric_error_m={final_error:.8f}")
     print(f"final_metric_error_refit_m={evaluation['metric_error_refit_m']:.8f}")
+    threshold_line = _confidence_threshold_line(evaluation["confidence_diagnostics"])
+    if threshold_line is not None:
+        print(threshold_line)
     if evaluation["sync_consistency"] is not None:
         print(
             "sync_consistency_m="

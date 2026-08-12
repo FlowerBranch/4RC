@@ -17,10 +17,16 @@ confidence term only separates visible from occluded if the *position error* doe
 which is a property of the data and worth failing fast on.  And the threshold is a
 free parameter that lives in another repository, so the grid below is what tells
 you which value is even workable.
+
+A tau belongs to a model state, not to the protocol: supervising confidence moves the
+channel's absolute level, so the same threshold means different things in two runs and
+a bare occlusion accuracy without its grid is not comparable to anything.  Every
+accuracy here therefore travels with the basis that produced it.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -33,6 +39,11 @@ from arc.training.losses import (
 # Spans the observed track-confidence range: `expp1` output is `1 + exp(x)`, and
 # archived runs sit in the low hundreds with a p05 near 36.  A grid rather than one
 # value because the useful threshold is not known ahead of the run.
+#
+# Kept at its original values, and kept reported, because four archived cluster runs
+# were scored on exactly these thresholds; changing them would silently strand those
+# numbers.  It is no longer the grid to read an optimum off -- see the relative grid
+# below for why.
 DEFAULT_CONFIDENCE_TAUS: tuple[float, ...] = (
     1.5,
     5.0,
@@ -45,6 +56,35 @@ DEFAULT_CONFIDENCE_TAUS: tuple[float, ...] = (
     300.0,
 )
 
+# The absolute grid above is not comparable across runs, and the reason is structural
+# rather than a matter of picking wider limits.  The confidence term's optimum is
+# `conf* = alpha/err`, so as training drives the error down the whole channel level
+# climbs -- by a different factor in every arm.  Measured across the archived weight
+# sweep, mean visible confidence ran 6175 (weight 0.01) to 25452 (weight 0.001), and
+# a threshold of 300 was 0.63x the run's own implied optimum in one arm against 0.35x
+# in another.  Occlusion accuracy was still rising at 300 in all of them, so the best
+# figure each reported was an artifact of where the grid stopped, not an optimum.
+#
+# So the grid is derived from the run's own state instead: multiples of
+# `implied_optimal_confidence = alpha/mean_error`, the level the term is itself
+# pulling confidence towards.  Two runs then sample the same points of their own
+# curves and their occlusion accuracies can be read side by side.
+#
+# Geometric, because "enough resolution near the optimum" is a statement about ratios
+# once the grid is scale-relative -- half-octave steps hold the same relative spacing
+# everywhere, in every run.  The span is set by what the sweep showed: mean visible
+# confidence sat 13x to 30x above the implied optimum, so the top at 256x clears it by
+# 4-10x (that the accuracy has stopped rising there is checked per run and reported as
+# `at_grid_edge`, never assumed), and the bottom at 1/32x lands near the old grid's
+# low end so the two overlap.
+DEFAULT_CONFIDENCE_TAU_MULTIPLES: tuple[float, ...] = tuple(
+    float(2.0 ** (exponent / 2.0)) for exponent in range(-10, 17)
+)
+
+# Bumped when the shape of the report changes, so a reader can tell which keys to
+# expect.  Version 1 is the absolute-grid-only block written by the archived runs.
+CONFIDENCE_DIAGNOSTICS_VERSION = 2
+
 
 def confidence_occlusion_diagnostics(
     confidence: torch.Tensor,
@@ -52,7 +92,9 @@ def confidence_occlusion_diagnostics(
     visible_mask: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
     *,
+    confidence_alpha: float | None = None,
     taus: Sequence[float] = DEFAULT_CONFIDENCE_TAUS,
+    multiples: Sequence[float] = DEFAULT_CONFIDENCE_TAU_MULTIPLES,
 ) -> dict:
     """Summarize how well confidence separates visible from occluded samples.
 
@@ -64,6 +106,21 @@ def confidence_occlusion_diagnostics(
     plus, for each tau, the accuracy of calling ``confidence > tau`` "visible".  The
     per-side accuracies are named to match the scorer's ``occlusion_accuracy_for_vis1``
     and ``..._for_vis0`` so the numbers can be read side by side.
+
+    Two grids, because a tau belongs to a model state and not to the protocol.
+    ``tau_grid`` is the fixed absolute sweep the archived runs were scored on, kept so
+    those numbers stay readable.  ``relative_tau_grid`` is the one to read an optimum
+    off: it is ``multiples`` times this run's own ``implied_optimal_confidence``, and
+    needs ``confidence_alpha`` -- without it there is no run-relative scale and the
+    relative grid is ``None`` rather than silently absolute.  Every reported accuracy
+    is accompanied by the basis that produced it.
+
+    ``best`` names the argmax of each grid outright, so no reader has to infer it from
+    the rows, and flags ``at_grid_edge`` when that argmax sits at either end -- the
+    grid then stopped before the curve turned and the "best" is a property of the
+    limits, not of the model.  Read it against
+    ``trivial_all_visible_occlusion_accuracy``, which is what calling everything
+    visible already scores and therefore the bar any threshold has to clear at all.
     """
 
     if confidence.shape != per_sample_error.shape:
@@ -96,6 +153,7 @@ def confidence_occlusion_diagnostics(
     occluded = (~visible_mask) & valid_mask
 
     report: dict = {
+        "confidence_diagnostics_version": CONFIDENCE_DIAGNOSTICS_VERSION,
         "sample_count": int(valid_mask.sum().item()),
         "visible_count": int(visible.sum().item()),
         "occluded_count": int(occluded.sum().item()),
@@ -119,30 +177,65 @@ def confidence_occlusion_diagnostics(
     else:
         report["error_separation"] = None
 
-    grid = []
-    for tau in taus:
-        predicted_visible = confidence > float(tau)
-        grid.append(
+    # Calling everything visible needs no model at all, so it is the number a
+    # threshold has to beat before it has earned its place. At the released
+    # checkpoint none does, which is only visible once this sits next to the grid.
+    report["trivial_all_visible_occlusion_accuracy"] = (
+        report["visible_count"] / report["sample_count"]
+    )
+    report["implied_optimal_confidence"] = _implied_optimal_confidence(
+        confidence_alpha,
+        report["mean_error"],
+    )
+
+    report["tau_grid_basis"] = (
+        "absolute: DEFAULT_CONFIDENCE_TAUS, fixed in confidence units. Retained for "
+        "comparability with runs scored before the relative grid existed; not "
+        "comparable across runs whose confidence scale differs"
+    )
+    report["tau_grid"] = [
+        _tau_row(confidence, float(tau), visible_mask, valid_mask, visible, occluded)
+        for tau in taus
+    ]
+
+    implied_optimal = report["implied_optimal_confidence"]
+    if implied_optimal is None:
+        # No alpha, or an error of zero: there is no run-relative scale to build on.
+        # Reporting the absolute grid under a relative name would be the exact
+        # confusion this block exists to end, so say so instead.
+        report["relative_tau_grid_basis"] = None
+        report["relative_tau_grid"] = None
+    else:
+        report["relative_tau_grid_basis"] = (
+            "relative: multiples of implied_optimal_confidence "
+            f"(= alpha/mean_error = {implied_optimal:.6g}), the level this run's own "
+            "confidence term is pulling towards. Chosen relative to the run because "
+            "conf* = alpha/err makes the channel's absolute level a function of how "
+            "far training got, so a fixed grid samples a different part of every "
+            "run's curve"
+        )
+        report["relative_tau_grid"] = [
             {
-                "tau": float(tau),
-                "occlusion_accuracy": _agreement(predicted_visible, visible_mask, valid_mask),
-                "occlusion_accuracy_for_vis1": _agreement(
-                    predicted_visible,
+                "multiple": float(multiple),
+                **_tau_row(
+                    confidence,
+                    float(multiple) * implied_optimal,
                     visible_mask,
+                    valid_mask,
                     visible,
-                ),
-                "occlusion_accuracy_for_vis0": _agreement(
-                    predicted_visible,
-                    visible_mask,
                     occluded,
                 ),
-                "predicted_visible_fraction": _masked_mean(
-                    predicted_visible.float(),
-                    valid_mask,
-                ),
             }
-        )
-    report["tau_grid"] = grid
+            for multiple in multiples
+        ]
+
+    report["best"] = {
+        "absolute": _best_row(report["tau_grid"], report["tau_grid_basis"]),
+        "relative": _best_row(
+            report["relative_tau_grid"],
+            report["relative_tau_grid_basis"],
+        ),
+    }
     return report
 
 
@@ -310,6 +403,87 @@ def reconstruction_shift_report(
                 "fov": float(pose_delta[..., 7:9].max().item()),
             },
         }
+
+
+def _implied_optimal_confidence(
+    alpha: float | None,
+    mean_error: float | None,
+) -> float | None:
+    """Where the confidence term wants confidence to sit, given the current error.
+
+    The optimum of ``conf * err - alpha * log(conf)`` is ``conf* = alpha/err``, and
+    ``mean_error`` is the same per-sample Huber error alpha was calibrated against --
+    not the L2 metric error, which is a different quantity.  ``None`` rather than an
+    infinity when the error has reached zero: there is no finite level to compare a
+    threshold against, and a NaN propagating into the grid would be worse than a
+    missing grid.
+    """
+
+    if alpha is None or mean_error is None:
+        return None
+    alpha = float(alpha)
+    mean_error = float(mean_error)
+    if not math.isfinite(alpha) or alpha <= 0:
+        return None
+    if not math.isfinite(mean_error) or mean_error <= 0:
+        return None
+    implied = alpha / mean_error
+    return implied if math.isfinite(implied) else None
+
+
+def _tau_row(
+    confidence: torch.Tensor,
+    tau: float,
+    visible_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    visible: torch.Tensor,
+    occluded: torch.Tensor,
+) -> dict:
+    """One threshold's worth of agreement, shared by both grids.
+
+    Shared rather than duplicated so the two grids can never drift into measuring
+    subtly different things and being compared anyway.
+    """
+
+    predicted_visible = confidence > tau
+    return {
+        "tau": tau,
+        "occlusion_accuracy": _agreement(predicted_visible, visible_mask, valid_mask),
+        "occlusion_accuracy_for_vis1": _agreement(predicted_visible, visible_mask, visible),
+        "occlusion_accuracy_for_vis0": _agreement(predicted_visible, visible_mask, occluded),
+        "predicted_visible_fraction": _masked_mean(predicted_visible.float(), valid_mask),
+    }
+
+
+def _best_row(grid: list[dict] | None, basis: str | None) -> dict | None:
+    """The grid's argmax, named outright rather than left to the reader.
+
+    ``at_grid_edge`` is true when the best row is the first or last one, which is the
+    machine-readable form of "this grid stopped before the curve turned".  Both ends
+    count: the archived runs' optimum was pinned to the top of the grid, and the
+    released checkpoint's to the bottom, and in both cases the reported best is a
+    property of the limits rather than of the model.  A flat grid ties at the first
+    row and so reads as an edge, which is the honest answer -- it located nothing.
+    """
+
+    if not grid:
+        return None
+    scored = [
+        (index, row)
+        for index, row in enumerate(grid)
+        if row["occlusion_accuracy"] is not None
+    ]
+    if not scored:
+        return None
+    index, best = max(scored, key=lambda pair: pair[1]["occlusion_accuracy"])
+    return {
+        "tau": best["tau"],
+        "multiple": best.get("multiple"),
+        "occlusion_accuracy": best["occlusion_accuracy"],
+        "predicted_visible_fraction": best["predicted_visible_fraction"],
+        "at_grid_edge": index in (0, len(grid) - 1),
+        "basis": basis,
+    }
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float | None:

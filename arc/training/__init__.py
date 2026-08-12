@@ -6,6 +6,8 @@ from .checkpoint import (
     save_temporal_tracking_checkpoint,
 )
 from .diagnostics import (
+    CONFIDENCE_DIAGNOSTICS_VERSION,
+    DEFAULT_CONFIDENCE_TAU_MULTIPLES,
     DEFAULT_CONFIDENCE_TAUS,
     confidence_occlusion_diagnostics,
     reconstruction_shift_report,
@@ -48,7 +50,9 @@ from .sparse_tracking import (
 )
 
 __all__ = [
+    "CONFIDENCE_DIAGNOSTICS_VERSION",
     "DEFAULT_CONFIDENCE_TAUS",
+    "DEFAULT_CONFIDENCE_TAU_MULTIPLES",
     "DEPTH_SIDECAR_FLAG",
     "DEPTH_SIDECAR_KEY",
     "DEPTH_SIDECAR_NAME",
