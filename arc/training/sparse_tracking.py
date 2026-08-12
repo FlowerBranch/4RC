@@ -516,6 +516,33 @@ def fit_scene_sim3(
     return sim3, report
 
 
+def _mean_max(values: list[float]) -> dict[str, float] | None:
+    """``{mean, max}`` over a group, or ``None`` when the group is empty."""
+
+    if not values:
+        return None
+    return {"mean": float(np.mean(values)), "max": float(np.max(values))}
+
+
+def _split_by_baseline(values: list[float], separated: list[bool]) -> dict:
+    """Summarise a per-slot figure split on the ground-truth baseline mask.
+
+    ``cross_camera`` are the slots genuinely displaced from the anchor;
+    ``static_camera`` are those at zero ground-truth baseline, which in today's
+    dumps means the anchor's own camera at another timestep.  Either group may
+    be empty, and an empty group reports ``None`` rather than a NaN mean.
+    """
+
+    return {
+        "cross_camera": _mean_max(
+            [value for value, apart in zip(values, separated) if apart]
+        ),
+        "static_camera": _mean_max(
+            [value for value, apart in zip(values, separated) if not apart]
+        ),
+    }
+
+
 def reconstruction_drift_report(
     raw_predictions: dict,
     scene: DumpedKubricScene,
@@ -531,6 +558,59 @@ def reconstruction_drift_report(
     geodesic plus metric camera-centre error), composed through the given
     alignment.  Ground-truth depth and extrinsics live in stored units; the
     scene's track upscaling factor lifts distances to metres.
+
+    ``rotation_error_deg`` and ``camera_center_error_m`` are those
+    alignment-composed figures, and the alignment is fitted from the predicted
+    *pointmaps* -- depth times pose.  Depth scale is exactly the quantity a
+    training run is suspected of moving, so those two read pose error through
+    the error they would be used to diagnose; ``camera_center_error_m``
+    inherits all of it via ``alignment.scale``.
+
+    ``relative_rotation_deg`` and ``relative_center_error_m`` are immune to that
+    by construction.  Both are taken relative to the anchor observation
+    (``scene.query_observation_slot``), with each side rotated into *its own*
+    anchor camera frame, so a global rotation of the model's world cancels and
+    no alignment enters.  That leaves scale as the only gauge freedom, and it is
+    fixed by ``baseline_scale``, a single least-squares scalar fitted from
+    camera centres alone -- never from pointmaps, never from ``alignment``.
+
+    Three properties of that fit are load-bearing.
+
+    *The fit excludes the zero-baseline slots.*  A slot sharing the anchor's
+    camera has a ground-truth offset of zero but a nonzero predicted one -- and
+    that nonzero *is* the centre wander being measured.  Such a term adds
+    nothing to the numerator and its full squared norm to the denominator, so it
+    drags ``baseline_scale`` toward zero, harder as drift grows, putting a
+    systematic offset on every slot including the well-conditioned ones.  They
+    are still measured and reported under ``static_camera``; they simply do not
+    vote on a gauge factor they carry no information about.  A fit over every
+    slot would also read a single-camera window as perfect pose regardless of
+    drift, since the numerator would be identically zero.
+
+    *The split is on the ground-truth baseline, not on camera identity.*  The
+    dumps hold each camera fixed across time, which is what makes
+    ``static_camera`` mean "the anchor's camera at another timestep"; a dump
+    with genuinely moving cameras would place those slots in ``cross_camera``,
+    which is correct.
+
+    *A uniform baseline error is unobservable*, absorbed by the fitted scalar --
+    unavoidable in a gauge-free measurement, which is why ``baseline_scale`` is
+    reported as its own number instead of being folded away.  Its severity
+    scales with the fit set: the scalar takes 1 degree of freedom out of ``3n``
+    for ``n`` separated slots, so at ``n = 1`` it exactly nulls that slot's
+    radial residual and ``cross_camera`` reports only the perpendicular
+    component, while at ``n = 12`` it is 1 of 36 and negligible.
+
+    ``baseline_scale`` and ``alignment.scale`` measure the same model-world to
+    stored-units factor by different routes, one from camera centres and one
+    from pointmaps; their disagreement is the depth-scale contamination itself.
+
+    ``baseline_scale`` is ``None``, and both ``relative_center_error_m`` groups
+    with it, when no slot has a nonzero ground-truth baseline or every predicted
+    centre has collapsed onto the anchor.  Rotation needs no scale, so
+    ``relative_rotation_deg`` survives those cases.  A non-positive
+    ``baseline_scale`` is reported as fitted rather than clamped: a mirrored rig
+    should be visible.
     """
 
     depth = raw_predictions.get("depth")
@@ -590,8 +670,32 @@ def reconstruction_drift_report(
             (height, width),
         )
         rotation_align = alignment.rotation.detach().cpu().float()
+        reference_slot = int(scene.query_observation_slot)
+        reference = next(
+            candidate
+            for candidate in scene.observations
+            if candidate.slot == reference_slot
+        )
+        reference_rotation_c2w = camera_to_world[0, reference_slot, :3, :3]
+        reference_center = camera_to_world[0, reference_slot, :3, 3]
+        reference_ground_truth = (
+            scene.extrinsics_world_to_camera[
+                reference.camera, reference.original_time
+            ]
+            .detach()
+            .cpu()
+            .float()
+        )
+        reference_rotation_gt = reference_ground_truth[:3, :3]
+        reference_center_gt = -(
+            reference_rotation_gt.mT @ reference_ground_truth[:3, 3]
+        )
+
         rotation_errors = []
         center_errors = []
+        relative_rotations: list[float] = []
+        predicted_offsets: list[torch.Tensor] = []
+        ground_truth_offsets: list[torch.Tensor] = []
         for observation in scene.observations:
             rotation_c2w = camera_to_world[0, observation.slot, :3, :3]
             predicted_center = camera_to_world[0, observation.slot, :3, 3]
@@ -620,6 +724,63 @@ def reconstruction_drift_report(
                 * upscaling
             )
 
+            if observation.slot == reference_slot:
+                continue
+            # Anchor-referenced, each side composed within its own frame: the
+            # alignment appears nowhere below, which is the whole point.
+            relative_rotation = reference_rotation_c2w.mT @ rotation_c2w
+            relative_rotation_gt = reference_rotation_gt @ rotation_gt.mT
+            relative_cosine = (
+                (relative_rotation * relative_rotation_gt).sum() - 1.0
+            ) / 2.0
+            relative_rotations.append(
+                float(
+                    torch.rad2deg(
+                        torch.arccos(relative_cosine.clamp(-1.0, 1.0))
+                    ).item()
+                )
+            )
+            predicted_offsets.append(
+                reference_rotation_c2w.mT @ (predicted_center - reference_center)
+            )
+            ground_truth_offsets.append(
+                reference_rotation_gt @ (center_gt - reference_center_gt)
+            )
+
+        baseline_scale = None
+        relative_rotation_report = _split_by_baseline([], [])
+        relative_center_report = _split_by_baseline([], [])
+        if predicted_offsets:
+            predicted_offset = torch.stack(predicted_offsets)
+            ground_truth_offset = torch.stack(ground_truth_offsets)
+            baselines = torch.linalg.vector_norm(ground_truth_offset, dim=-1)
+            # Strictly greater, so an all-zero-baseline window makes the
+            # threshold zero too and selects nothing -- the degenerate case
+            # falls out of the predicate instead of needing its own branch.
+            separated = baselines > 1e-6 * baselines.max()
+            separated_flags = [bool(flag) for flag in separated.tolist()]
+            relative_rotation_report = _split_by_baseline(
+                relative_rotations,
+                separated_flags,
+            )
+
+            fitted = predicted_offset[separated]
+            denominator = float((fitted * fitted).sum().item())
+            if denominator > 0:
+                numerator = float(
+                    (fitted * ground_truth_offset[separated]).sum().item()
+                )
+                baseline_scale = numerator / denominator
+                residual = (
+                    baseline_scale * predicted_offset - ground_truth_offset
+                )
+                relative_center_report = _split_by_baseline(
+                    (
+                        torch.linalg.vector_norm(residual, dim=-1) * upscaling
+                    ).tolist(),
+                    separated_flags,
+                )
+
     return {
         "depth": depth_report,
         "pose": {
@@ -631,6 +792,9 @@ def reconstruction_drift_report(
                 "mean": float(np.mean(center_errors)),
                 "max": float(np.max(center_errors)),
             },
+            "relative_rotation_deg": relative_rotation_report,
+            "relative_center_error_m": relative_center_report,
+            "baseline_scale": baseline_scale,
         },
     }
 

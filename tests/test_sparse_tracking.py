@@ -32,7 +32,7 @@ from arc.training import (
 )
 from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
-from arc.models.arc.utils.transform import mat_to_quat
+from arc.models.arc.utils.transform import mat_to_quat, quat_to_mat
 from arc.training import (
     ELIGIBILITY_ASSIGNMENT_RULE,
     compose_tracking_loss,
@@ -3120,6 +3120,14 @@ def test_drift_report_is_zero_for_ground_truth_predictions(dumped_scene):
         assert camera_report["p90_relative_error"] < 1e-5
     assert report["pose"]["rotation_error_deg"]["max"] < 1e-3
     assert report["pose"]["camera_center_error_m"]["max"] < 1e-4
+    # The anchor-referenced figures agree, and both groups are populated: the
+    # window has cameras apart from the anchor's and timesteps of its own.
+    pose = report["pose"]
+    for figure in ("relative_rotation_deg", "relative_center_error_m"):
+        for group in ("cross_camera", "static_camera"):
+            assert pose[figure][group] is not None
+            assert pose[figure][group]["max"] < 1e-3
+    assert pose["baseline_scale"] == pytest.approx(1.0, rel=1e-5)
 
 
 def test_drift_report_reads_a_depth_inflation_as_relative_error(dumped_scene):
@@ -3150,6 +3158,315 @@ def test_drift_report_reads_a_camera_translation_as_center_error(dumped_scene):
         0.25, rel=1e-4
     )
     assert report["pose"]["rotation_error_deg"]["max"] < 1e-3
+    # Moving the whole rig is a change of gauge, not a pose error. This is the
+    # difference the anchor-referenced figures exist to draw: the alignment-
+    # composed number above reads 25 cm, these read nothing.
+    pose = report["pose"]
+    for group in ("cross_camera", "static_camera"):
+        assert pose["relative_center_error_m"][group]["max"] < 1e-4
+        assert pose["relative_rotation_deg"][group]["max"] < 1e-3
+    assert pose["baseline_scale"] == pytest.approx(1.0, rel=1e-5)
+
+
+def _apply_predicted_gauge(raw, rotation, scale):
+    """Rotate and rescale the *predicted* world frame, leaving the dump alone."""
+
+    pose_encoding = raw["pose_enc"].clone()
+    rotation = torch.as_tensor(rotation, dtype=torch.float64)
+    for slot in range(pose_encoding.shape[1]):
+        centre = pose_encoding[0, slot, :3].double()
+        camera_to_world = quat_to_mat(pose_encoding[0, slot, 3:7].double())
+        pose_encoding[0, slot, :3] = (scale * (rotation @ centre)).float()
+        pose_encoding[0, slot, 3:7] = mat_to_quat(
+            rotation @ camera_to_world
+        ).float()
+    return {**raw, "pose_enc": pose_encoding}
+
+
+def _moved_center(raw, slot, offset):
+    """A copy of the raw prediction with one camera centre displaced."""
+
+    pose_encoding = raw["pose_enc"].clone()
+    pose_encoding[0, slot, :3] += torch.tensor(offset, dtype=pose_encoding.dtype)
+    return {**raw, "pose_enc": pose_encoding}
+
+
+def test_drift_report_relative_pose_is_gauge_invariant(dumped_scene):
+    """A global rotation and rescale of the prediction must not be an error.
+
+    Applied to a prediction that is already wrong, so the figures being
+    compared are nonzero and an implementation that merely returned constants
+    could not pass.  ``baseline_scale`` moves *inversely*: scaling the predicted
+    offsets by sigma scales the fit's numerator by sigma and its denominator by
+    sigma squared.
+    """
+
+    scale = 2.5
+    rotation = _yaw_rotation(25.0) @ _pitch_rotation(-12.0)
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(dumped_scene),
+        slot=4,
+        offset=(0.0, 0.25, 0.0),
+    )
+
+    plain = reconstruction_drift_report(raw, dumped_scene, _identity_alignment())
+    gauged = reconstruction_drift_report(
+        _apply_predicted_gauge(raw, rotation, scale),
+        dumped_scene,
+        _identity_alignment(),
+    )
+
+    assert plain["pose"]["relative_center_error_m"]["cross_camera"]["max"] > 0.1
+    for figure in ("relative_rotation_deg", "relative_center_error_m"):
+        for group in ("cross_camera", "static_camera"):
+            for statistic in ("mean", "max"):
+                assert gauged["pose"][figure][group][statistic] == pytest.approx(
+                    plain["pose"][figure][group][statistic],
+                    abs=1e-4,
+                )
+    assert gauged["pose"]["baseline_scale"] == pytest.approx(
+        plain["pose"]["baseline_scale"] / scale,
+        rel=1e-4,
+    )
+
+
+def test_drift_report_relative_center_ignores_a_depth_contaminated_alignment(
+    dumped_scene,
+):
+    """The alignment carries the depth error; the relative figures must not.
+
+    This is the whole reason the new numbers exist, so the alignment here is the
+    real one -- fitted by ``fit_scene_sim3`` from the inflated pointmaps -- not a
+    hand-built stand-in.
+    """
+
+    clean = _ground_truth_raw_reconstruction(dumped_scene)
+    raw = {**clean, "depth": clean["depth"] * 1.1}
+    clean_alignment, _ = fit_scene_sim3(clean, dumped_scene)
+    alignment, _ = fit_scene_sim3(raw, dumped_scene)
+
+    report = reconstruction_drift_report(raw, dumped_scene, alignment)
+
+    # The fixture's own scale is not 1, so the readable statement is the ratio:
+    # the fit absorbed the depth inflation exactly, which is what contaminates
+    # every figure composed through it.
+    assert float(alignment.scale.item()) == pytest.approx(
+        float(clean_alignment.scale.item()) / 1.1, rel=1e-4
+    )
+    assert report["pose"]["camera_center_error_m"]["max"] > 0.05
+    assert (
+        report["pose"]["relative_center_error_m"]["cross_camera"]["max"] < 1e-4
+    )
+    # Fitted from camera centres, so it does not follow the depth inflation the
+    # Sim(3) scale above absorbed. The two disagreeing is the contamination.
+    assert report["pose"]["baseline_scale"] == pytest.approx(1.0, rel=1e-4)
+
+
+@pytest.mark.parametrize("offset", (0.25, 4.0))
+def test_drift_report_static_wander_does_not_move_the_baseline_scale(
+    dumped_scene,
+    offset,
+):
+    """Zero-baseline slots are measured but do not vote on the gauge factor.
+
+    Such a slot has a zero ground-truth offset and a nonzero predicted one -- the
+    wander itself -- so a fit taken over every slot would add nothing to the
+    numerator and the full squared norm to the denominator, dragging the scalar
+    down harder as the drift grows.  Hence the two offsets: the larger one must
+    move the scalar no more than the smaller.
+    """
+
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(dumped_scene),
+        slot=1,  # camera 0 at time 1: the anchor's own camera, zero GT baseline
+        offset=(offset, 0.0, 0.0),
+    )
+
+    pose = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )["pose"]
+
+    assert pose["baseline_scale"] == pytest.approx(1.0, rel=1e-5)
+    assert pose["relative_center_error_m"]["static_camera"]["max"] == pytest.approx(
+        offset, rel=1e-4
+    )
+    assert pose["relative_center_error_m"]["cross_camera"]["max"] < 1e-4
+
+
+def test_drift_report_reads_a_cross_camera_center_move(dumped_scene):
+    """A term invariant to everything would pass every test above but this one."""
+
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(dumped_scene),
+        slot=4,  # camera 1 at time 0: genuinely separated from the anchor
+        offset=(0.0, 0.25, 0.0),
+    )
+
+    pose = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )["pose"]
+
+    assert pose["relative_center_error_m"]["cross_camera"]["max"] > 0.2
+    assert pose["camera_center_error_m"]["max"] == pytest.approx(0.25, rel=1e-4)
+
+
+def test_drift_report_relative_figures_stay_finite_under_wander(dumped_scene):
+    """The 2-camera fixture keeps three zero-baseline slots; none may go NaN."""
+
+    raw = _moved_center(
+        _moved_center(
+            _ground_truth_raw_reconstruction(dumped_scene),
+            slot=2,
+            offset=(0.3, -0.1, 0.2),
+        ),
+        slot=5,
+        offset=(-0.2, 0.4, 0.1),
+    )
+
+    pose = reconstruction_drift_report(
+        raw,
+        dumped_scene,
+        _identity_alignment(),
+    )["pose"]
+
+    assert np.isfinite(pose["baseline_scale"])
+    for figure in ("relative_rotation_deg", "relative_center_error_m"):
+        for group in ("cross_camera", "static_camera"):
+            for value in pose[figure][group].values():
+                assert np.isfinite(value)
+
+
+def test_drift_report_relative_rotation_survives_a_single_camera_window(tmp_path):
+    """One camera means no baseline anywhere, and rotation must outlive that.
+
+    A fit taken over every slot would make the numerator identically zero here,
+    so ``baseline_scale`` would be 0 and every centre residual would collapse to
+    ``||0 * c_pred - 0|| == 0`` -- the report would call a drifting model perfect.
+    Restricting the fit empties its input instead, which reaches ``None``.
+    """
+
+    _write_scene(tmp_path)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(1,),
+        times=(0, 2, 3),
+        size=56,
+    )
+    # The centre must actually wander, or the merged-fit denominator would be
+    # zero too and this would pass for the wrong reason. With it, that fit finds
+    # a nonzero denominator against an identically-zero numerator and reports
+    # baseline_scale 0.0 and perfect centres.
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(scene),
+        slot=1,
+        offset=(0.35, -0.2, 0.15),
+    )
+    raw["pose_enc"][0, 1, 3:7] = mat_to_quat(
+        torch.from_numpy(_yaw_rotation(5.0))
+    ).float()
+
+    pose = reconstruction_drift_report(raw, scene, _identity_alignment())["pose"]
+
+    assert pose["baseline_scale"] is None
+    assert pose["relative_center_error_m"]["cross_camera"] is None
+    assert pose["relative_center_error_m"]["static_camera"] is None
+    assert pose["relative_rotation_deg"]["cross_camera"] is None
+    # The scale-free half still reads the drift the centre half cannot.
+    assert pose["relative_rotation_deg"]["static_camera"]["max"] == pytest.approx(
+        5.0, rel=1e-3
+    )
+
+
+def test_drift_report_relative_pose_ignores_the_alignment_entirely(dumped_scene):
+    """The relative figures must not move when the Sim(3) does.
+
+    The alignment is the channel the depth error arrives through, so the claim
+    worth testing is the strong one: swapping it for an arbitrary rotation,
+    scale and translation changes neither figure at all.  The first two
+    assertions keep that non-vacuous by confirming the swapped alignment does
+    move the numbers that are composed through it.
+    """
+
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(dumped_scene),
+        slot=4,
+        offset=(0.0, 0.25, 0.0),
+    )
+    skewed = DetachedSim3(
+        scale=torch.tensor(0.37),
+        rotation=torch.from_numpy(
+            _yaw_rotation(31.0) @ _pitch_rotation(17.0)
+        ).float(),
+        translation=torch.tensor([0.8, -1.3, 2.0]),
+    )
+
+    plain = reconstruction_drift_report(
+        raw, dumped_scene, _identity_alignment()
+    )["pose"]
+    composed = reconstruction_drift_report(raw, dumped_scene, skewed)["pose"]
+
+    assert composed["camera_center_error_m"]["max"] != pytest.approx(
+        plain["camera_center_error_m"]["max"], rel=1e-3
+    )
+    assert composed["rotation_error_deg"]["max"] != pytest.approx(
+        plain["rotation_error_deg"]["max"], abs=1e-2
+    )
+    assert composed["baseline_scale"] == pytest.approx(
+        plain["baseline_scale"], rel=1e-6
+    )
+    for figure in ("relative_rotation_deg", "relative_center_error_m"):
+        for group in ("cross_camera", "static_camera"):
+            for statistic in ("mean", "max"):
+                assert composed[figure][group][statistic] == pytest.approx(
+                    plain[figure][group][statistic], abs=1e-5
+                )
+
+
+def test_drift_report_relative_pose_is_anchored_at_the_query_observation(tmp_path):
+    """The reference is the anchor, not slot 0.
+
+    ``rotated_camera=1`` gives the anchor camera a real yaw, pitch and offset, so
+    a transposed rotation moves the numbers.  The wander is placed on the
+    anchor's *own* camera, which is what makes the choice of reference readable:
+    slot 3 shares camera 1 with the anchor and so owes zero baseline, but under a
+    slot-0 reference it would be a separated slot instead and the two groups
+    below would swap.
+    """
+
+    _write_scene(tmp_path, rotated_camera=1)
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 3),
+        query_anchors=((1, 0),),
+        size=56,
+    )
+    assert scene.query_observation_slot == 2
+    clean = _ground_truth_raw_reconstruction(scene)
+
+    exact = reconstruction_drift_report(clean, scene, _identity_alignment())["pose"]
+    for figure in ("relative_rotation_deg", "relative_center_error_m"):
+        for group in ("cross_camera", "static_camera"):
+            assert exact[figure][group]["max"] < 1e-3
+    assert exact["baseline_scale"] == pytest.approx(1.0, rel=1e-4)
+
+    wandered = reconstruction_drift_report(
+        _moved_center(clean, slot=3, offset=(0.3, 0.0, 0.0)),
+        scene,
+        _identity_alignment(),
+    )["pose"]
+
+    assert wandered["relative_center_error_m"]["static_camera"]["max"] == (
+        pytest.approx(0.3, rel=1e-4)
+    )
+    assert wandered["relative_center_error_m"]["cross_camera"]["max"] < 1e-4
+    assert wandered["baseline_scale"] == pytest.approx(1.0, rel=1e-4)
 
 
 # ------------------------------------------------------------------------------
