@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ast
+import io
 import json
 import sys
+import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -112,6 +114,25 @@ def _render_plane_depth(rotation, translation, intrinsics, height, width):
     )
 
 
+def _frame_png_bytes(camera: int, time_index: int, height: int, width: int) -> bytes:
+    """The PNG one frame holds, identical whichever layout stores it.
+
+    Both layouts are written from this one function, so a packed-versus-loose
+    comparison measures the loader rather than two encodings that happened to
+    agree.  The fill is distinct per (camera, time), which is what lets such a
+    comparison catch a frame landing in the wrong slot.
+    """
+
+    pixels = np.full(
+        (height, width, 3),
+        fill_value=20 * camera + time_index,
+        dtype=np.uint8,
+    )
+    buffer = io.BytesIO()
+    Image.fromarray(pixels).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def _write_scene(
     root: Path,
     *,
@@ -124,6 +145,7 @@ def _write_scene(
     view_ids=None,
     query_times=None,
     invisible=(),
+    packed: bool = False,
 ) -> Path:
     """Write a dump.
 
@@ -136,22 +158,40 @@ def _write_scene(
     ``query_times`` gives each track its own query frame, ``view_ids`` records
     original camera ids that need not be ``range(view_count)``, and
     ``invisible`` marks ``(camera, time, track)`` triples as occluded.
+
+    ``packed`` writes the frames into one ``frames.zip`` instead of loose
+    ``view_<v>/`` directories, mirroring the training dump.  This is not a
+    fixture convenience: both layouts are permanently live -- the benchmark dump
+    stays loose while the training dump packs to fit the cluster's file-count
+    quota -- so the flag reproduces a real bimodality the loader must handle.
+    ``meta.npz`` and ``depth_full.npz`` stay loose either way.
     """
 
     scene_path = root / scene_name
     track_count = 3
     height = width = 56
 
-    for camera in range(view_count):
-        view_path = scene_path / f"view_{camera}"
-        view_path.mkdir(parents=True)
-        for time_index in range(time_count):
-            pixels = np.full(
-                (height, width, 3),
-                fill_value=20 * camera + time_index,
-                dtype=np.uint8,
-            )
-            Image.fromarray(pixels).save(view_path / f"{time_index:04d}.png")
+    if packed:
+        scene_path.mkdir(parents=True)
+        # STORED matches the producing side: PNGs are already compressed, so
+        # deflating them again buys nothing.
+        with zipfile.ZipFile(
+            scene_path / "frames.zip", "w", zipfile.ZIP_STORED
+        ) as archive:
+            for camera in range(view_count):
+                for time_index in range(time_count):
+                    archive.writestr(
+                        f"view_{camera}/{time_index:04d}.png",
+                        _frame_png_bytes(camera, time_index, height, width),
+                    )
+    else:
+        for camera in range(view_count):
+            view_path = scene_path / f"view_{camera}"
+            view_path.mkdir(parents=True)
+            for time_index in range(time_count):
+                (view_path / f"{time_index:04d}.png").write_bytes(
+                    _frame_png_bytes(camera, time_index, height, width)
+                )
 
     initial_points = np.array(
         [
@@ -240,17 +280,16 @@ def _write_scene(
 def dumped_scene(tmp_path, monkeypatch):
     _write_scene(tmp_path)
 
-    def fake_load_images(
-        paths,
+    def fake_preprocess_images(
+        frames,
         size,
         square_ok,
         verbose,
         patch_size,
     ):
         result = []
-        for index, path in enumerate(paths):
-            with Image.open(path) as image:
-                width, height = image.size
+        for index, (_name, image) in enumerate(frames):
+            width, height = image.size
             transform = compute_image_transform(
                 height,
                 width,
@@ -276,8 +315,8 @@ def dumped_scene(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(
-        "arc.dust3r.utils.image.load_images",
-        fake_load_images,
+        "arc.dust3r.utils.image.preprocess_images",
+        fake_preprocess_images,
     )
     return load_dumped_kubric_scene(
         tmp_path,
@@ -368,6 +407,317 @@ def test_production_crop_geometry_is_exact():
     )
 
 
+def _gradient_png(path: Path, height: int, width: int) -> None:
+    """Write a non-uniform, asymmetric image.
+
+    The asymmetry is the point.  A transposed or flipped output carries the same
+    sum and standard deviation as the original, so only a spatially varying
+    pattern tells them apart -- and rotation is one of the things below is for.
+    """
+
+    rows = np.arange(height, dtype=np.float64)[:, None]
+    columns = np.arange(width, dtype=np.float64)[None, :]
+    pixels = np.stack(
+        [
+            (rows * 3 + columns * 5) % 256,
+            (rows * 7 + columns * 2) % 256,
+            (rows * columns) % 256,
+        ],
+        axis=-1,
+    ).astype(np.uint8)
+    Image.fromarray(pixels).save(path)
+
+
+def _probe_points(tensor):
+    """Four corners and two off-centre interior pixels."""
+
+    height, width = tensor.shape[-2:]
+    picks = [
+        (0, 0),
+        (0, width - 1),
+        (height - 1, 0),
+        (height - 1, width - 1),
+        (height // 3, width // 4),
+        (2 * height // 3, 3 * width // 4),
+    ]
+    return [
+        [float(tensor[0, channel, row, column]) for channel in range(3)]
+        for row, column in picks
+    ]
+
+
+# Captured from `load_images` *before* `preprocess_images` was split out of it, so
+# these measure the split against what the loader did rather than against itself.
+# The cases cover each geometry branch a bad extraction could break: long-edge
+# resize with the patch crop, the `size <= 392` short-edge and square crop, and
+# the `square_ok=False and W == H` case that sets `halfh = 3 * halfw / 4`.
+# `rotate_clockwise_90` and `crop_to_landscape` are app.py's alone and were
+# covered nowhere; `landscape_crop` pins that cropping an already-4:3 image is a
+# no-op, while `tall_crop` pins that cropping a portrait one is not.
+_LOAD_IMAGES_GOLDENS = {
+    "landscape_512": {
+        "source": (384, 512),
+        "kwargs": {"size": 512, "patch_size": 14},
+        "shape": (1, 3, 378, 504),
+        "total": -2122.8164,
+        "std": 0.5800428,
+        "probes": [
+            [-0.772549, -0.772549, -0.9058824],
+            [0.8823529, -0.9137255, 0.8901961],
+            [0.0666667, -0.1529412, 0.8823529],
+            [-0.2862745, -0.2941176, 0.1607844],
+            [-0.8980392, 0.0901961, 0.0196079],
+            [-0.0980392, 0.9215686, 0.0196079],
+        ],
+    },
+    "portrait_512": {
+        "source": (512, 384),
+        "kwargs": {"size": 512, "patch_size": 14},
+        "shape": (1, 3, 504, 378),
+        "total": -2229.2319,
+        "std": 0.5800789,
+        "probes": [
+            [-0.7882353, -0.7333333, -0.9058824],
+            [-0.0588235, -0.8431373, 0.8823529],
+            [-1.0, 0.7803922, 0.8901961],
+            [-0.2705882, 0.6705883, 0.1607844],
+            [0.827451, -0.0745098, -0.654902],
+            [0.1450981, 0.0666667, 0.6941177],
+        ],
+    },
+    "square_512": {
+        "source": (256, 256),
+        "kwargs": {"size": 512, "patch_size": 14},
+        "shape": (1, 3, 378, 504),
+        "total": -755.418,
+        "std": 0.5315253,
+        "probes": [
+            [-0.145098, 0.8588235, -0.5372549],
+            [-0.3254902, 0.7882353, 0.2862746],
+            [0.2705883, -0.8431373, 0.5921569],
+            [0.0901961, -0.9529412, -0.2549019],
+            [-0.2078431, -0.7176471, -0.3568627],
+            [0.1921569, 0.7019608, 0.0117648],
+        ],
+    },
+    "square_512_square_ok": {
+        "source": (256, 256),
+        "kwargs": {"size": 512, "patch_size": 14, "square_ok": True},
+        "shape": (1, 3, 504, 504),
+        "total": -770.9363,
+        "std": 0.5347646,
+        "probes": [
+            [-0.8901961, -0.8745098, -0.9686275],
+            [0.9764706, -0.9921569, 1.0],
+            [-0.6862745, 0.8901961, 1.0],
+            [0.8352941, 0.8196079, -0.945098],
+            [-0.4588235, 0.7098039, 0.6156863],
+            [0.4352942, -0.7333333, 0.1843138],
+        ],
+    },
+    "small_224": {
+        "source": (96, 64),
+        "kwargs": {"size": 224, "patch_size": 14},
+        "shape": (1, 3, 224, 224),
+        "total": -126.9702,
+        "std": 0.5591598,
+        "probes": [
+            [-0.6392157, -0.145098, -1.0],
+            [-0.1607843, 0.8431373, 0.8666667],
+            [0.8588235, -0.654902, -1.0],
+            [-0.6705883, 0.3333334, 0.1529412],
+            [0.4745098, -0.7411765, -0.5137255],
+            [0.2313726, 0.9686275, 0.5921569],
+        ],
+    },
+    "rotated": {
+        "source": (384, 512),
+        "kwargs": {"size": 512, "patch_size": 14, "rotate_clockwise_90": True},
+        "shape": (1, 3, 504, 378),
+        "total": -2122.8159,
+        "std": 0.5800428,
+        "probes": [
+            [0.0666667, -0.1529412, 0.8823529],
+            [-0.772549, -0.772549, -0.9058824],
+            [-0.2862745, -0.2941176, 0.1607844],
+            [0.8823529, -0.9137255, 0.8901961],
+            [0.427451, -0.6705883, -0.6862745],
+            [0.5607843, -0.3803921, 0.6627451],
+        ],
+    },
+    # `size <= 392` combined with a rotate is the only case where reading W1/H1
+    # before the rotate rather than after it changes the resize target, so
+    # without this case that transposition is invisible.
+    "rotated_224": {
+        "source": (384, 512),
+        "kwargs": {"size": 224, "patch_size": 14, "rotate_clockwise_90": True},
+        "shape": (1, 3, 224, 224),
+        "total": -628.5382,
+        "std": 0.4839001,
+        "probes": [
+            [0.4666667, 0.9058824, -0.0431373],
+            [-0.4980392, 0.0196079, -0.8509804],
+            [-0.6235294, 0.8901961, -0.1686274],
+            [0.4196079, -0.0117647, -0.2784314],
+            [-0.8196079, -0.3411765, -0.5843138],
+            [-0.3254902, -0.7960784, -0.2784314],
+        ],
+    },
+    "landscape_crop": {
+        "source": (384, 512),
+        "kwargs": {"size": 512, "patch_size": 14, "crop_to_landscape": True},
+        "shape": (1, 3, 378, 504),
+        "total": -2122.8164,
+        "std": 0.5800428,
+        "probes": [
+            [-0.772549, -0.772549, -0.9058824],
+            [0.8823529, -0.9137255, 0.8901961],
+            [0.0666667, -0.1529412, 0.8823529],
+            [-0.2862745, -0.2941176, 0.1607844],
+            [-0.8980392, 0.0901961, 0.0196079],
+            [-0.0980392, 0.9215686, 0.0196079],
+        ],
+    },
+    "tall_crop": {
+        "source": (512, 384),
+        "kwargs": {"size": 512, "patch_size": 14, "crop_to_landscape": True},
+        "shape": (1, 3, 378, 504),
+        "total": -2258.3513,
+        "std": 0.5363215,
+        "probes": [
+            [-0.2156863, -0.7098039, -0.2705882],
+            [0.5294118, -0.8196079, -0.490196],
+            [0.4196079, 0.7568628, 0.254902],
+            [-0.8431373, 0.6470588, -0.3019608],
+            [-0.3019608, -0.0666667, -0.3568627],
+            [-0.7098039, 0.0588236, 0.2],
+        ],
+    },
+}
+
+
+@pytest.mark.parametrize("case", sorted(_LOAD_IMAGES_GOLDENS))
+def test_load_images_is_unchanged_by_the_preprocess_split(tmp_path, case):
+    """`load_images` still does exactly what it did before it was split.
+
+    The adapter now calls `preprocess_images` directly so it can hand over a frame
+    it already decoded, and `load_images` is the path-opening wrapper left around
+    it. Four other callers -- inference.py, app.py, and the two eval launchers --
+    still go through the wrapper and must not be able to tell.
+    """
+
+    from arc.dust3r.utils.image import load_images
+
+    golden = _LOAD_IMAGES_GOLDENS[case]
+    height, width = golden["source"]
+    path = tmp_path / f"{case}.png"
+    _gradient_png(path, height, width)
+
+    views = load_images([str(path)], verbose=False, **golden["kwargs"])
+
+    assert len(views) == 1
+    view = views[0]
+    assert tuple(view["img"].shape) == golden["shape"]
+    assert view["true_shape"].tolist() == [list(golden["shape"][-2:])]
+    assert view["idx"] == 0
+    assert view["instance"] == "0"
+    assert float(view["img"].sum()) == pytest.approx(golden["total"], abs=1e-2)
+    assert float(view["img"].std()) == pytest.approx(golden["std"], abs=1e-6)
+    np.testing.assert_allclose(
+        _probe_points(view["img"]),
+        golden["probes"],
+        atol=1e-6,
+    )
+
+
+def test_load_images_still_honours_exif_orientation(tmp_path):
+    """A dropped `exif_transpose` is invisible on the dump's own frames.
+
+    Kubric writes PNGs with no EXIF, so every other case here passes with the
+    call removed -- and it sits on the line the split moved between functions.
+    Orientation 6 means "rotate on display", so the loader must hand back the
+    transpose of what is stored.
+    """
+
+    from arc.dust3r.utils.image import load_images
+
+    path = tmp_path / "sideways.png"
+    _gradient_png(path, 64, 96)
+    with Image.open(path) as stored:
+        assert stored.size == (96, 64)
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    with Image.open(path) as stored:
+        stored.save(path, exif=exif)
+
+    view = load_images([str(path)], size=224, patch_size=14, verbose=False)[0]
+
+    # 96x64 stored, so 64x96 after the transpose: short side 64 resized to 224
+    # gives 336x224, square-cropped to 224x224. Without exif_transpose the same
+    # arithmetic runs on 96x64 and lands on 224x224 too -- so compare pixels, not
+    # only the shape.
+    assert tuple(view["img"].shape) == (1, 3, 224, 224)
+    upright = load_images(
+        [str(_rewritten_without_exif(tmp_path, path))],
+        size=224,
+        patch_size=14,
+        verbose=False,
+    )[0]
+    assert not torch.equal(view["img"], upright["img"])
+
+
+def _rewritten_without_exif(tmp_path: Path, source: Path) -> Path:
+    """The same pixels as ``source``, stripped of its EXIF block."""
+
+    destination = tmp_path / f"upright_{source.name}"
+    with Image.open(source) as image:
+        Image.fromarray(np.asarray(image)).save(destination)
+    return destination
+
+
+def test_load_images_still_converts_modes_and_numbers_its_output(tmp_path):
+    """Non-RGB input becomes RGB, and `idx` counts the surviving images.
+
+    Kubric renders RGBA, so `convert("RGB")` is load-bearing rather than
+    defensive -- without it `ImgNorm` meets a 4- or 1-channel tensor and its
+    3-channel normalisation is wrong or raises. `idx` is what the adapter's
+    out-of-step guard reads, and a single-image call cannot tell `len(imgs)`
+    from a constant 0.
+    """
+
+    from arc.dust3r.utils.image import load_images
+
+    rgba = tmp_path / "a_rgba.png"
+    grey = tmp_path / "b_grey.png"
+    _gradient_png(rgba, 64, 96)
+    with Image.open(rgba) as image:
+        image.convert("RGBA").save(rgba)
+        Image.fromarray(np.asarray(image.convert("L"))).save(grey)
+
+    views = load_images([str(rgba), str(grey)], size=224, patch_size=14, verbose=False)
+
+    assert len(views) == 2
+    assert [view["idx"] for view in views] == [0, 1]
+    assert [view["instance"] for view in views] == ["0", "1"]
+    assert all(view["img"].shape[1] == 3 for view in views)
+    # A greyscale source broadcast to RGB has three identical channels; the
+    # colour one must not.
+    red, green, blue = views[1]["img"][0]
+    assert torch.equal(red, green) and torch.equal(green, blue)
+    assert not torch.equal(views[0]["img"][0][0], views[0]["img"][0][1])
+
+
+def test_load_images_still_rejects_a_folder_with_no_images(tmp_path):
+    """The empty case names the root, which only the wrapper knows."""
+
+    from arc.dust3r.utils.image import load_images
+
+    (tmp_path / "notes.txt").write_text("not an image")
+
+    with pytest.raises(AssertionError, match=f"no images found at {tmp_path}"):
+        load_images(str(tmp_path), size=512, patch_size=14, verbose=False)
+
+
 def test_adapter_rejects_a_loader_that_reorders_its_output(tmp_path, monkeypatch):
     """Slot s must hold the pixels of paths[s].
 
@@ -378,11 +728,10 @@ def test_adapter_rejects_a_loader_that_reorders_its_output(tmp_path, monkeypatch
 
     _write_scene(tmp_path)
 
-    def reversing_load_images(paths, size, square_ok, verbose, patch_size):
+    def reversing_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
-        for index, path in enumerate(paths):
-            with Image.open(path) as image:
-                width, height = image.size
+        for index, (_name, image) in enumerate(frames):
+            width, height = image.size
             transform = compute_image_transform(
                 height,
                 width,
@@ -408,8 +757,8 @@ def test_adapter_rejects_a_loader_that_reorders_its_output(tmp_path, monkeypatch
         return result[::-1]
 
     monkeypatch.setattr(
-        "arc.dust3r.utils.image.load_images",
-        reversing_load_images,
+        "arc.dust3r.utils.image.preprocess_images",
+        reversing_preprocess_images,
     )
 
     with pytest.raises(RuntimeError, match="out of step"):
@@ -608,6 +957,141 @@ def test_adapter_uses_the_real_image_loader(tmp_path):
     assert scene.time_indices == (0, 1, 2, 3, 0, 1, 2, 3)
 
 
+def test_packed_and_loose_dumps_load_identically(tmp_path):
+    """The layout on disk must not reach the tensors.
+
+    Deliberately unmocked: a fake preprocessor would skip the pixel path, which
+    is the only thing this test is about.  Both dumps are written from the same
+    `_frame_png_bytes`, so any difference is the loader's doing.
+    """
+
+    _write_scene(tmp_path, scene_name="loose")
+    _write_scene(tmp_path, scene_name="packed", packed=True)
+
+    assert (tmp_path / "packed" / "frames.zip").is_file()
+    assert not (tmp_path / "packed" / "view_0").exists()
+    assert (tmp_path / "packed" / "meta.npz").is_file()
+
+    window = dict(cameras=(0, 1), times=(0, 1, 2, 3), size=56)
+    loose = load_dumped_kubric_scene(tmp_path, "loose", **window)
+    packed = load_dumped_kubric_scene(tmp_path, "packed", **window)
+
+    assert len(packed.views) == len(loose.views) == 8
+    for slot, (from_loose, from_packed) in enumerate(zip(loose.views, packed.views)):
+        assert torch.equal(from_loose["img"], from_packed["img"]), (
+            f"slot {slot} pixels differ between layouts"
+        )
+        np.testing.assert_array_equal(
+            from_loose["true_shape"], from_packed["true_shape"]
+        )
+        assert from_loose["idx"] == from_packed["idx"] == slot
+        assert from_loose["instance"] == from_packed["instance"]
+        assert torch.equal(from_loose["time_index"], from_packed["time_index"])
+        assert torch.equal(
+            from_loose["track_query_idx"], from_packed["track_query_idx"]
+        )
+
+    # Equal tensors would prove nothing if every frame looked alike, so confirm
+    # the eight are mutually distinct -- that is what makes the loop above able
+    # to catch a frame landing in the wrong slot.
+    assert len({float(view["img"].mean()) for view in loose.views}) == 8
+
+    assert packed.slot_cameras.tolist() == loose.slot_cameras.tolist()
+    assert packed.slot_times.tolist() == loose.slot_times.tolist()
+    assert packed.time_indices == loose.time_indices
+    assert torch.equal(packed.depth0, loose.depth0)
+
+    # `path` is the one field that must differ: it records where the frame was
+    # read from, and for a packed scene that is a member inside the archive.
+    assert loose.observations[0].path == tmp_path / "loose" / "view_0" / "0000.png"
+    assert (
+        packed.observations[0].path
+        == tmp_path / "packed" / "frames.zip" / "view_0" / "0000.png"
+    )
+
+
+def test_a_missing_packed_frame_names_the_scene_and_the_member(tmp_path):
+    """A gap in the archive must say which frame of which scene is missing.
+
+    `ZipFile.read` raises a bare `KeyError` naming neither, which would surface
+    as an unhandled key error halfway through a cluster run.
+    """
+
+    _write_scene(tmp_path, scene_name="gappy", packed=True)
+    archive_path = tmp_path / "gappy" / "frames.zip"
+
+    with zipfile.ZipFile(archive_path) as source:
+        names = source.namelist()
+        kept = [
+            (name, source.read(name)) for name in names if name != "view_1/0002.png"
+        ]
+    # Without this the test would still pass if the writer's member spelling ever
+    # stopped matching the name above -- having deleted no frame at all.
+    assert len(kept) == len(names) - 1
+
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as target:
+        for name, payload in kept:
+            target.writestr(name, payload)
+
+    # FileNotFoundError, not KeyError: same failure, same type, as a loose dump
+    # missing the same frame.
+    with pytest.raises(FileNotFoundError) as raised:
+        load_dumped_kubric_scene(
+            tmp_path,
+            "gappy",
+            cameras=(0, 1),
+            times=(0, 1, 2, 3),
+            size=56,
+        )
+
+    message = str(raised.value)
+    assert "view_1/0002.png" in message
+    assert str(archive_path) in message
+
+
+def test_the_frame_archive_wins_when_both_layouts_are_present(tmp_path):
+    """A scene carrying both layouts reads the archive.
+
+    Packing is a transition: a scene can be packed before its loose frames are
+    swept away.  Preferring the loose copy would silently read whichever half
+    went stale, so the rule is that the archive decides wherever it exists.
+    """
+
+    scene_path = _write_scene(tmp_path, scene_name="both")
+    # Offset fills, so which layout was read is visible in the pixels.
+    with zipfile.ZipFile(
+        scene_path / "frames.zip", "w", zipfile.ZIP_STORED
+    ) as archive:
+        for camera in range(2):
+            for time_index in range(4):
+                archive.writestr(
+                    f"view_{camera}/{time_index:04d}.png",
+                    _frame_png_bytes(camera + 5, time_index, 56, 56),
+                )
+
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "both",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+    )
+
+    # A 56x56 frame at size=56 is resized and cropped by the identity, and ImgNorm
+    # maps a constant fill f to 2f/255 - 1.
+    expected = [
+        2 * (20 * (camera + 5) + time_index) / 255 - 1
+        for camera in range(2)
+        for time_index in range(4)
+    ]
+    np.testing.assert_allclose(
+        [float(view["img"].mean()) for view in scene.views],
+        expected,
+        atol=1e-6,
+    )
+    assert "frames.zip" in str(scene.observations[0].path)
+
+
 def test_adapter_parses_nonzero_window_but_sparse_supervision_rejects_it(
     tmp_path,
 ):
@@ -774,11 +1258,10 @@ def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
 
     _write_scene(tmp_path, rotated_camera=1)
 
-    def fake_load_images(paths, size, square_ok, verbose, patch_size):
+    def fake_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
-        for index, path in enumerate(paths):
-            with Image.open(path) as image:
-                width, height = image.size
+        for index, (_name, image) in enumerate(frames):
+            width, height = image.size
             transform = compute_image_transform(
                 height,
                 width,
@@ -803,7 +1286,9 @@ def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
             )
         return result
 
-    monkeypatch.setattr("arc.dust3r.utils.image.load_images", fake_load_images)
+    monkeypatch.setattr(
+        "arc.dust3r.utils.image.preprocess_images", fake_preprocess_images
+    )
     return load_dumped_kubric_scene(
         tmp_path,
         "0000",
@@ -1587,11 +2072,10 @@ def test_nonconsecutive_frames_keep_local_semantic_time_indices(
 ):
     _write_scene(tmp_path, time_count=7)
 
-    def fake_load_images(paths, size, square_ok, verbose, patch_size):
+    def fake_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
-        for index, path in enumerate(paths):
-            with Image.open(path) as image:
-                width, height = image.size
+        for index, (_name, image) in enumerate(frames):
+            width, height = image.size
             transform = compute_image_transform(
                 height,
                 width,
@@ -1614,8 +2098,8 @@ def test_nonconsecutive_frames_keep_local_semantic_time_indices(
         return result
 
     monkeypatch.setattr(
-        "arc.dust3r.utils.image.load_images",
-        fake_load_images,
+        "arc.dust3r.utils.image.preprocess_images",
+        fake_preprocess_images,
     )
     scene = load_dumped_kubric_scene(
         tmp_path,

@@ -8,10 +8,17 @@ Two files are read.  ``meta.npz`` is required and carries the sparse metric
 metadata.  ``depth_full.npz`` is an optional sibling holding per-frame depth; it
 is emitted only when the dump ran with ``RCMV_DUMP_DEPTH=1``, so a dump made
 without it is complete-looking but supports anchors at original time 0 only.
+
+Frames arrive in one of two layouts and the adapter reads either.  The training
+dump packs them into a single ``frames.zip``; the benchmark dump leaves them
+loose under ``view_<v>/``.  Both are permanently live, and which one applies is
+decided by what is on disk -- there is no flag and no config key.
 """
 
 from __future__ import annotations
 
+import io
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -20,11 +27,15 @@ import numpy as np
 import torch
 from PIL import Image
 
-# The optional per-frame depth sidecar. Its ``t`` axis is 1:1 with the PNG
+# The optional per-frame depth sidecar. Its ``t`` axis is 1:1 with the frame
 # names, and ``depth[:, 0]`` is what ``meta.npz`` stores as ``depth0``.
 DEPTH_SIDECAR_NAME = "depth_full.npz"
 DEPTH_SIDECAR_KEY = "depth"
 DEPTH_SIDECAR_FLAG = "RCMV_DUMP_DEPTH=1"
+
+# The packed frame layout. Present for a dump whose frames were packed, absent
+# for one that left them loose; nothing else distinguishes the two.
+FRAMES_ARCHIVE_NAME = "frames.zip"
 
 
 @dataclass(frozen=True)
@@ -88,6 +99,13 @@ class Observation:
     the original camera this view was rendered from, recorded by ``view_ids``.
     The two coincide for every dump taken with an ascending, complete view
     list, which is all of them so far, but only ``camera`` may index an array.
+
+    ``path`` is a *diagnostic label, not a locator*, and is not guaranteed to
+    exist on disk: a frame read out of ``frames.zip`` is labelled
+    ``<scene>/frames.zip/view_<v>/<t>.png``, naming the archive and the member
+    it came from.  Nothing stats or reopens it today.  A consumer that needs to
+    is the moment to give this field an explicit archive spelling and change its
+    type -- with that caller in hand, not before.
     """
 
     slot: int
@@ -320,6 +338,73 @@ def _resolve_view_indices(
             )
         resolved.append(lookup[int(camera_id)])
     return tuple(resolved)
+
+
+def _frame_member_name(camera: int, time_index: int) -> str:
+    """Where one frame lives, in the single spelling both layouts share.
+
+    Zip member names are ``/``-separated by specification, so this is built as a
+    string; the loose layout then derives its path from it, which is what keeps
+    the packed and loose names from ever drifting apart.  ``camera`` is the
+    resolved view index -- the position along the dumped ``V`` axis -- exactly as
+    it is for the loose directory name.
+    """
+
+    return f"view_{camera}/{time_index:04d}.png"
+
+
+def _iter_frames(
+    scene_path: Path,
+    cameras: Sequence[int],
+    times: Sequence[int],
+):
+    """Yield ``(path, image)`` for the selected grid, camera-major.
+
+    Frames are packed into ``frames.zip`` or loose under ``view_<v>/``, and which
+    it is depends on nothing but what is on disk.  Packing exists because the
+    cluster quota caps file *count*: a ten-view scene costs 241 loose files
+    against three packed.  The benchmark dump stays loose, so both layouts are
+    live simultaneously and the archive wins wherever it is present.
+
+    Each image is decoded here rather than handed on unread, so its source handle
+    is released before the next frame opens instead of one being held open per
+    observation.
+    """
+
+    archive_path = scene_path / FRAMES_ARCHIVE_NAME
+    if archive_path.is_file():
+        try:
+            archive = zipfile.ZipFile(archive_path)
+        except zipfile.BadZipFile as error:
+            raise ValueError(
+                f"{archive_path} is not a readable zip archive ({error}); the "
+                "packed frames are truncated or were not transferred completely"
+            ) from error
+        # One handle for the whole window. Opening per member would re-read the
+        # archive's central directory once per observation.
+        with archive:
+            for camera in cameras:
+                for time_index in times:
+                    member = _frame_member_name(camera, time_index)
+                    try:
+                        payload = archive.read(member)
+                    except KeyError:
+                        raise FileNotFoundError(
+                            f"Observation image not found: member '{member}' is "
+                            f"missing from {archive_path}"
+                        ) from None
+                    image = Image.open(io.BytesIO(payload))
+                    image.load()
+                    yield archive_path / member, image
+    else:
+        for camera in cameras:
+            for time_index in times:
+                path = scene_path / _frame_member_name(camera, time_index)
+                if not path.is_file():
+                    raise FileNotFoundError(f"Observation image not found: {path}")
+                image = Image.open(path)
+                image.load()
+                yield path, image
 
 
 def _load_view_ids(
@@ -561,36 +646,35 @@ def load_dumped_kubric_scene(
         )
         depth_sidecar_path = sidecar_path
 
+    # Each frame is read and decoded exactly once here: its size feeds the
+    # transform, and the same decoded image is then handed to the preprocessor.
     paths = []
+    images = []
     transforms = []
-    for camera in cameras:
-        for time_index in times:
-            path = scene_path / f"view_{camera}" / f"{time_index:04d}.png"
-            if not path.is_file():
-                raise FileNotFoundError(f"Observation image not found: {path}")
-            with Image.open(path) as image:
-                width, height = image.size
-            if depth0.shape[-2:] != (height, width):
-                raise ValueError(
-                    f"depth0 grid {depth0.shape[-2:]} does not match dumped PNG "
-                    f"grid {(height, width)} for {path}"
-                )
-            paths.append(str(path))
-            transforms.append(
-                compute_image_transform(
-                    height,
-                    width,
-                    size=size,
-                    patch_size=patch_size,
-                    square_ok=square_ok,
-                )
+    for path, image in _iter_frames(scene_path, cameras, times):
+        width, height = image.size
+        if depth0.shape[-2:] != (height, width):
+            raise ValueError(
+                f"depth0 grid {depth0.shape[-2:]} does not match dumped frame "
+                f"grid {(height, width)} for {path}"
             )
+        paths.append(str(path))
+        images.append(image)
+        transforms.append(
+            compute_image_transform(
+                height,
+                width,
+                size=size,
+                patch_size=patch_size,
+                square_ok=square_ok,
+            )
+        )
 
     # Import lazily so metadata/geometry tests do not require torchvision.
-    from arc.dust3r.utils.image import load_images
+    from arc.dust3r.utils.image import preprocess_images
 
-    views = load_images(
-        paths,
+    views = preprocess_images(
+        zip(paths, images),
         size=size,
         square_ok=square_ok,
         verbose=verbose,

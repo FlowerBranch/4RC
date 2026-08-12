@@ -75,31 +75,23 @@ def _resize_pil_image(img, long_edge_size):
     return img.resize(new_size, interp)
 
 
-def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_clockwise_90=False, crop_to_landscape=False, patch_size=16):
-    """open and convert all images in a list or folder to proper input format for DUSt3R"""
-    if isinstance(folder_or_list, str):
-        if verbose:
-            print(f">> Loading images from {folder_or_list}")
-        root, folder_content = folder_or_list, sorted(os.listdir(folder_or_list))
+def preprocess_images(frames, size, square_ok=False, verbose=True, rotate_clockwise_90=False, crop_to_landscape=False, patch_size=16):
+    """resize, crop and normalise already-opened images into DUSt3R input format
 
-    elif isinstance(folder_or_list, list):
-        if verbose:
-            print(f">> Loading a list of {len(folder_or_list)} images")
-        root, folder_content = "", folder_or_list
+    ``frames`` is an iterable of ``(name, PIL image)`` pairs.  ``name`` labels the
+    image in the verbose line and nothing else; pairing it with the image rather
+    than passing a parallel list of names is what stops the two desyncing.
 
-    else:
-        raise ValueError(f"bad {folder_or_list=} ({type(folder_or_list)})")
-
-    supported_images_extensions = [".jpg", ".jpeg", ".png"]
-    if heif_support_enabled:
-        supported_images_extensions += [".heic", ".heif"]
-    supported_images_extensions = tuple(supported_images_extensions)
+    The iterable is consumed lazily, so a caller feeding it from a generator holds
+    one open image at a time instead of one per frame.  This is the whole body of
+    the loading path: `load_images` opens files and hands them here, and callers
+    that already have the bytes -- a frame read out of an archive, say -- hand them
+    here directly rather than round-tripping through a path.
+    """
 
     imgs = []
-    for path in folder_content:
-        if not path.lower().endswith(supported_images_extensions):
-            continue
-        img = exif_transpose(PIL.Image.open(os.path.join(root, path))).convert("RGB")
+    for name, img in frames:
+        img = exif_transpose(img).convert("RGB")
 
         if rotate_clockwise_90:
             img = img.rotate(-90, expand=True)
@@ -152,7 +144,7 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_cloc
 
         W2, H2 = img.size
         if verbose:
-            print(f" - adding {path} with resolution {W1}x{H1} --> {W2}x{H2}")
+            print(f" - adding {name} with resolution {W1}x{H1} --> {W2}x{H2}")
         # true_shape = [img.size] if height > width else [img.size[::-1]] # if is protrait, the true shape should inverse
         true_shape = [img.size[::-1]] # true shape requires H, W
         imgs.append(
@@ -163,6 +155,43 @@ def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_cloc
                 instance=str(len(imgs)),
             )
         )
+
+    return imgs
+
+
+def load_images(folder_or_list, size, square_ok=False, verbose=True, rotate_clockwise_90=False, crop_to_landscape=False, patch_size=16):
+    """open and convert all images in a list or folder to proper input format for DUSt3R"""
+    if isinstance(folder_or_list, str):
+        if verbose:
+            print(f">> Loading images from {folder_or_list}")
+        root, folder_content = folder_or_list, sorted(os.listdir(folder_or_list))
+
+    elif isinstance(folder_or_list, list):
+        if verbose:
+            print(f">> Loading a list of {len(folder_or_list)} images")
+        root, folder_content = "", folder_or_list
+
+    else:
+        raise ValueError(f"bad {folder_or_list=} ({type(folder_or_list)})")
+
+    supported_images_extensions = [".jpg", ".jpeg", ".png"]
+    if heif_support_enabled:
+        supported_images_extensions += [".heic", ".heif"]
+    supported_images_extensions = tuple(supported_images_extensions)
+
+    imgs = preprocess_images(
+        (
+            (path, PIL.Image.open(os.path.join(root, path)))
+            for path in folder_content
+            if path.lower().endswith(supported_images_extensions)
+        ),
+        size,
+        square_ok=square_ok,
+        verbose=verbose,
+        rotate_clockwise_90=rotate_clockwise_90,
+        crop_to_landscape=crop_to_landscape,
+        patch_size=patch_size,
+    )
 
     assert imgs, "no images found at " + root
     if verbose:
