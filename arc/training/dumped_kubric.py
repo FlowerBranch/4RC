@@ -358,7 +358,13 @@ def _iter_frames(
     cameras: Sequence[int],
     times: Sequence[int],
 ):
-    """Yield ``(path, image)`` for the selected grid, camera-major.
+    """Yield ``(camera, time, path, image)`` for the selected grid, camera-major.
+
+    The camera and time travel with the frame so ``build_scene`` can check each
+    one against the slot it is filling.  They are redundant for this source,
+    which generates the grid itself -- but the core accepts any frame source, and
+    a source that yields in the wrong order would otherwise produce a scene whose
+    every slot holds the right metadata and the wrong picture.
 
     Frames are packed into ``frames.zip`` or loose under ``view_<v>/``, and which
     it is depends on nothing but what is on disk.  Packing exists because the
@@ -395,7 +401,7 @@ def _iter_frames(
                         ) from None
                     image = Image.open(io.BytesIO(payload))
                     image.load()
-                    yield archive_path / member, image
+                    yield camera, time_index, archive_path / member, image
     else:
         for camera in cameras:
             for time_index in times:
@@ -404,7 +410,7 @@ def _iter_frames(
                     raise FileNotFoundError(f"Observation image not found: {path}")
                 image = Image.open(path)
                 image.load()
-                yield path, image
+                yield camera, time_index, path, image
 
 
 def _load_view_ids(
@@ -434,7 +440,7 @@ def _load_view_ids(
 def _validate_depth_sidecar(
     depth: np.ndarray,
     *,
-    sidecar_path: Path,
+    sidecar_path: Path | str,
     view_count: int,
     time_count: int,
     depth0: np.ndarray,
@@ -493,12 +499,33 @@ def _validate_meta(
             f"{scene_path / 'meta.npz'} is missing required fields: {sorted(missing)}"
         )
 
-    query_points = meta["query_points"]
-    trajectories = meta["traj3d_world"]
-    visibility = meta["visibility"]
-    intrinsics = meta["intrs"]
-    extrinsics = meta["extrs"]
-    depth0 = meta["depth0"]
+    _validate_scene_arrays(
+        query_points=meta["query_points"],
+        trajectories=meta["traj3d_world"],
+        visibility=meta["visibility"],
+        intrinsics=meta["intrs"],
+        extrinsics=meta["extrs"],
+        depth0=meta["depth0"],
+    )
+
+
+def _validate_scene_arrays(
+    *,
+    query_points,
+    trajectories,
+    visibility,
+    intrinsics,
+    extrinsics,
+    depth0,
+) -> None:
+    """The shape contract, checked the same way whatever the arrays came from.
+
+    Split out of ``_validate_meta`` so a scene assembled in memory is held to the
+    identical contract as one read off disk.  A live sample that has been
+    transposed or has picked up a batch axis fails here rather than three frames
+    later inside the slot arithmetic, where the message would name a grid
+    mismatch instead of the actual fault.
+    """
 
     if query_points.ndim != 2 or query_points.shape[1] != 4:
         raise ValueError(
@@ -536,10 +563,28 @@ def _validate_meta(
         )
 
 
-def load_dumped_kubric_scene(
-    data_root: str | Path,
-    scene_name: str,
+def _as_numpy(value, dtype):
+    """Accept a torch tensor or anything array-like, always return a fresh copy."""
+
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.array(value, dtype=dtype, copy=True)
+
+
+def build_scene(
     *,
+    name: str,
+    open_frames,
+    query_points,
+    trajectories,
+    visibility,
+    intrinsics,
+    extrinsics,
+    depth0,
+    track_upscaling_factor: float,
+    view_ids=None,
+    depth=None,
+    depth_sidecar_path: Path | None = None,
     cameras: Sequence[int] = (0, 1),
     times: Sequence[int] = (0, 1, 2, 3),
     query_anchors: Sequence[tuple[int, int]] | None = None,
@@ -547,19 +592,43 @@ def load_dumped_kubric_scene(
     patch_size: int = 14,
     square_ok: bool = False,
     verbose: bool = False,
+    source: str = "<arrays>",
 ) -> DumpedKubricScene:
-    """Load one camera-major window from the existing evaluation dump.
+    """Assemble one camera-major window from arrays and a frame source.
 
-    ``cameras`` and the camera half of ``query_anchors`` are original camera
-    ids, resolved against the dump's ``view_ids``; every array is indexed by the
-    resolved view position.  ``query_anchors`` names the observations that own a
-    dense query field, in priority order -- the first is the primary anchor and
-    owns the scene Sim(3).  It defaults to the first selected camera and time.
+    Everything that makes a :class:`DumpedKubricScene` a *scene* rather than a
+    pile of arrays lives here: camera-id resolution, the camera-major slot
+    arithmetic, the anchor slots, and the two cross-checks that catch a frame
+    source which reordered or dropped images.  None of it depends on where the
+    pixels came from, which is the whole point -- a dump on disk and a live
+    MVTracker sample must not be able to disagree about what a window *is*.
 
-    Anchoring at an original time other than 0 needs the per-frame depth
-    sidecar; :meth:`DumpedKubricScene.surface_depth_map` is where that is
-    enforced, so parsing and ordinary Arc forwarding stay unrestricted.
+    ``open_frames(view_positions, times)`` yields ``(label, PIL image)`` in
+    camera-major order.  It is a callable rather than an iterable because the
+    resolution from original camera ids to view positions happens here, and the
+    frame source needs the resolved positions.  ``label`` is used for error
+    messages and for ``Observation.path``; it need not name a real file.
+
+    Arrays may be numpy or torch, and are copied.  ``view_ids`` defaults to the
+    identity, which is what a dump predating the field means.
     """
+
+    query_points = _as_numpy(query_points, np.float32)
+    trajectories = _as_numpy(trajectories, np.float32)
+    visibility = _as_numpy(visibility, bool)
+    intrinsics = _as_numpy(intrinsics, np.float32)
+    extrinsics = _as_numpy(extrinsics, np.float32)
+    depth0 = _as_numpy(depth0, np.float32)
+    if depth is not None:
+        depth = _as_numpy(depth, np.float32)
+    _validate_scene_arrays(
+        query_points=query_points,
+        trajectories=trajectories,
+        visibility=visibility,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        depth0=depth0,
+    )
 
     cameras = _as_unique_int_tuple("cameras", cameras)
     times = _as_unique_int_tuple("times", times)
@@ -582,25 +651,19 @@ def load_dumped_kubric_scene(
                 f"selected times {times}"
             )
 
-    scene_path = Path(data_root) / scene_name
-    meta_path = scene_path / "meta.npz"
-    if not meta_path.is_file():
-        raise FileNotFoundError(f"Scene metadata not found: {meta_path}")
-
-    with np.load(meta_path, allow_pickle=False) as meta:
-        _validate_meta(meta, scene_path=scene_path)
-        query_points = np.array(meta["query_points"], dtype=np.float32, copy=True)
-        trajectories = np.array(meta["traj3d_world"], dtype=np.float32, copy=True)
-        visibility = np.array(meta["visibility"], dtype=bool, copy=True)
-        intrinsics = np.array(meta["intrs"], dtype=np.float32, copy=True)
-        extrinsics = np.array(meta["extrs"], dtype=np.float32, copy=True)
-        depth0 = np.array(meta["depth0"], dtype=np.float32, copy=True)
-        view_ids = _load_view_ids(meta, view_count=visibility.shape[0])
-        track_upscaling_factor = float(
-            np.asarray(meta["track_upscaling_factor"]).reshape(()).item()
-        )
-
     view_count, time_count = visibility.shape[:2]
+    if view_ids is None:
+        view_ids = np.arange(view_count, dtype=np.int64)
+    else:
+        view_ids = _as_numpy(view_ids, np.int64).reshape(-1)
+        if view_ids.shape != (view_count,):
+            raise ValueError(
+                f"view_ids must have shape ({view_count},) matching the dumped "
+                f"views, got {view_ids.shape}"
+            )
+        if np.any(view_ids < 0):
+            raise ValueError(f"view_ids must be non-negative, got {view_ids.tolist()}")
+
     camera_ids = cameras
     cameras = _resolve_view_indices(camera_ids, view_ids)
     anchor_view_pairs = tuple(
@@ -617,41 +680,42 @@ def load_dumped_kubric_scene(
             "track_upscaling_factor must be finite and positive, got "
             f"{track_upscaling_factor}"
         )
-
-    # Optional per-frame depth. Absent is the normal case for a dump taken
-    # without RCMV_DUMP_DEPTH=1, and leaves every path below at depth0 only.
-    sidecar_path = scene_path / DEPTH_SIDECAR_NAME
-    depth = None
-    depth_sidecar_path = None
-    if sidecar_path.exists():
-        with np.load(sidecar_path, allow_pickle=False) as sidecar:
-            if DEPTH_SIDECAR_KEY not in sidecar.files:
-                raise ValueError(
-                    f"{sidecar_path} is missing the '{DEPTH_SIDECAR_KEY}' array; "
-                    f"found {sorted(sidecar.files)}"
-                )
-            # Cast before comparing: the sidecar's dtype is whatever Kubric's
-            # depth TIFFs carried, and depth0 was already cast the same way.
-            depth = np.array(
-                sidecar[DEPTH_SIDECAR_KEY],
-                dtype=np.float32,
-                copy=True,
-            )
+    if depth is not None:
         _validate_depth_sidecar(
             depth,
-            sidecar_path=sidecar_path,
+            sidecar_path=depth_sidecar_path if depth_sidecar_path is not None else source,
             view_count=view_count,
             time_count=time_count,
             depth0=depth0,
         )
-        depth_sidecar_path = sidecar_path
 
     # Each frame is read and decoded exactly once here: its size feeds the
     # transform, and the same decoded image is then handed to the preprocessor.
     paths = []
     images = []
     transforms = []
-    for path, image in _iter_frames(scene_path, cameras, times):
+    for slot, (camera, time_index, path, image) in enumerate(
+        open_frames(cameras, times)
+    ):
+        # The frame source declares which observation each image is, and it is
+        # checked against the slot arithmetic rather than trusted. The loader-index
+        # check further down cannot stand in for this: `preprocess_images` numbers
+        # its outputs by receipt order, so a source that yields the grid in the
+        # wrong order satisfies it while every slot holds the wrong picture.
+        if slot >= len(cameras) * len(times):
+            raise RuntimeError(
+                f"Frame source yielded more than {len(cameras) * len(times)} "
+                "frames for the selected camera/time grid"
+            )
+        expected_camera = cameras[slot // len(times)]
+        expected_time = times[slot % len(times)]
+        if (int(camera), int(time_index)) != (expected_camera, expected_time):
+            raise RuntimeError(
+                f"Frame source is out of step at slot {slot}: got camera "
+                f"{int(camera)} time {int(time_index)} for {path}, expected "
+                f"camera {expected_camera} time {expected_time}. Frames must "
+                "arrive camera-major over the selected grid."
+            )
         width, height = image.size
         if depth0.shape[-2:] != (height, width):
             raise ValueError(
@@ -668,6 +732,13 @@ def load_dumped_kubric_scene(
                 patch_size=patch_size,
                 square_ok=square_ok,
             )
+        )
+
+    expected_frames = len(cameras) * len(times)
+    if len(paths) != expected_frames:
+        raise RuntimeError(
+            f"Frame source yielded {len(paths)} frames for a {len(cameras)}x"
+            f"{len(times)} camera/time grid ({expected_frames} expected)"
         )
 
     # Import lazily so metadata/geometry tests do not require torchvision.
@@ -757,7 +828,7 @@ def load_dumped_kubric_scene(
         )
 
     return DumpedKubricScene(
-        name=scene_name,
+        name=name,
         views=views,
         observations=tuple(observations),
         cameras=cameras,
@@ -779,4 +850,190 @@ def load_dumped_kubric_scene(
         depth=None if depth is None else torch.from_numpy(depth),
         depth_sidecar_path=depth_sidecar_path,
         track_upscaling_factor=track_upscaling_factor,
+    )
+
+
+def scene_from_datapoint(
+    sample,
+    *,
+    cameras: Sequence[int] | None = None,
+    times: Sequence[int] | None = None,
+    query_anchors: Sequence[tuple[int, int]] | None = None,
+    size: int = 512,
+    patch_size: int = 14,
+    square_ok: bool = False,
+    verbose: bool = False,
+) -> DumpedKubricScene:
+    """Build a scene from a live MVTracker ``Datapoint``, with no dump on disk.
+
+    The same :func:`build_scene` core as the dump reader, so a window assembled
+    here and the same window read back from a dump are the same object -- which
+    is asserted, not assumed, by the live-vs-dump equivalence test.
+
+    A live sample always carries per-frame depth (``videodepth``), so
+    :attr:`DumpedKubricScene.has_time_varying_depth` is true and an anchor at a
+    time other than 0 needs no sidecar.  ``cameras`` are original camera ids and
+    default to the sample's own ``sample_views``; ``times`` default to every
+    frame the sample holds.
+    """
+
+    video = sample.video
+    if video.ndim != 5 or video.shape[2] != 3:
+        raise ValueError(
+            f"Datapoint.video must have shape (V,T,3,H,W), got {tuple(video.shape)}"
+        )
+    view_count, time_count = int(video.shape[0]), int(video.shape[1])
+    view_ids = getattr(sample, "sample_views", None)
+    if view_ids is None:
+        view_ids = list(range(view_count))
+    view_ids = [int(value) for value in view_ids]
+    if len(view_ids) != view_count:
+        raise ValueError(
+            f"sample_views has {len(view_ids)} entries for {view_count} video views"
+        )
+    if cameras is None:
+        cameras = tuple(view_ids)
+    if times is None:
+        times = tuple(range(time_count))
+
+    depth = sample.videodepth
+    if depth is None:
+        raise ValueError(
+            "Datapoint.videodepth is None; a live scene needs per-frame depth to "
+            "anchor queries at all"
+        )
+
+    def open_frames(view_positions, selected_times):
+        for view_position in view_positions:
+            for time_index in selected_times:
+                frame = video[view_position, time_index]
+                if hasattr(frame, "detach"):
+                    frame = frame.detach().cpu()
+                array = np.asarray(frame).transpose(1, 2, 0).astype(np.uint8)
+                # Labelled the way a packed dump labels its members, so an error
+                # message reads the same whichever source produced the frame.
+                yield (
+                    view_position,
+                    time_index,
+                    f"{sample.seq_name}/<live>/{_frame_member_name(view_position, time_index)}",
+                    Image.fromarray(array),
+                )
+
+    return build_scene(
+        name=str(sample.seq_name),
+        open_frames=open_frames,
+        query_points=sample.query_points_3d,
+        trajectories=sample.trajectory_3d,
+        visibility=sample.visibility,
+        intrinsics=sample.intrs,
+        extrinsics=sample.extrs,
+        depth0=depth[:, 0],
+        depth=depth,
+        view_ids=view_ids,
+        track_upscaling_factor=float(sample.track_upscaling_factor),
+        cameras=cameras,
+        times=times,
+        query_anchors=query_anchors,
+        size=size,
+        patch_size=patch_size,
+        square_ok=square_ok,
+        verbose=verbose,
+        source=f"<live sample {sample.seq_name}>",
+    )
+
+
+def load_dumped_kubric_scene(
+    data_root: str | Path,
+    scene_name: str,
+    *,
+    cameras: Sequence[int] = (0, 1),
+    times: Sequence[int] = (0, 1, 2, 3),
+    query_anchors: Sequence[tuple[int, int]] | None = None,
+    size: int = 512,
+    patch_size: int = 14,
+    square_ok: bool = False,
+    verbose: bool = False,
+) -> DumpedKubricScene:
+    """Load one camera-major window from the existing evaluation dump.
+
+    The disk front-end of :func:`build_scene`: it owns ``meta.npz``, the optional
+    depth sidecar and the frames-or-archive branch, and nothing else.  Every
+    derivation the scene depends on lives in the core, so this and
+    :func:`scene_from_datapoint` cannot drift apart.
+
+    ``cameras`` and the camera half of ``query_anchors`` are original camera
+    ids, resolved against the dump's ``view_ids``; every array is indexed by the
+    resolved view position.  ``query_anchors`` names the observations that own a
+    dense query field, in priority order -- the first is the primary anchor and
+    owns the scene Sim(3).  It defaults to the first selected camera and time.
+
+    Anchoring at an original time other than 0 needs the per-frame depth
+    sidecar; :meth:`DumpedKubricScene.surface_depth_map` is where that is
+    enforced, so parsing and ordinary Arc forwarding stay unrestricted.
+    """
+
+    scene_path = Path(data_root) / scene_name
+    meta_path = scene_path / "meta.npz"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"Scene metadata not found: {meta_path}")
+
+    with np.load(meta_path, allow_pickle=False) as meta:
+        _validate_meta(meta, scene_path=scene_path)
+        query_points = np.array(meta["query_points"], dtype=np.float32, copy=True)
+        trajectories = np.array(meta["traj3d_world"], dtype=np.float32, copy=True)
+        visibility = np.array(meta["visibility"], dtype=bool, copy=True)
+        intrinsics = np.array(meta["intrs"], dtype=np.float32, copy=True)
+        extrinsics = np.array(meta["extrs"], dtype=np.float32, copy=True)
+        depth0 = np.array(meta["depth0"], dtype=np.float32, copy=True)
+        view_ids = _load_view_ids(meta, view_count=visibility.shape[0])
+        track_upscaling_factor = float(
+            np.asarray(meta["track_upscaling_factor"]).reshape(()).item()
+        )
+
+    # Optional per-frame depth. Absent is the normal case for a dump taken
+    # without RCMV_DUMP_DEPTH=1, and leaves every path below at depth0 only.
+    sidecar_path = scene_path / DEPTH_SIDECAR_NAME
+    depth = None
+    depth_sidecar_path = None
+    if sidecar_path.exists():
+        with np.load(sidecar_path, allow_pickle=False) as sidecar:
+            if DEPTH_SIDECAR_KEY not in sidecar.files:
+                raise ValueError(
+                    f"{sidecar_path} is missing the '{DEPTH_SIDECAR_KEY}' array; "
+                    f"found {sorted(sidecar.files)}"
+                )
+            # Cast before comparing: the sidecar's dtype is whatever Kubric's
+            # depth TIFFs carried, and depth0 was already cast the same way.
+            depth = np.array(
+                sidecar[DEPTH_SIDECAR_KEY],
+                dtype=np.float32,
+                copy=True,
+            )
+        depth_sidecar_path = sidecar_path
+
+    return build_scene(
+        name=scene_name,
+        open_frames=lambda view_positions, selected_times: _iter_frames(
+            scene_path,
+            view_positions,
+            selected_times,
+        ),
+        query_points=query_points,
+        trajectories=trajectories,
+        visibility=visibility,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        depth0=depth0,
+        depth=depth,
+        depth_sidecar_path=depth_sidecar_path,
+        view_ids=view_ids,
+        track_upscaling_factor=track_upscaling_factor,
+        cameras=cameras,
+        times=times,
+        query_anchors=query_anchors,
+        size=size,
+        patch_size=patch_size,
+        square_ok=square_ok,
+        verbose=verbose,
+        source=str(scene_path),
     )

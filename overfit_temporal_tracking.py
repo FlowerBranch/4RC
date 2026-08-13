@@ -13,7 +13,6 @@ import argparse
 import json
 import math
 import random
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -36,46 +35,31 @@ from arc.training import (
 )
 
 
-# Per freeze mode: (trainable tensor count, trainable parameters excluding the
-# time-index embedding, whose row count is a flag). Measured on a meta-device
-# Arc. A refactor that silently changes a freeze mask must fail here rather
-# than quietly costing GPU weeks.
-EXPECTED_TRAINABLE_SETS = {
-    "temporal_tracking": (231, 314_551_588),
-    "temporal_tracking_global_attention": (483, 711_268_132),
-    # Pinned at DEFAULT_LATE_GLOBAL_BLOCKS; every other k derives from it via
-    # LATE_GLOBAL_PER_BLOCK in _expected_trainable_set.
-    "temporal_tracking_late_global": (303, 427_899_172),
-}
-# One global-attention block, measured on a meta-device Arc. The 14 are exactly
-# homogeneous, so k of them cost exactly k times this.
-LATE_GLOBAL_PER_BLOCK = (18, 28_336_896)
-DEFAULT_LATE_GLOBAL_BLOCKS = 4
-# Every global-attention block the vitg encoder has (alt_start=13, depth=40).
-# At this k the late mask equals temporal_tracking_global_attention exactly --
-# asserted in the tests, since argument validation runs before a model exists.
-MAX_LATE_GLOBAL_BLOCKS = 14
-TIME_EMBEDDING_DIM = 1536
-TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
-
-
-def _expected_trainable_set(freeze_mode, late_global_blocks):
-    """(tensor count, non-embedding parameter count) the mode must produce.
-
-    The late-global entry is pinned at k = DEFAULT_LATE_GLOBAL_BLOCKS and other
-    k derive from it, so the startup assertion stays live for every k instead
-    of being skipped whenever k is not the default.
-    """
-
-    tensors, parameters = EXPECTED_TRAINABLE_SETS[freeze_mode]
-    if freeze_mode != "temporal_tracking_late_global":
-        return tensors, parameters
-    per_block_tensors, per_block_parameters = LATE_GLOBAL_PER_BLOCK
-    delta = late_global_blocks - DEFAULT_LATE_GLOBAL_BLOCKS
-    return (
-        tensors + per_block_tensors * delta,
-        parameters + per_block_parameters * delta,
-    )
+# The runtime helpers and the freeze-mask constants live in arc.training.runtime
+# so a second driver shares them rather than copying them; a copy is how the
+# guards below stop being guards. They are imported under this module's own
+# private names so `main` is unchanged by the move -- and so the tests that
+# monkeypatch them on this module keep working, since these are module globals
+# exactly as the definitions were.
+from arc.training.runtime import (  # noqa: E402
+    DEFAULT_LATE_GLOBAL_BLOCKS,
+    EXPECTED_TRAINABLE_SETS,
+    LATE_GLOBAL_PER_BLOCK,
+    MAX_LATE_GLOBAL_BLOCKS,
+    TIME_EMBEDDING_DIM,
+    TIME_EMBEDDING_KEY,
+    assert_frozen_gradients_absent as _assert_frozen_gradients_absent,
+    assert_trainable_gradients_finite as _assert_trainable_gradients_finite,
+    autocast_context as _autocast_context,
+    build_optimizer,
+    confidence_gradient_norms as _confidence_gradient_norms,
+    confidence_stats as _confidence_stats,
+    expected_trainable_set as _expected_trainable_set,
+    gradient_norm as _gradient_norm,
+    move_views_to_cuda as _move_views_to_cuda,
+    shuffled_index_views as _shuffled_index_views,
+    tracking_only as _tracking_only,
+)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -551,89 +535,6 @@ def _print_parse_report(scene) -> None:
     print("PASS mvtracker dump parsing")
 
 
-def _autocast_context(precision: str):
-    if precision == "32":
-        return nullcontext()
-    dtype = torch.float16 if precision == "16-mixed" else torch.bfloat16
-    return torch.autocast(device_type="cuda", dtype=dtype)
-
-
-def _gradient_norm(parameters) -> float:
-    squared_norm = torch.zeros((), device="cuda", dtype=torch.float32)
-    found = False
-    for parameter in parameters:
-        if parameter.grad is None:
-            continue
-        found = True
-        squared_norm += parameter.grad.detach().float().square().sum()
-    return float(torch.sqrt(squared_norm).item()) if found else 0.0
-
-
-def _assert_frozen_gradients_absent(model) -> None:
-    offenders = [
-        name
-        for name, parameter in model.named_parameters()
-        if not parameter.requires_grad and parameter.grad is not None
-    ]
-    if offenders:
-        raise RuntimeError(
-            "Frozen parameters received gradients: " + ", ".join(offenders[:10])
-        )
-
-
-def _assert_trainable_gradients_finite(model) -> None:
-    missing = []
-    non_finite = []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if parameter.grad is None:
-            missing.append(name)
-        elif not torch.isfinite(parameter.grad).all():
-            non_finite.append(name)
-    if missing or non_finite:
-        details = []
-        if missing:
-            details.append(f"missing gradients: {missing[:10]}")
-        if non_finite:
-            details.append(f"non-finite gradients: {non_finite[:10]}")
-        raise RuntimeError("Invalid trainable gradients; " + "; ".join(details))
-
-
-def _move_views_to_cuda(views: list[dict]) -> None:
-    for view in views:
-        for key in ("img", "time_index", "track_query_idx"):
-            view[key] = view[key].to("cuda", non_blocking=True)
-
-
-def _shuffled_index_views(scene) -> list[dict] | None:
-    """Views with every non-primary camera's time indices reversed.
-
-    Reversal keeps every index a valid, trained embedding row (in-distribution)
-    while breaking cross-camera synchronization, which is exactly the structure
-    the temporal indices exist to encode.  Each view dict is shallow-copied so
-    the scene's own views keep their true indices.  Returns ``None`` when there
-    is nothing to break: a single camera, or a single time (whose reversal is
-    the identity).
-    """
-
-    time_count = len(scene.times)
-    if len(scene.cameras) < 2 or time_count < 2:
-        return None
-    primary_camera = scene.cameras[0]
-    views = []
-    for observation, view in zip(scene.observations, scene.views):
-        copy = dict(view)
-        if observation.camera != primary_camera:
-            copy["time_index"] = torch.tensor(
-                [time_count - 1 - observation.semantic_time_index],
-                dtype=torch.long,
-                device=view["time_index"].device,
-            )
-        views.append(copy)
-    return views
-
-
 def _measure_temporal_injection(model, views: list[dict], precision: str):
     """Transport of the index signal through the encoder, on the real weights.
 
@@ -662,62 +563,19 @@ def _measure_temporal_injection(model, views: list[dict], precision: str):
 
 
 def _build_optimizer(model, args) -> tuple[torch.optim.AdamW, dict[str, float], list]:
-    """AdamW over named parameter groups with per-group learning rates.
+    """This driver's flags, applied to the shared builder.
 
-    The embedding gets its own group so its rate is a free knob, and unfrozen
-    encoder blocks get a lower default because the frozen geometry heads read
-    the features those blocks produce.  Weight decay stays 0 everywhere: no
-    regularizer is part of this proof, and decoupled decay must not drag the
-    unsupervised confidence output around.
+    The builder takes scalars rather than a Namespace so a driver with a
+    different parser can call it; this wrapper is where *these* flag names are
+    resolved, and it is the only place they appear.
     """
 
-    embedding_parameters = [
-        parameter
-        for parameter in model.backbone.pretrained.time_index_embedding.parameters()
-        if parameter.requires_grad
-    ]
-    head_parameters = [
-        parameter
-        for module in (model.motion_decoder, model.track_head)
-        for parameter in module.parameters()
-        if parameter.requires_grad
-    ]
-    encoder_parameters = [
-        parameter
-        for name, parameter in model.backbone.named_parameters()
-        if parameter.requires_grad and "time_index_embedding" not in name
-    ]
-    learning_rates = {
-        "decoder": args.lr,
-        "embedding": args.lr if args.embedding_lr is None else args.embedding_lr,
-        "encoder_blocks": (
-            args.lr * 0.1 if args.encoder_lr is None else args.encoder_lr
-        ),
-    }
-    groups = [
-        {"params": head_parameters, "lr": learning_rates["decoder"]},
-        {"params": embedding_parameters, "lr": learning_rates["embedding"]},
-    ]
-    if encoder_parameters:
-        groups.append(
-            {"params": encoder_parameters, "lr": learning_rates["encoder_blocks"]}
-        )
-    else:
-        learning_rates["encoder_blocks"] = None
-
-    grouped = sum(parameter.numel() for group in groups for parameter in group["params"])
-    trainable = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
+    return build_optimizer(
+        model,
+        lr=args.lr,
+        embedding_lr=args.embedding_lr,
+        encoder_lr=args.encoder_lr,
     )
-    if grouped != trainable:
-        raise RuntimeError(
-            f"Parameter groups cover {grouped} parameters but {trainable} are "
-            "trainable; a trainable parameter escaped every group"
-        )
-    optimizer = torch.optim.AdamW(groups, weight_decay=0.0)
-    return optimizer, learning_rates, encoder_parameters
 
 
 def _cut_features(feats):
@@ -885,22 +743,6 @@ def _accumulate(total: float | None, value, weight: float) -> float | None:
     return contribution if total is None else total + contribution
 
 
-def _tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
-    """Drop unused reconstruction branches promptly to reduce retained memory.
-
-    ``conf_track_multi`` is kept only when the confidence term needs it, so a
-    position-only run retains exactly what it retained before.
-    """
-
-    kept = {
-        "track_multi": raw_predictions["track_multi"],
-        "track_query_idx": raw_predictions["track_query_idx"],
-    }
-    if keep_confidence:
-        kept["conf_track_multi"] = raw_predictions["conf_track_multi"]
-    return kept
-
-
 def _breakdown_to_floats(breakdown) -> dict[str, float] | None:
     """`compose_tracking_loss` hands back detached tensors; JSON needs floats."""
 
@@ -963,40 +805,6 @@ def _confidence_threshold_line(diagnostics) -> str | None:
     if best["at_grid_edge"]:
         line += "; AT GRID EDGE, so the optimum may lie outside the grid"
     return line
-
-
-def _confidence_gradient_norms(model) -> dict[str, float]:
-    """Attribute the final track conv's gradient to its confidence and xyz rows.
-
-    xyz and confidence come off the same ``Conv2d(_, 4, 1)``: rows 0-2 are the
-    position term's contribution and row 3 is the confidence term's.  Because the
-    confidence term detaches the error, that split is exact -- no second backward
-    pass is needed to attribute it.
-    """
-
-    output_conv = model.track_head.scratch.output_conv2[2]
-    # The split is only meaningful for the 4-channel xyz+conf head. Fail loudly if
-    # the head is ever rebuilt with a different output_dim rather than silently
-    # reporting a norm over the wrong rows.
-    if output_conv.out_channels != 4:
-        raise RuntimeError(
-            "Expected a 4-channel track output conv (3 xyz + 1 confidence), got "
-            f"{output_conv.out_channels}"
-        )
-    norms = {}
-    for label, rows in (
-        ("track_head_output_conv_position_rows", slice(0, 3)),
-        ("track_head_output_conv_confidence_row", slice(3, 4)),
-    ):
-        total = 0.0
-        for parameter in (output_conv.weight, output_conv.bias):
-            if parameter is None or parameter.grad is None:
-                continue
-            total += float(
-                parameter.grad[rows].detach().float().norm().item() ** 2
-            )
-        norms[label] = float(total**0.5)
-    return norms
 
 
 def _exit_criteria_failure(
@@ -1075,32 +883,6 @@ def _exit_criteria_failure(
                 "temporal indices"
             )
     return None
-
-
-def _confidence_stats(raw_predictions) -> dict[str, float] | None:
-    """Summarize the track head's confidence channel.
-
-    Nothing supervises it: ``sparse_tracking_loss`` is a position-only Huber, and
-    xyz and confidence are split off the *same* final conv, so the channel gets a
-    zero gradient while its trunk moves.  ``score_joint.py`` thresholds this
-    confidence absolutely to derive occlusion, which feeds OA and AJ, so an
-    unsupervised mean shift is not harmless.  Log it so drift is attributable.
-    """
-
-    confidence = raw_predictions.get("conf_track_multi")
-    if confidence is None:
-        return None
-    values = confidence.detach().float().flatten()
-    if values.numel() == 0:
-        return None
-    quantiles = torch.tensor([0.05, 0.5, 0.95], device=values.device)
-    p05, p50, p95 = torch.quantile(values, quantiles).tolist()
-    return {
-        "mean": float(values.mean().item()),
-        "p05": float(p05),
-        "p50": float(p50),
-        "p95": float(p95),
-    }
 
 
 def _evaluate(

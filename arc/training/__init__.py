@@ -21,7 +21,9 @@ from .dumped_kubric import (
     DumpedKubricScene,
     ImageTransform,
     Observation,
+    build_scene,
     load_dumped_kubric_scene,
+    scene_from_datapoint,
 )
 from .losses import (
     compose_tracking_loss,
@@ -77,7 +79,9 @@ __all__ = [
     "gather_at_correspondences",
     "gather_query_anchor_points",
     "load_temporal_tracking_checkpoint",
+    "build_scene",
     "load_dumped_kubric_scene",
+    "scene_from_datapoint",
     "read_temporal_patch_metadata",
     "reconstruction_drift_report",
     "reconstruction_shift_report",
