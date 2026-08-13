@@ -14,6 +14,7 @@ from typing import List, Dict, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from .head_act import activate_head
 from .utils import create_uv_grid, position_grid_to_embed
 
@@ -164,16 +165,40 @@ class DPTHead(nn.Module):
         for frames_start_idx in range(0, S, frames_chunk_size):
             frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
 
-            # Process batch of frames
-            if self.feature_only:
+            # Process batch of frames.  During training each chunk is recomputed
+            # in backward rather than retained: without this the loop costs
+            # exactly as much as processing all S frames at once, because every
+            # chunk's activations stay alive until the concatenation below.
+            # Gated on self.training like the model's other two checkpoints
+            # (vision_transformer.py:476, motiondecoder.py:154), and the head has
+            # no dropout, norm statistics or RNG, so train and eval differ only
+            # in whether the recomputation happens.
+            #
+            # The bounds are passed as checkpoint arguments and the target is the
+            # bound method, so nothing closes over a loop variable.  Non-reentrant
+            # recomputation runs during backward, after this loop has finished; a
+            # closure would recompute every chunk with the final chunk's bounds
+            # and silently corrupt the gradients, which is what `ce12837` fixed in
+            # the MotionDecoder.
+            if self.training:
+                chunk_output = checkpoint(
+                    self._forward_impl,
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx,
+                    frames_end_idx,
+                    use_reentrant=False,
+                )
+            else:
                 chunk_output = self._forward_impl(
                     aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
                 )
+
+            if self.feature_only:
                 all_preds.append(chunk_output)
             else:
-                chunk_preds, chunk_conf = self._forward_impl(
-                    aggregated_tokens_list, images, patch_start_idx, frames_start_idx, frames_end_idx
-                )
+                chunk_preds, chunk_conf = chunk_output
                 all_preds.append(chunk_preds)
                 all_conf.append(chunk_conf)
 
