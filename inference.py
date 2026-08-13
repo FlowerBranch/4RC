@@ -72,6 +72,21 @@ def select_input_frames(paths, time_indices=None, *, is_video=False, max_frames=
             max_frames,
             dtype=int,
         )
+        # Refuse on "the selection is not the identity" rather than on which
+        # branch fired. Dropping frames rearranges a deliberate (camera, time)
+        # grid; duplicating them is worse, because repeated time values are how
+        # this flag encodes synchronized observations, so a short video would
+        # manufacture synchronization that the footage does not contain. Both
+        # pass every downstream check -- attach_frame_metadata re-verifies 1:1
+        # after subsampling -- so the run would look clean either way.
+        if time_indices is not None and list(selected_indices) != list(range(len(paths))):
+            raise ValueError(
+                "--time_indices describes a deliberate camera/time grid, and "
+                f"selecting {max_frames} of {len(paths)} input frames would "
+                "silently drop or duplicate its entries: raise --max_frames to "
+                f"{len(paths)}, or extract the frames to a directory and pass "
+                "exactly the subset you want"
+            )
         paths = [paths[index] for index in selected_indices]
         if time_indices is not None:
             time_indices = [time_indices[index] for index in selected_indices]
@@ -147,9 +162,22 @@ def build_arg_parser():
         nargs="+",
         default=None,
         help=(
-            "One semantic time index per collected input frame, before any 30-frame "
-            "subsampling. Repeated values mark synchronized observations and must not "
-            "encode camera identity."
+            "One semantic time index per collected input frame, before any "
+            "subsampling to --max_frames. Repeated values mark synchronized "
+            "observations and must not encode camera identity. Supplying these "
+            "makes the frame count exact: any selection that would drop or "
+            "duplicate a frame is refused rather than applied."
+        ),
+    )
+    parser.add_argument(
+        "--max_frames",
+        type=int,
+        default=30,
+        help=(
+            "Cap on the number of collected input frames. Above it the input is "
+            "resampled to exactly this many frames, which for a video also fires "
+            "below the cap and duplicates frames. Raise it to the input count to "
+            "keep a full (camera, time) grid; --time_indices requires that."
         ),
     )
     parser.add_argument(
@@ -170,6 +198,9 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    if args.max_frames <= 0:
+        parser.error("--max_frames must be positive")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     paths, is_video = collect_images(args.input)
@@ -178,6 +209,7 @@ def main():
             paths,
             args.time_indices,
             is_video=is_video,
+            max_frames=args.max_frames,
         )
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))

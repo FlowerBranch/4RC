@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -418,18 +419,184 @@ def test_inference_time_validation_errors_are_clear():
         )
 
 
-def test_input_paths_and_time_metadata_are_subsampled_in_lockstep():
-    paths = [f"frame_{index:03d}.png" for index in range(41)]
-    semantic_times = list(range(41))
-    expected_positions = np.linspace(0, 40, 30, dtype=int)
+def test_a_deliberate_grid_is_refused_rather_than_subsampled():
+    """Lockstep resampling of --time_indices used to be the behaviour here.
+
+    It kept paths and indices consistent with each other, so nothing downstream
+    complained -- but the grid the caller asked to be scored on was not the grid
+    that got scored, and it was still labelled as the original.
+    """
+
+    paths = [f"frame_{index:03d}.png" for index in range(48)]
+    semantic_times = list(range(12)) * 4
+
+    with pytest.raises(ValueError, match="--max_frames") as excinfo:
+        inference_cli.select_input_frames(paths, semantic_times)
+
+    message = str(excinfo.value)
+    assert "48" in message
+    assert "30" in message
+
+
+def test_raising_the_cap_keeps_every_frame_and_its_time_index():
+    paths = [f"frame_{index:03d}.png" for index in range(48)]
+    semantic_times = list(range(12)) * 4
 
     selected_paths, selected_times = inference_cli.select_input_frames(
         paths,
         semantic_times,
+        max_frames=96,
+    )
+
+    assert selected_paths == paths
+    assert selected_times == semantic_times
+
+
+def test_paths_without_time_indices_still_subsample_to_the_cap():
+    paths = [f"frame_{index:03d}.png" for index in range(48)]
+    expected_positions = np.linspace(0, 47, 30, dtype=int)
+
+    selected_paths, selected_times = inference_cli.select_input_frames(paths)
+
+    assert selected_paths == [paths[index] for index in expected_positions]
+    assert selected_times is None
+
+
+def test_a_short_video_may_not_manufacture_synchronized_observations():
+    """The duplicate case is the worse one, and it fires below the cap.
+
+    ``np.linspace(0, 3, 30)`` repeats indices, and repeated time values are
+    exactly how --time_indices marks observations as simultaneous.  Carrying
+    them along in lockstep would invent synchronization the footage does not
+    contain, while leaving every 1:1 check downstream satisfied.
+    """
+
+    paths = [f"frame_{index:03d}.png" for index in range(4)]
+
+    with pytest.raises(ValueError, match="drop or duplicate"):
+        inference_cli.select_input_frames(
+            paths,
+            [0, 1, 2, 3],
+            is_video=True,
+        )
+
+
+def test_a_video_selection_that_is_the_identity_stays_legal():
+    """No spurious refusal when linspace is exactly arange.
+
+    A 30-frame video at the default cap selects every frame in order, so the
+    grid survives untouched and there is nothing to refuse.
+    """
+
+    paths = [f"frame_{index:03d}.png" for index in range(30)]
+    semantic_times = list(range(15)) * 2
+
+    selected_paths, selected_times = inference_cli.select_input_frames(
+        paths,
+        semantic_times,
+        is_video=True,
+    )
+
+    assert selected_paths == paths
+    assert selected_times == semantic_times
+
+
+def test_a_video_without_time_indices_is_resampled_as_before():
+    paths = [f"frame_{index:03d}.png" for index in range(12)]
+    expected_positions = np.linspace(0, 11, 30, dtype=int)
+
+    selected_paths, selected_times = inference_cli.select_input_frames(
+        paths,
+        is_video=True,
     )
 
     assert selected_paths == [paths[index] for index in expected_positions]
-    assert selected_times == [semantic_times[index] for index in expected_positions]
+    assert len(selected_paths) == 30
+    assert selected_times is None
+
+
+def test_inference_parser_exposes_the_frame_cap():
+    parser = inference_cli.build_arg_parser()
+
+    default_args = parser.parse_args(["--input", "frames", "--save", "output.npz"])
+    assert default_args.max_frames == 30
+
+    raised_args = parser.parse_args(
+        ["--input", "frames", "--save", "output.npz", "--max_frames", "96"]
+    )
+    assert raised_args.max_frames == 96
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--input", "frames", "--save", "output.npz", "--max_frames", "not-an-integer"]
+        )
+
+
+class _FrameSelectionReached(Exception):
+    """Stops main() at the call under test, before it imports the model stack."""
+
+
+def test_main_forwards_the_frame_cap_to_the_selection(monkeypatch):
+    """The one seam the tests above cannot see.
+
+    Both the parser default and select_input_frames' own default are 30, so a
+    main() that never passed --max_frames through would satisfy every other test
+    in this file while silently ignoring the flag at the values it exists for.
+    """
+
+    recorded = {}
+
+    def fake_collect_images(input_path):
+        return [f"frame_{index:03d}.png" for index in range(48)], False
+
+    def spy_select_input_frames(paths, time_indices=None, *, is_video=False, max_frames=30):
+        recorded["max_frames"] = max_frames
+        raise _FrameSelectionReached
+
+    monkeypatch.setattr(inference_cli, "collect_images", fake_collect_images)
+    monkeypatch.setattr(inference_cli, "select_input_frames", spy_select_input_frames)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference.py",
+            "--input",
+            "frames",
+            "--save",
+            "output.npz",
+            "--max_frames",
+            "96",
+        ],
+    )
+
+    with pytest.raises(_FrameSelectionReached):
+        inference_cli.main()
+
+    assert recorded["max_frames"] == 96
+
+
+def test_main_rejects_a_non_positive_frame_cap(monkeypatch):
+    monkeypatch.setattr(
+        inference_cli,
+        "collect_images",
+        lambda input_path: pytest.fail("a rejected cap must not reach frame collection"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "inference.py",
+            "--input",
+            "frames",
+            "--save",
+            "output.npz",
+            "--max_frames",
+            "0",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        inference_cli.main()
 
 
 def test_time_count_is_checked_before_subsampling_and_after_loading():
