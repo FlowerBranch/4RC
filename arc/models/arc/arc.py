@@ -37,6 +37,7 @@ class Arc(
     TEMPORAL_FREEZE_MODES = (
         "temporal_tracking",
         "temporal_tracking_global_attention",
+        "temporal_tracking_late_global",
     )
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
@@ -59,6 +60,7 @@ class Arc(
     def __init__(
         self,
         freeze="none",
+        late_global_blocks=None,
         motion_decoder_depth=4,
         motion_decoder_has_self_attention=True,
         motion_decoder_has_cross_attention=True,
@@ -114,7 +116,7 @@ class Arc(
             intermediate_layer_idx=[0, 1, 2, 3],
         )
 
-        self.set_freeze(freeze)
+        self.set_freeze(freeze, late_global_blocks=late_global_blocks)
 
     def _preprocess_input(self, views):
         images = torch.stack([view["img"] for view in views], dim=1)
@@ -279,12 +281,75 @@ class Arc(
 
         return output_list
 
-    def set_freeze(self, freeze):
+    def _global_attention_block_indices(self, freeze):
+        """Encoder block indices that attend across frames, low to high.
+
+        Both encoder-training presets select from this list, so the rule --
+        i >= alt_start and odd i, exactly the routing the forward pass uses --
+        is stated once. Attribute access is deliberately unguarded: a backbone
+        without `blocks`/`alt_start` must fail loudly here rather than silently
+        train nothing extra.
+        """
+
+        encoder = self.backbone.pretrained
+        if encoder.alt_start == -1:
+            raise ValueError(
+                f"Freeze mode '{freeze}' requires an encoder with alternating "
+                "attention (alt_start != -1)"
+            )
+        return [
+            index
+            for index in range(encoder.alt_start, len(encoder.blocks))
+            if index % 2 == 1
+        ]
+
+    def set_freeze(self, freeze, *, late_global_blocks=None):
         supported_modes = {"none", *self.TEMPORAL_FREEZE_MODES}
         if freeze not in supported_modes:
             raise ValueError(
                 f"Unknown freeze mode '{freeze}'. Expected one of {sorted(supported_modes)}"
             )
+
+        # Every rejectable argument is rejected here, before the first
+        # requires_grad_ call, so a bad k leaves the model exactly as it was
+        # rather than half-frozen under a mode that never took effect.
+        if freeze != "temporal_tracking_late_global" and late_global_blocks is not None:
+            raise ValueError(
+                "late_global_blocks is only meaningful for freeze mode "
+                f"'temporal_tracking_late_global'; got mode {freeze!r}"
+            )
+        unfrozen_block_indices = ()
+        if freeze == "temporal_tracking_global_attention":
+            # Cross-view fusion can only be learned in the blocks that attend
+            # across frames, so this mode adds exactly the global-attention
+            # blocks and leaves the interleaved local blocks frozen.
+            unfrozen_block_indices = self._global_attention_block_indices(freeze)
+        elif freeze == "temporal_tracking_late_global":
+            # The middle rung: the same fusion argument, but confined to the
+            # last k global-attention blocks so the earlier ones keep producing
+            # the features the frozen geometry heads were trained against.
+            # There is deliberately no default k -- a silent one would let a
+            # k=8 intent produce a k=4 mask, and the patch written from it would
+            # then load cleanly as something it is not.
+            if late_global_blocks is None:
+                raise ValueError(
+                    "Freeze mode 'temporal_tracking_late_global' requires "
+                    "late_global_blocks=K, the number of trailing "
+                    "global-attention blocks to unfreeze"
+                )
+            if isinstance(late_global_blocks, bool) or not isinstance(
+                late_global_blocks, int
+            ):
+                raise TypeError("late_global_blocks must be a positive integer")
+            if late_global_blocks < 1:
+                raise ValueError("late_global_blocks must be a positive integer")
+            available = self._global_attention_block_indices(freeze)
+            if late_global_blocks > len(available):
+                raise ValueError(
+                    f"late_global_blocks={late_global_blocks} exceeds the "
+                    f"{len(available)} global-attention blocks this encoder has"
+                )
+            unfrozen_block_indices = available[-late_global_blocks:]
 
         self.requires_grad_(True)
         if freeze in self.TEMPORAL_FREEZE_MODES:
@@ -292,24 +357,16 @@ class Arc(
             self.backbone.pretrained.time_index_embedding.requires_grad_(True)
             self.motion_decoder.requires_grad_(True)
             self.track_head.requires_grad_(True)
-        if freeze == "temporal_tracking_global_attention":
-            # Cross-view fusion can only be learned in the blocks that attend
-            # across frames, so this mode adds exactly the global-attention
-            # blocks (i >= alt_start, odd i) and leaves the interleaved local
-            # blocks frozen. Attribute access is deliberately unguarded: a
-            # backbone without `blocks`/`alt_start` must fail loudly here
-            # rather than silently train nothing extra.
-            encoder = self.backbone.pretrained
-            if encoder.alt_start == -1:
-                raise ValueError(
-                    "Freeze mode 'temporal_tracking_global_attention' requires "
-                    "an encoder with alternating attention (alt_start != -1)"
-                )
-            for index in range(encoder.alt_start, len(encoder.blocks)):
-                if index % 2 == 1:
-                    encoder.blocks[index].requires_grad_(True)
+        for index in unfrozen_block_indices:
+            self.backbone.pretrained.blocks[index].requires_grad_(True)
 
         self.freeze = freeze
+        # Set for every mode, not just the late one, so re-freezing to a
+        # narrower preset cannot leave a stale k behind for the checkpoint
+        # round trip to record.
+        self.late_global_blocks = (
+            late_global_blocks if freeze == "temporal_tracking_late_global" else None
+        )
 
     def get_trainable_parameter_report(self):
         parameters = [

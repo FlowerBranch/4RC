@@ -253,12 +253,21 @@ def main():
 
         # set_freeze first, to the mode recorded in the patch: the loader
         # requires the match and keys the expected parameter set off
-        # requires_grad.
-        model.set_freeze(patch_metadata["freeze_mode"])
+        # requires_grad. The recorded block count comes with it, since the
+        # late-global mode's name does not by itself fix that set.
+        model.set_freeze(
+            patch_metadata["freeze_mode"],
+            late_global_blocks=patch_metadata["late_global_blocks"],
+        )
         load_temporal_tracking_checkpoint(model, args.temporal_patch)
+        late_global_note = (
+            ""
+            if patch_metadata["late_global_blocks"] is None
+            else f", late_global_blocks {patch_metadata['late_global_blocks']}"
+        )
         print(
             f"Loaded temporal-tracking patch: {args.temporal_patch} "
-            f"(freeze mode {patch_metadata['freeze_mode']})"
+            f"(freeze mode {patch_metadata['freeze_mode']}{late_global_note})"
         )
     elif TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
         print(

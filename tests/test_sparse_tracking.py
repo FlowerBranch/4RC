@@ -1765,6 +1765,25 @@ def test_run_summary_fields_are_only_ever_added_to():
         "initial_confidence_dropped",
         "final_confidence_dropped",
     } <= written
+    # The freeze mask a run actually trained under: the mode name alone does
+    # not fix it, and gpu_name is what makes a mixed-hardware comparison
+    # detectable in the archive rather than being read as a result.
+    assert {"late_global_blocks", "gpu_name"} <= written
+    assert {
+        "holdout_fraction",
+        "holdout_band_count",
+        "holdout_band_offset",
+        "holdout_gutter_m",
+        "holdout_split",
+        "supervised_row_count",
+        "held_out_row_count",
+        "baseline_held_out_position_loss",
+        "initial_held_out_position_loss",
+        "final_held_out_position_loss",
+        "baseline_held_out_metric_error_m",
+        "initial_held_out_metric_error_m",
+        "final_held_out_metric_error_m",
+    } <= written
 
 
 def test_confidence_gradient_norms_split_the_shared_output_conv():
@@ -1997,6 +2016,400 @@ def test_the_loss_modules_introduce_no_trainable_parameters():
             assert not isinstance(attribute, nn.Parameter), name
 
 
+def _banded_scene(query_x, motion=None, times=(0, 1)):
+    """A scene carrying only what the region split reads.
+
+    One trajectory per entry in ``query_x``, placed along world x at its query
+    time. ``motion`` optionally displaces each trajectory along x at every time
+    after the first, which is how a boundary-crossing mover is expressed.
+    """
+
+    count = len(query_x)
+    frame_count = max(times) + 1
+    positions = np.zeros((frame_count, count, 3), dtype=np.float64)
+    drift = np.zeros(count) if motion is None else np.asarray(motion, dtype=np.float64)
+    for frame in range(frame_count):
+        positions[frame, :, 0] = np.asarray(query_x, dtype=np.float64) + drift * frame
+    # Query time 0 for every trajectory, so query_points[:, 1:] is positions[0].
+    query_points = np.zeros((count, 4), dtype=np.float64)
+    query_points[:, 1:] = positions[0]
+    return SimpleNamespace(
+        times=tuple(times),
+        query_points=torch.from_numpy(query_points),
+        trajectories_world=torch.from_numpy(positions),
+    )
+
+
+def _banded_correspondences(count, query_slots=None):
+    index = torch.arange(count, dtype=torch.long)
+    return SparseCorrespondences(
+        trajectory_indices=index,
+        query_slots=(
+            torch.zeros(count, dtype=torch.long)
+            if query_slots is None
+            else torch.as_tensor(query_slots, dtype=torch.long)
+        ),
+        query_times=torch.zeros(count, dtype=torch.long),
+        rows=index,
+        columns=index,
+    )
+
+
+def _band_centre_scene(band_count=16, motion=None, per_band=1):
+    """``per_band`` trajectories spread across each of ``band_count`` 1 m bands.
+
+    Band width is ``(max - min) / band_count`` over the *query points*, so the
+    two anchors at 0 and ``band_count`` are what make the bands exactly 1 m and
+    aligned to integers. Without them the extent would be measured centre to
+    centre and every band edge would land mid-gap.
+
+    ``per_band > 1`` places points at evenly spaced offsets within each band, so
+    their distances to a held-out band edge take several distinct values -- which
+    is what lets a widening gutter be observed swallowing them one shell at a
+    time instead of all at once.
+    """
+
+    offsets = [(index + 0.5) / per_band for index in range(per_band)]
+    query_x = (
+        [0.0]
+        + [band + offset for band in range(band_count) for offset in offsets]
+        + [float(band_count)]
+    )
+    drift = None if motion is None else [0.0] + list(motion) + [0.0]
+    return (
+        _banded_scene(query_x, motion=drift),
+        _banded_correspondences(len(query_x)),
+    )
+
+
+def test_select_rows_keeps_scene_level_query_slots():
+    """The held-out subset must stay addressable against the scene's anchors.
+
+    select_query_slot rebases query_slots to 0 for a single-query head pass;
+    doing that here would make gather_query_anchor_points read anchor 0's
+    pointmaps for another anchor's pixels without complaining.
+    """
+
+    correspondences = _banded_correspondences(4, query_slots=[0, 1, 1, 0])
+    mask = torch.tensor([True, False, True, False])
+
+    kept = correspondences.select_rows(mask)
+    assert kept.count == 2
+    assert kept.query_slots.tolist() == [0, 1]
+    assert kept.trajectory_indices.tolist() == [0, 2]
+    # The contrast that makes the method necessary.
+    assert correspondences.select_query_slot(1).query_slots.tolist() == [0, 0]
+
+    for bad, match in (
+        (torch.tensor([1, 0, 1, 0]), "must be boolean"),
+        (torch.tensor([True, False]), "covers 2 rows"),
+        (torch.ones(2, 2, dtype=torch.bool), "one-dimensional"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            correspondences.select_rows(bad)
+
+
+def test_region_split_partitions_every_row_exactly_once():
+    scene, correspondences = _band_centre_scene()
+
+    split = sparse_module.split_correspondences_by_region(
+        scene,
+        correspondences,
+        holdout_fraction=0.25,
+        band_count=16,
+        gutter_m=0.1,
+        min_held_out_rows=1,
+    )
+
+    supervised = split.supervised_rows
+    held_out = split.held_out_rows
+    assert not bool((supervised & held_out).any())
+    report = split.report
+    total = (
+        report["supervised_row_count"]
+        + report["held_out_row_count"]
+        + report["gutter_row_count"]
+    )
+    assert total == correspondences.count
+    # period 4 over 16 bands holds out bands 0, 4, 8 and 12. Band 0 holds both
+    # the lower extent anchor at x=0 and the centre at x=0.5, so five rows.
+    assert report["held_out_band_indices"] == [0, 4, 8, 12]
+    assert report["held_out_row_count"] == 5
+    assert split.held_out.trajectory_indices.tolist() == [0, 1, 5, 9, 13]
+    assert report["gutter_row_count"] == 0
+    # No trajectory straddles: one row per trajectory, banded per trajectory.
+    assert (
+        report["held_out_trajectory_count"] + report["supervised_trajectory_count"]
+        == report["held_out_row_count"] + report["supervised_row_count"]
+    )
+
+
+def test_region_split_binds_bands_at_query_time_not_across_the_window():
+    """A trajectory that crosses a band boundary mid-window stays supervised.
+
+    Binding membership to every selected time would drop every fast mover into
+    the gutter, stripping exactly the hard trajectories out of the *supervised*
+    set -- that biases what the model trains on, not just what it is scored on.
+    """
+
+    # Neighbouring trajectories drift four bands in opposite directions over one
+    # step, so every one of them changes band -- and they cross each other.
+    motion = [4.0 if index % 2 == 0 else -4.0 for index in range(16)]
+    scene, correspondences = _band_centre_scene(motion=motion)
+
+    split = sparse_module.split_correspondences_by_region(
+        scene,
+        correspondences,
+        holdout_fraction=0.25,
+        band_count=16,
+        gutter_m=0.1,
+        min_held_out_rows=1,
+    )
+
+    # Identical to the static split: membership is read at query time only.
+    assert split.report["gutter_row_count"] == 0
+    assert split.report["supervised_row_count"] == 13
+    assert split.report["held_out_row_count"] == 5
+    # The window figure is reported but deliberately not enforced -- rows that
+    # are separated as queries are free to approach each other later, and here
+    # the crossing movers do exactly that.
+    assert (
+        split.report["min_window_separation_m"]
+        < split.report["min_query_time_separation_m"]
+    )
+
+
+def test_region_split_gutter_guarantees_metric_separation():
+    # Three points per band, so their distances to a held-out edge take three
+    # distinct values and a widening gutter swallows them one shell at a time.
+    scene, correspondences = _band_centre_scene(per_band=3)
+
+    observed = []
+    previous_gutter_rows = -1
+    for gutter_m in (0.0, 0.1, 0.2, 0.6):
+        split = sparse_module.split_correspondences_by_region(
+            scene,
+            correspondences,
+            holdout_fraction=0.25,
+            band_count=16,
+            gutter_m=gutter_m,
+            min_held_out_rows=1,
+        )
+        assert split.report["min_query_time_separation_m"] >= gutter_m
+        # Widening the gutter can only move rows out of the supervised set.
+        assert split.report["gutter_row_count"] >= previous_gutter_rows
+        previous_gutter_rows = split.report["gutter_row_count"]
+        observed.append(previous_gutter_rows)
+
+    # Seven supervised bands touch a held-out one; each loses its innermost
+    # point at 0.2 m and its middle point as well at 0.6 m.
+    assert observed == [0, 0, 7, 14]
+
+
+def test_region_split_is_deterministic_and_offset_shifts_the_regions():
+    scene, correspondences = _band_centre_scene()
+    kwargs = dict(
+        holdout_fraction=0.25, band_count=16, gutter_m=0.1, min_held_out_rows=1
+    )
+
+    first = sparse_module.split_correspondences_by_region(
+        scene, correspondences, **kwargs
+    )
+    again = sparse_module.split_correspondences_by_region(
+        scene, correspondences, **kwargs
+    )
+    assert torch.equal(first.held_out_rows, again.held_out_rows)
+    assert torch.equal(first.supervised_rows, again.supervised_rows)
+
+    shifted = sparse_module.split_correspondences_by_region(
+        scene, correspondences, band_offset=1, **kwargs
+    )
+    assert shifted.report["held_out_band_indices"] == [3, 7, 11, 15]
+    assert not torch.equal(first.held_out_rows, shifted.held_out_rows)
+    # Band 15 holds both the x=15.5 centre and the upper extent anchor.
+    assert shifted.report["held_out_row_count"] == 5
+
+
+def test_region_split_disabled_at_fraction_zero():
+    scene, correspondences = _band_centre_scene()
+
+    split = sparse_module.split_correspondences_by_region(
+        scene,
+        correspondences,
+        holdout_fraction=0.0,
+    )
+
+    assert split.report["enabled"] is False
+    assert split.held_out.count == 0
+    assert split.supervised is correspondences
+    assert bool(split.supervised_rows.all())
+    assert not bool(split.held_out_rows.any())
+    # The minimum-rows floor must not fire when the split is off.
+    assert split.report["held_out_row_count"] == 0
+
+
+def test_region_split_fails_loudly_on_too_few_held_out_rows():
+    """A degeneracy floor, not a decision floor.
+
+    It exists so a held-out number is never computed from a handful of points.
+    Deliberately not a flag: a knob that lowers the floor is a knob for making
+    this failure quiet.
+    """
+
+    scene, correspondences = _band_centre_scene()
+
+    with pytest.raises(RuntimeError, match="held out only 5 rows"):
+        sparse_module.split_correspondences_by_region(
+            scene,
+            correspondences,
+            holdout_fraction=0.25,
+            band_count=16,
+            gutter_m=0.1,
+            min_held_out_rows=32,
+        )
+
+    # A gutter wide enough to swallow every supervised row is the other way the
+    # split degenerates, and it names the supervised side instead.
+    with pytest.raises(RuntimeError, match="no supervised correspondences"):
+        sparse_module.split_correspondences_by_region(
+            scene,
+            correspondences,
+            holdout_fraction=0.25,
+            band_count=16,
+            gutter_m=100.0,
+            min_held_out_rows=1,
+        )
+
+
+def test_region_split_refuses_a_gutter_that_eats_the_supervised_set():
+    """A fixed metric gutter against a short split axis is the silent failure.
+
+    band_width is extent/band_count, so a 0.10 m gutter is nothing on a 6 m
+    scene and most of a band on a 2 m one. Left unguarded it shrinks *and*
+    biases the training set -- the very thing the query-time binding exists to
+    avoid -- while every other figure in the report still looks healthy.
+    """
+
+    scene, correspondences = _band_centre_scene(per_band=3)
+
+    with pytest.raises(RuntimeError, match="above the 33% ceiling") as excinfo:
+        sparse_module.split_correspondences_by_region(
+            scene,
+            correspondences,
+            holdout_fraction=0.25,
+            band_count=16,
+            gutter_m=0.9,
+            min_held_out_rows=1,
+        )
+    message = str(excinfo.value)
+    # Every count it took to reach the verdict, plus the two lengths whose
+    # ratio caused it.
+    assert "21 of 50 rows" in message
+    assert "16 supervised" in message and "13 held out" in message
+    assert "0.900 m gutter" in message and "1.000 m band" in message
+    assert "--holdout_band_count" in message
+
+    # A short split axis reaches the same ceiling at the default gutter: the
+    # same 16 bands over 2 m are 0.125 m wide.
+    short_scene = _banded_scene([index * 2.0 / 49 for index in range(50)])
+    with pytest.raises(RuntimeError, match="above the 33% ceiling"):
+        sparse_module.split_correspondences_by_region(
+            short_scene,
+            _banded_correspondences(50),
+            holdout_fraction=0.25,
+            band_count=16,
+            gutter_m=0.10,
+            min_held_out_rows=1,
+        )
+
+
+def test_region_split_report_has_one_shape_whether_or_not_it_ran():
+    """The report goes verbatim into run_summary.json.
+
+    The split is off by default, so most archived runs take the disabled
+    branch; a collection script reading a geometry field must get None from
+    those, not a KeyError.
+    """
+
+    scene, correspondences = _band_centre_scene()
+    enabled = sparse_module.split_correspondences_by_region(
+        scene,
+        correspondences,
+        holdout_fraction=0.25,
+        band_count=16,
+        gutter_m=0.1,
+        min_held_out_rows=1,
+    ).report
+    disabled = sparse_module.split_correspondences_by_region(
+        scene,
+        correspondences,
+        holdout_fraction=0.0,
+    ).report
+
+    assert set(enabled) == set(disabled)
+    assert disabled["enabled"] is False and enabled["enabled"] is True
+    # Counts that are known without splitting stay real numbers; everything
+    # that describes a split that never happened is None.
+    assert disabled["supervised_row_count"] == correspondences.count
+    assert disabled["held_out_row_count"] == 0
+    assert disabled["gutter_row_count"] == 0
+    assert disabled["realized_held_out_fraction"] == 0.0
+    for key in (
+        "axis",
+        "axis_extent_m",
+        "band_count",
+        "band_width_m",
+        "period",
+        "band_offset",
+        "gutter_m",
+        "held_out_band_indices",
+        "supervised_trajectory_count",
+        "held_out_trajectory_count",
+        "min_query_time_separation_m",
+        "min_window_separation_m",
+        "per_anchor_held_out_counts",
+    ):
+        assert disabled[key] is None, key
+        assert enabled[key] is not None, key
+    # Both survive the trip the summary actually takes.
+    for report in (enabled, disabled):
+        assert json.loads(json.dumps(report)).keys() == report.keys()
+
+
+def test_region_split_rejects_a_band_count_below_its_own_period():
+    scene, correspondences = _band_centre_scene()
+
+    with pytest.raises(ValueError, match="below the period"):
+        sparse_module.split_correspondences_by_region(
+            scene,
+            correspondences,
+            holdout_fraction=0.1,
+            band_count=4,
+        )
+
+
+def _empty_correspondences():
+    empty = torch.zeros(0, dtype=torch.long)
+    return SparseCorrespondences(
+        trajectory_indices=empty,
+        query_slots=empty,
+        query_times=empty,
+        rows=empty,
+        columns=empty,
+    )
+
+
+def _held_out_correspondences(count=2):
+    index = torch.arange(count, dtype=torch.long)
+    return SparseCorrespondences(
+        trajectory_indices=index,
+        query_slots=torch.zeros(count, dtype=torch.long),
+        query_times=torch.zeros(count, dtype=torch.long),
+        rows=index,
+        columns=index,
+    )
+
+
 def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch):
     """The gated number must reuse the initial alignment and anchors.
 
@@ -2072,6 +2485,8 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
         initial_anchors,
         sync_metric_scale=1.0,
         shuffled_views=None,
+        held_out_correspondences=_empty_correspondences(),
+        initial_held_out_anchors=torch.zeros(0, 3),
     )
 
     assert len(calls) == 2
@@ -2081,6 +2496,94 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
     assert evaluation["loss_refit"] == pytest.approx(0.25)
     assert evaluation["loss"] == pytest.approx(0.75)
     assert evaluation["confidence"]["mean"] == pytest.approx(3.0)
+    # An empty held-out set adds no call and reports nothing.
+    assert evaluation["loss_held_out"] is None
+    assert evaluation["metric_error_held_out_m"] is None
+
+
+def test_evaluate_scores_the_held_out_rows_against_the_initial_references():
+    """The held-out number must never be scored against a refit.
+
+    A refit absorbs a global transform of the whole track field, which is
+    precisely the failure a held-out score is being read to rule out; scoring it
+    that way would report a clean number for a model that had moved everything.
+    """
+
+    initial_alignment = _identity_alignment()
+    initial_anchors = torch.full((3, 3), 7.0)
+    refit_alignment = _identity_alignment()
+    refit_anchors = torch.full((3, 3), -1.0)
+    held_out_anchors = torch.full((2, 3), 11.0)
+    held_out = _held_out_correspondences()
+
+    calls = []
+
+    def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
+        calls.append((correspondences, alignment, anchors))
+        return SparseTrackingLossResult(
+            loss=torch.tensor(0.5),
+            metric_error=torch.tensor(1.5),
+            sample_count=0,
+        )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(overfit_cli, "sparse_tracking_loss", fake_loss)
+        monkeypatch.setattr(
+            overfit_cli,
+            "fit_scene_sim3",
+            lambda raw, scene: (refit_alignment, {"pair_count": 1}),
+        )
+        monkeypatch.setattr(
+            overfit_cli,
+            "gather_query_anchor_points",
+            lambda raw, scene, correspondences: refit_anchors,
+        )
+        monkeypatch.setattr(
+            overfit_cli,
+            "_tracking_only",
+            lambda raw, keep_confidence=False: raw,
+        )
+        monkeypatch.setattr(
+            overfit_cli, "synchronized_consistency_stats", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            overfit_cli, "reconstruction_drift_report", lambda *a, **k: None
+        )
+
+        class _StubModel:
+            def eval(self):
+                return self
+
+            def __call__(self, views, **kwargs):
+                return {
+                    "conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0),
+                    "track_multi": torch.zeros(1, 1, 2, 2, 2, 3),
+                }
+
+        evaluation = overfit_cli._evaluate(
+            _StubModel(),
+            SimpleNamespace(
+                views=[], slot_time_indices=torch.zeros(0, dtype=torch.long)
+            ),
+            object(),
+            "32",
+            0.05,
+            initial_alignment,
+            initial_anchors,
+            sync_metric_scale=1.0,
+            shuffled_views=None,
+            held_out_correspondences=held_out,
+            initial_held_out_anchors=held_out_anchors,
+        )
+
+    # refit, like-for-like, held-out -- the held-out call comes third and reads
+    # the initial alignment and the held-out anchors, not the refit ones.
+    assert len(calls) == 3
+    assert calls[2][0] is held_out
+    assert calls[2][1] is initial_alignment
+    assert calls[2][2] is held_out_anchors
+    assert evaluation["loss_held_out"] == pytest.approx(0.5)
+    assert evaluation["metric_error_held_out_m"] == pytest.approx(1.5)
 
 
 def test_parse_only_main_needs_neither_cuda_nor_checkpoint(
@@ -3658,9 +4161,12 @@ def test_evaluate_scores_the_shuffled_arm_against_the_initial_references(
         initial_anchors,
         sync_metric_scale=1.0,
         shuffled_views=shuffled_views,
+        held_out_correspondences=_empty_correspondences(),
+        initial_held_out_anchors=torch.zeros(0, 3),
     )
 
-    # refit, like-for-like, then the shuffled arm.
+    # refit, like-for-like, then the shuffled arm. An empty held-out set adds
+    # no call, so the shuffled arm keeps its position.
     assert len(calls) == 3
     assert calls[1][0] is initial_alignment and calls[1][1] is initial_anchors
     assert calls[2][0] is initial_alignment and calls[2][1] is initial_anchors
@@ -3688,6 +4194,14 @@ def test_new_training_flags_default_to_the_archived_behaviour():
     assert args.embedding_lr is None
     assert args.encoder_lr is None
     assert args.min_index_advantage == 0.01
+    assert args.late_global_blocks == overfit_cli.DEFAULT_LATE_GLOBAL_BLOCKS == 4
+    # The held-out split is off by default for the same reason --sync_weight and
+    # --confidence_weight are: on by default it would silently change what every
+    # archived command line trains on.
+    assert args.holdout_fraction == 0.0
+    assert args.holdout_band_count == 16
+    assert args.holdout_band_offset == 0
+    assert args.holdout_gutter_m == 0.10
 
     for flag, bad in (
         ("--time_embedding_init_scale", "0"),
@@ -3695,6 +4209,13 @@ def test_new_training_flags_default_to_the_archived_behaviour():
         ("--min_index_advantage", "1.0"),
         ("--embedding_lr", "nan"),
         ("--encoder_lr", "0"),
+        ("--late_global_blocks", "0"),
+        ("--late_global_blocks", "15"),
+        ("--holdout_fraction", "0.9"),
+        ("--holdout_fraction", "-0.1"),
+        ("--holdout_band_count", "1"),
+        ("--holdout_band_offset", "-1"),
+        ("--holdout_gutter_m", "-1"),
     ):
         rejected = parser.parse_args(
             [
@@ -3705,6 +4226,170 @@ def test_new_training_flags_default_to_the_archived_behaviour():
         )
         with pytest.raises(ValueError, match=flag.lstrip("-").replace("-", "_")):
             overfit_cli._validate_args(rejected)
+
+
+def _optimizer_args(lr=1e-5, embedding_lr=None, encoder_lr=None):
+    return SimpleNamespace(lr=lr, embedding_lr=embedding_lr, encoder_lr=encoder_lr)
+
+
+def _optimizer_model(freeze, late_global_blocks=None):
+    from test_time_indexing import _GlobalAttnTinyArc
+
+    return _GlobalAttnTinyArc(
+        freeze=freeze,
+        late_global_blocks=late_global_blocks,
+    )
+
+
+_ENCODER_FREEZE_MODES = (
+    ("temporal_tracking_global_attention", None),
+    ("temporal_tracking_late_global", 1),
+)
+
+
+@pytest.mark.parametrize("freeze,late_global_blocks", _ENCODER_FREEZE_MODES)
+def test_build_optimizer_gives_every_mode_the_same_encoder_rate_rule(
+    freeze,
+    late_global_blocks,
+):
+    """encoder_lr must reach the middle rung exactly as it reaches the full one.
+
+    _build_optimizer selects the encoder group by module membership and a name
+    filter, never by freeze mode or block index, so this holds by construction
+    -- but "by construction" is what silently stops being true under a
+    refactor, and a sweep over encoder_lr is worthless if the flag misses.
+    """
+
+    model = _optimizer_model(freeze, late_global_blocks)
+
+    _, defaulted, encoder_parameters = overfit_cli._build_optimizer(
+        model,
+        _optimizer_args(lr=1e-5),
+    )
+    assert defaulted["decoder"] == 1e-5
+    assert defaulted["embedding"] == 1e-5
+    assert defaulted["encoder_blocks"] == pytest.approx(1e-6)
+    assert encoder_parameters
+
+    optimizer, explicit, _ = overfit_cli._build_optimizer(
+        model,
+        _optimizer_args(lr=1e-5, encoder_lr=3e-6, embedding_lr=2e-5),
+    )
+    assert explicit["encoder_blocks"] == 3e-6
+    assert explicit["embedding"] == 2e-5
+    # The rate reaches the optimizer itself, not just the reported dict.
+    assert sorted(group["lr"] for group in optimizer.param_groups) == [
+        3e-6,
+        1e-5,
+        2e-5,
+    ]
+
+
+def test_build_optimizer_leaves_the_narrow_mode_without_an_encoder_group():
+    """No unfrozen encoder block means no group and no rate to report."""
+
+    model = _optimizer_model("temporal_tracking")
+    optimizer, learning_rates, encoder_parameters = overfit_cli._build_optimizer(
+        model,
+        _optimizer_args(lr=1e-5, encoder_lr=3e-6),
+    )
+    assert encoder_parameters == []
+    assert learning_rates["encoder_blocks"] is None
+    assert len(optimizer.param_groups) == 2
+
+
+def test_build_optimizer_encoder_group_is_the_unfrozen_blocks_only():
+    """The embedding lives in its own group, never in the encoder one."""
+
+    model = _optimizer_model("temporal_tracking_late_global", late_global_blocks=1)
+    _, _, encoder_parameters = overfit_cli._build_optimizer(
+        model,
+        _optimizer_args(),
+    )
+
+    encoder_ids = {id(parameter) for parameter in encoder_parameters}
+    blocks = model.backbone.pretrained.blocks
+    assert encoder_ids == {id(parameter) for parameter in blocks[3].parameters()}
+    embedding = model.backbone.pretrained.time_index_embedding.weight
+    assert id(embedding) not in encoder_ids
+
+
+@pytest.mark.parametrize(
+    "freeze,late_global_blocks",
+    (("temporal_tracking", None), *_ENCODER_FREEZE_MODES),
+)
+def test_build_optimizer_groups_cover_every_trainable_parameter(
+    freeze,
+    late_global_blocks,
+):
+    model = _optimizer_model(freeze, late_global_blocks)
+    optimizer, _, _ = overfit_cli._build_optimizer(model, _optimizer_args())
+
+    grouped = sum(
+        parameter.numel()
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    )
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    assert grouped == trainable
+
+
+def test_build_optimizer_rejects_a_parameter_outside_every_group():
+    """The coverage guard is the only thing standing between a silent typo in
+    the group construction and a run that trains fewer parameters than it
+    reports."""
+
+    model = _optimizer_model("temporal_tracking_late_global", late_global_blocks=1)
+    model.head.requires_grad_(True)
+
+    with pytest.raises(RuntimeError, match="escaped every group"):
+        overfit_cli._build_optimizer(model, _optimizer_args())
+
+
+def test_expected_trainable_set_derives_every_k():
+    """The pinned k=4 entry and the per-block constant must span the range.
+
+    At k=14 the derivation has to land exactly on the independently pinned
+    temporal_tracking_global_attention entry: that is what proves the middle
+    rung and the full preset describe one mask, not two that happen to agree
+    at the default.
+    """
+
+    narrow_tensors, narrow_parameters = overfit_cli.EXPECTED_TRAINABLE_SETS[
+        "temporal_tracking"
+    ]
+    per_block_tensors, per_block_parameters = overfit_cli.LATE_GLOBAL_PER_BLOCK
+
+    for k in range(1, overfit_cli.MAX_LATE_GLOBAL_BLOCKS + 1):
+        assert overfit_cli._expected_trainable_set(
+            "temporal_tracking_late_global", k
+        ) == (
+            narrow_tensors + per_block_tensors * k,
+            narrow_parameters + per_block_parameters * k,
+        )
+
+    assert overfit_cli._expected_trainable_set(
+        "temporal_tracking_late_global",
+        overfit_cli.MAX_LATE_GLOBAL_BLOCKS,
+    ) == overfit_cli.EXPECTED_TRAINABLE_SETS["temporal_tracking_global_attention"]
+
+    # The k-less modes ignore k entirely.
+    for mode in ("temporal_tracking", "temporal_tracking_global_attention"):
+        assert (
+            overfit_cli._expected_trainable_set(mode, None)
+            == overfit_cli.EXPECTED_TRAINABLE_SETS[mode]
+        )
+
+    assert (
+        "temporal_tracking_late_global"
+        in overfit_cli.build_arg_parser()
+        ._option_string_actions["--freeze_mode"]
+        .choices
+    )
 
 
 def test_run_summary_includes_the_baseline_and_control_fields():
@@ -4379,6 +5064,62 @@ def test_query_anchor_parsing_and_defaults():
         args = parser.parse_args(base + flags)
         with pytest.raises(ValueError, match=message):
             overfit_cli._validate_args(args)
+
+
+@pytest.mark.parametrize(
+    "holdout_flags,expected",
+    (
+        ([], "holdout_split=off"),
+        (["--holdout_fraction", "0.25"], "held out only"),
+    ),
+)
+def test_eligibility_only_reports_the_holdout_split_without_a_gpu(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    holdout_flags,
+    expected,
+):
+    """--eligibility_only is where a split is inspected before an allocation.
+
+    --parse_only returns before correspondences exist, so this is the only
+    checkpoint-free path that has them. A scene too small to hold out a usable
+    sample must say so here, on CPU, rather than after a model load.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "overfit_temporal_tracking.py",
+            "--data_root", str(tmp_path),
+            "--scene", "0000",
+            "--cameras", "0", "1",
+            "--times", "0", "1", "2", "3",
+            "--output_dir", str(tmp_path / "out"),
+            "--eligibility_only",
+            *holdout_flags,
+        ],
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: pytest.fail("eligibility-only mode must not inspect CUDA"),
+    )
+
+    if holdout_flags:
+        # Three queries cannot support a held-out score, and the floor says so
+        # with every count it took to decide.
+        with pytest.raises(RuntimeError, match=expected):
+            overfit_cli.main()
+        return
+
+    overfit_cli.main()
+    printed = capsys.readouterr().out
+    assert expected in printed
+    written = json.loads((tmp_path / "out" / "eligibility.json").read_text())
+    assert written["holdout_split"]["enabled"] is False
 
 
 def test_eligibility_only_main_needs_neither_cuda_nor_checkpoint(

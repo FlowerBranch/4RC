@@ -1343,7 +1343,7 @@ class _GlobalAttnTinyBackbone(nn.Module):
 
 
 class _GlobalAttnTinyArc(Arc):
-    def __init__(self, freeze="none", alt_start=1):
+    def __init__(self, freeze="none", alt_start=1, late_global_blocks=None):
         nn.Module.__init__(self)
         self.max_time_indices = 4
         self.backbone = _GlobalAttnTinyBackbone(alt_start=alt_start)
@@ -1351,7 +1351,7 @@ class _GlobalAttnTinyArc(Arc):
         self.cam_dec = nn.Linear(2, 2)
         self.motion_decoder = nn.Linear(2, 2)
         self.track_head = nn.Linear(2, 2)
-        self.set_freeze(freeze)
+        self.set_freeze(freeze, late_global_blocks=late_global_blocks)
 
 
 def test_global_attention_freeze_unfreezes_only_odd_blocks_from_alt_start():
@@ -1439,6 +1439,244 @@ def test_global_attention_freeze_is_exact_on_the_full_model():
     narrowed = model.get_trainable_parameter_report()
     assert narrowed["tensor_count"] == 231
     assert narrowed["parameter_count"] == 314_600_740
+
+
+def test_late_global_freeze_selects_the_last_k_global_blocks():
+    """The middle rung takes the highest-numbered global blocks, not the first.
+
+    The tiny encoder's global blocks are [1, 3], so k=1 must be {3}: unfreezing
+    block 1 instead would leave the last cross-frame block frozen and defeat
+    the point of the preset.
+    """
+
+    model = _GlobalAttnTinyArc(
+        freeze="temporal_tracking_late_global",
+        late_global_blocks=1,
+    )
+    trainable_blocks = {
+        index
+        for index, block in enumerate(model.backbone.pretrained.blocks)
+        if any(parameter.requires_grad for parameter in block.parameters())
+    }
+    assert trainable_blocks == {3}
+    assert model.late_global_blocks == 1
+    assert model.backbone.pretrained.time_index_embedding.weight.requires_grad
+    assert model.motion_decoder.weight.requires_grad
+    assert not model.head.weight.requires_grad
+    assert not model.cam_dec.weight.requires_grad
+
+    model.set_freeze("temporal_tracking_late_global", late_global_blocks=2)
+    assert {
+        index
+        for index, block in enumerate(model.backbone.pretrained.blocks)
+        if any(parameter.requires_grad for parameter in block.parameters())
+    } == {1, 3}
+
+    # Reversible in both directions, and k does not survive the trip.
+    model.set_freeze("temporal_tracking")
+    assert not any(
+        parameter.requires_grad
+        for block in model.backbone.pretrained.blocks
+        for parameter in block.parameters()
+    )
+    assert model.late_global_blocks is None
+    model.set_freeze("none")
+    assert all(parameter.requires_grad for parameter in model.parameters())
+
+
+def test_late_global_freeze_requires_alternating_attention():
+    with pytest.raises(ValueError, match="alt_start"):
+        _GlobalAttnTinyArc(
+            freeze="temporal_tracking_late_global",
+            alt_start=-1,
+            late_global_blocks=1,
+        )
+
+
+def test_late_global_freeze_rejects_out_of_range_k():
+    """A k the encoder cannot honour must fail rather than silently clamp."""
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive integer"):
+            _GlobalAttnTinyArc(
+                freeze="temporal_tracking_late_global",
+                late_global_blocks=bad,
+            )
+    # Only two global blocks exist; asking for three names both numbers.
+    with pytest.raises(ValueError, match="exceeds the 2 global-attention"):
+        _GlobalAttnTinyArc(
+            freeze="temporal_tracking_late_global",
+            late_global_blocks=3,
+        )
+    with pytest.raises(TypeError, match="positive integer"):
+        _GlobalAttnTinyArc(
+            freeze="temporal_tracking_late_global",
+            late_global_blocks=True,
+        )
+
+
+def test_late_global_blocks_is_rejected_outside_its_own_mode():
+    """k is meaningless under the other presets, and required under this one.
+
+    There is deliberately no default: a silent k would let a k=2 intent produce
+    a k=1 mask, and the patch saved from it would load cleanly as something it
+    is not.
+    """
+
+    model = _GlobalAttnTinyArc()
+    for mode in ("none", "temporal_tracking", "temporal_tracking_global_attention"):
+        with pytest.raises(ValueError, match="only meaningful"):
+            model.set_freeze(mode, late_global_blocks=1)
+    with pytest.raises(ValueError, match="requires late_global_blocks"):
+        model.set_freeze("temporal_tracking_late_global")
+
+    # A rejected call leaves the model untouched: validation runs before the
+    # first requires_grad_ mutation.
+    model.set_freeze("temporal_tracking_late_global", late_global_blocks=2)
+    before = model.get_trainable_parameter_report()
+    with pytest.raises(ValueError, match="exceeds the 2 global-attention"):
+        model.set_freeze("temporal_tracking_late_global", late_global_blocks=5)
+    assert model.get_trainable_parameter_report() == before
+    assert model.late_global_blocks == 2
+
+
+def test_late_global_freeze_is_exact_on_the_full_model():
+    """Pin the exact trainable set of the middle rung on the real 1.5B Arc.
+
+    The counts are also asserted at runtime by overfit_temporal_tracking.py's
+    _expected_trainable_set; the two must agree.
+    """
+
+    model = _full_meta_arc()
+    model.set_freeze("temporal_tracking_late_global", late_global_blocks=4)
+    report = model.get_trainable_parameter_report()
+
+    encoder = model.backbone.pretrained
+    expected_names = {
+        "backbone.pretrained.time_index_embedding.weight",
+        *{
+            f"motion_decoder.{name}"
+            for name, _ in model.motion_decoder.named_parameters()
+        },
+        *{
+            f"track_head.{name}"
+            for name, _ in model.track_head.named_parameters()
+        },
+        *{
+            f"backbone.pretrained.blocks.{index}.{name}"
+            for index in (33, 35, 37, 39)
+            for name, _ in encoder.blocks[index].named_parameters()
+        },
+    }
+    assert {name for name, _ in report["parameters"]} == expected_names
+    assert report["tensor_count"] == 303
+    assert report["parameter_count"] == 427_948_324
+
+    # Every earlier global block, the local blocks and the frozen heads stay put.
+    for index in (13, 15, 31, 32, 34, 38):
+        assert not any(
+            parameter.requires_grad
+            for parameter in encoder.blocks[index].parameters()
+        )
+    assert not any(parameter.requires_grad for parameter in model.head.parameters())
+    assert not any(
+        parameter.requires_grad for parameter in model.cam_dec.parameters()
+    )
+
+
+def test_late_global_at_full_k_reproduces_the_global_attention_mask():
+    """The two presets must name the same mask where they overlap.
+
+    k=14 is every global block the encoder has, so the middle rung degenerates
+    to the full one. Pinning that continuity is what stops the two masks from
+    drifting apart under a refactor of either.
+    """
+
+    model = _full_meta_arc()
+    model.set_freeze("temporal_tracking_late_global", late_global_blocks=14)
+    late = model.get_trainable_parameter_report()
+    model.set_freeze("temporal_tracking_global_attention")
+    full = model.get_trainable_parameter_report()
+
+    assert {name for name, _ in late["parameters"]} == {
+        name for name, _ in full["parameters"]
+    }
+    assert late["tensor_count"] == full["tensor_count"] == 483
+    assert late["parameter_count"] == full["parameter_count"] == 711_317_284
+
+    with pytest.raises(ValueError, match="exceeds the 14 global-attention"):
+        model.set_freeze("temporal_tracking_late_global", late_global_blocks=15)
+
+
+def test_late_global_mode_backward_reaches_only_the_last_k_blocks():
+    """Training-path guard for the middle rung on a real small encoder.
+
+    Runs the actual DinoVisionTransformer in train mode, so the unfrozen global
+    block goes through torch.utils.checkpoint. The earlier global block must
+    come back with no gradient at all -- that is the whole difference between
+    this preset and the full one, and a checkpointing bug that quietly trained
+    it would otherwise be invisible.
+    """
+
+    torch.manual_seed(0)
+    encoder = DinoVisionTransformer(
+        img_size=28,
+        patch_size=14,
+        embed_dim=8,
+        depth=6,
+        num_heads=2,
+        ffn_layer="mlp",
+        alt_start=3,
+        qknorm_start=3,
+        rope_start=3,
+        cat_token=True,
+        has_time_token=True,
+        max_time_indices=4,
+    )
+    with torch.no_grad():
+        encoder.camera_token.normal_()
+        encoder.time_token.normal_()
+        encoder.pos_embed.normal_(std=0.02)
+    encoder.reinitialize_time_index_embedding(
+        "orthogonal",
+        scale=0.1,
+        generator=torch.Generator().manual_seed(0),
+    )
+
+    class _EncoderBackbone(nn.Module):
+        def __init__(self, pretrained):
+            super().__init__()
+            self.pretrained = pretrained
+
+    model = _arc_shell(max_time_indices=4)
+    model.backbone = _EncoderBackbone(encoder)
+    model.head = nn.Linear(2, 2)
+    model.cam_dec = nn.Linear(2, 2)
+    model.motion_decoder = nn.Linear(2, 2)
+    model.track_head = nn.Linear(2, 2)
+    # Global blocks are [3, 5]; k=1 keeps only 5.
+    model.set_freeze("temporal_tracking_late_global", late_global_blocks=1)
+
+    encoder.train()
+    images = torch.randn(1, 4, 3, 28, 28)
+    outputs, _ = encoder._get_intermediate_layers_not_chunked(
+        images,
+        n=[5],
+        ref_view_strategy="first",
+        time_indices=torch.tensor([[0, 1, 0, 1]]),
+    )
+    outputs[0][1].sum().backward()
+
+    for index, block in enumerate(encoder.blocks):
+        for name, parameter in block.named_parameters():
+            if index == 5:
+                assert parameter.requires_grad, f"blocks.{index}.{name}"
+                assert parameter.grad is not None, f"blocks.{index}.{name}"
+                assert torch.isfinite(parameter.grad).all(), f"blocks.{index}.{name}"
+            else:
+                assert not parameter.requires_grad, f"blocks.{index}.{name}"
+                assert parameter.grad is None, f"blocks.{index}.{name}"
+    assert encoder.time_index_embedding.weight.grad is not None
 
 
 def test_global_attention_mode_backward_reaches_all_unfrozen_blocks():
@@ -1639,6 +1877,7 @@ def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
 
     assert metadata == {
         "freeze_mode": "temporal_tracking",
+        "late_global_blocks": None,
         "max_time_indices": 4,
     }
 
@@ -1718,6 +1957,93 @@ def test_new_mode_patch_covers_the_trained_encoder_blocks(tmp_path):
     assert "backbone.pretrained.blocks.3.weight" in saved_names
     assert "backbone.pretrained.blocks.0.weight" not in saved_names
     assert "backbone.pretrained.blocks.2.weight" not in saved_names
+
+
+def test_patch_records_late_global_k_and_rejects_a_k_mismatch(tmp_path):
+    """Under the late mode the mode name alone does not fix the parameter set.
+
+    A k=1 patch and a k=2 model agree on every string the loader used to check,
+    so without the recorded k the mismatch would surface as a list of missing
+    block tensors instead of as the one number that is wrong.
+    """
+
+    trained = _GlobalAttnTinyArc(
+        freeze="temporal_tracking_late_global",
+        late_global_blocks=1,
+    )
+    with torch.no_grad():
+        trained.backbone.pretrained.blocks[3].weight.fill_(1.25)
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+    metadata = read_temporal_patch_metadata(patch)
+    assert metadata["freeze_mode"] == "temporal_tracking_late_global"
+    assert metadata["late_global_blocks"] == 1
+
+    # Same mode, different k: rejected by k, not by a wall of missing keys.
+    mismatched = _GlobalAttnTinyArc(
+        freeze="temporal_tracking_late_global",
+        late_global_blocks=2,
+    )
+    with pytest.raises(ValueError, match="late_global_blocks=1"):
+        load_temporal_tracking_checkpoint(mismatched, patch)
+
+    # And the other direction: a k-less mode must not accept a late patch.
+    with pytest.raises(ValueError, match="temporal_tracking_late_global"):
+        load_temporal_tracking_checkpoint(
+            _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention"), patch
+        )
+
+    restored = _GlobalAttnTinyArc(
+        freeze="temporal_tracking_late_global",
+        late_global_blocks=1,
+    )
+    load_temporal_tracking_checkpoint(restored, patch)
+    torch.testing.assert_close(
+        restored.backbone.pretrained.blocks[3].weight,
+        trained.backbone.pretrained.blocks[3].weight,
+    )
+
+    payload = torch.load(patch, map_location="cpu", weights_only=True)
+    saved_names = set(payload["state_dict"])
+    assert "backbone.pretrained.blocks.3.weight" in saved_names
+    assert "backbone.pretrained.blocks.1.weight" not in saved_names
+
+
+def test_patch_without_a_recorded_k_still_loads_a_k_less_mode(tmp_path):
+    """Absence of the field is read as None, not rejected.
+
+    Every patch written before the field existed genuinely has no k, because
+    its mode name fully determines its parameter set -- those archived patches
+    must keep loading. The one hole that leaves is a late-mode patch with no k,
+    whose block set cannot be reconstructed, and that is refused.
+    """
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    payload = {
+        "freeze_mode": "temporal_tracking",
+        "state_dict": {
+            name: parameter.detach().clone()
+            for name, parameter in trained.named_parameters()
+            if parameter.requires_grad
+        },
+    }
+    path = tmp_path / "no_k_patch.pt"
+    torch.save(payload, path)
+
+    assert read_temporal_patch_metadata(path)["late_global_blocks"] is None
+    load_temporal_tracking_checkpoint(_TinyHubArc(freeze="temporal_tracking"), path)
+
+    payload["freeze_mode"] = "temporal_tracking_late_global"
+    late_path = tmp_path / "late_without_k.pt"
+    torch.save(payload, late_path)
+    with pytest.raises(RuntimeError, match="re-run the overfit"):
+        read_temporal_patch_metadata(late_path)
+
+    payload["late_global_blocks"] = "four"
+    bad_path = tmp_path / "bad_k.pt"
+    torch.save(payload, bad_path)
+    with pytest.raises(RuntimeError, match="must be an integer or absent"):
+        read_temporal_patch_metadata(bad_path)
 
 
 def test_harness_step_helpers_drive_the_split_forward():

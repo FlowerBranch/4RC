@@ -27,6 +27,12 @@ def save_temporal_tracking_checkpoint(model, path: str | Path) -> Path:
     patch. The mode is recorded so the loader can demand it back; whether a
     mode name is *valid* is ``set_freeze``'s business, the single authority on
     mode names.
+
+    ``late_global_blocks`` is recorded for the same reason and read off the
+    same object: under ``temporal_tracking_late_global`` the mode name alone
+    does not determine the parameter set, so without it a k=4 patch would pass
+    the loader's mode check against a k=8 model and fail as a wall of missing
+    keys instead of as one sentence about k.
     """
 
     freeze_mode = getattr(model, "freeze", None)
@@ -40,6 +46,7 @@ def save_temporal_tracking_checkpoint(model, path: str | Path) -> Path:
         raise ValueError("Model has no trainable temporal-tracking parameters")
     payload = {
         "freeze_mode": freeze_mode,
+        "late_global_blocks": getattr(model, "late_global_blocks", None),
         "state_dict": {
             name: parameter.detach().cpu()
             for name, parameter in parameters.items()
@@ -51,7 +58,7 @@ def save_temporal_tracking_checkpoint(model, path: str | Path) -> Path:
     return path
 
 
-def _parse_payload(path: str | Path) -> tuple[str, dict]:
+def _parse_payload(path: str | Path) -> tuple[str, int | None, dict]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
         not isinstance(payload, dict)
@@ -64,21 +71,45 @@ def _parse_payload(path: str | Path) -> tuple[str, dict]:
             "fix and are not worth loading; re-run the overfit to produce a "
             "new one."
         )
-    return payload["freeze_mode"], payload["state_dict"]
+    # A patch written before this field existed genuinely has no k, and None is
+    # its true value: every mode that predates it is fully determined by its
+    # name. Absence is therefore read, not rejected -- archived patches must
+    # keep loading. The one hole that leaves is closed immediately below.
+    late_global_blocks = payload.get("late_global_blocks")
+    if late_global_blocks is not None and (
+        isinstance(late_global_blocks, bool)
+        or not isinstance(late_global_blocks, int)
+    ):
+        raise RuntimeError(
+            "Patch late_global_blocks must be an integer or absent, got "
+            f"{late_global_blocks!r}"
+        )
+    if payload["freeze_mode"] == "temporal_tracking_late_global" and (
+        late_global_blocks is None
+    ):
+        raise RuntimeError(
+            "Patch declares freeze mode 'temporal_tracking_late_global' but "
+            "records no late_global_blocks, so the trained block set cannot be "
+            "reconstructed; re-run the overfit to produce a new one."
+        )
+    return payload["freeze_mode"], late_global_blocks, payload["state_dict"]
 
 
 def read_temporal_patch_metadata(path: str | Path) -> dict:
-    """Freeze mode and embedding table size, without needing a model.
+    """Freeze mode, block count and embedding table size, without a model.
 
     ``max_time_indices`` is derived from the stored embedding tensor's row
     count rather than a separate field, so it cannot disagree with the
     weights; it is ``None`` when the patch carries no embedding.
+    ``late_global_blocks`` is ``None`` for every mode whose name already
+    determines its parameter set.
     """
 
-    freeze_mode, state_dict = _parse_payload(path)
+    freeze_mode, late_global_blocks, state_dict = _parse_payload(path)
     embedding = state_dict.get(_TIME_EMBEDDING_KEY)
     return {
         "freeze_mode": freeze_mode,
+        "late_global_blocks": late_global_blocks,
         "max_time_indices": (
             None
             if not isinstance(embedding, torch.Tensor)
@@ -90,12 +121,23 @@ def read_temporal_patch_metadata(path: str | Path) -> dict:
 def load_temporal_tracking_checkpoint(model, path: str | Path) -> None:
     """Strictly overlay a saved temporal-tracking patch onto a base Arc model."""
 
-    freeze_mode, state_dict = _parse_payload(path)
+    freeze_mode, late_global_blocks, state_dict = _parse_payload(path)
     if getattr(model, "freeze", None) != freeze_mode:
         raise ValueError(
             f"This patch was trained under freeze mode '{freeze_mode}'; call "
             f"model.set_freeze('{freeze_mode}') before loading it "
             f"(model.freeze is {getattr(model, 'freeze', None)!r})"
+        )
+    # Before the key match, not after: under the late-global mode the mode name
+    # matches for every k, so without this a k mismatch surfaces as a list of
+    # missing block tensors rather than as the one number that is wrong.
+    model_blocks = getattr(model, "late_global_blocks", None)
+    if model_blocks != late_global_blocks:
+        raise ValueError(
+            f"This patch was trained with late_global_blocks={late_global_blocks}; "
+            f"call model.set_freeze('{freeze_mode}', "
+            f"late_global_blocks={late_global_blocks}) before loading it "
+            f"(model.late_global_blocks is {model_blocks!r})"
         )
 
     parameters = _trainable_parameters(model)
