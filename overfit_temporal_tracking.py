@@ -29,7 +29,6 @@ from arc.training import (
     save_temporal_tracking_checkpoint,
     sparse_targets,
     sparse_tracking_loss,
-    split_correspondences_by_region,
     synchronized_consistency_stats,
     temporal_injection_report,
 )
@@ -153,54 +152,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Learning rate for unfrozen encoder blocks (default: 0.1 * --lr). "
             "Only meaningful with --freeze_mode temporal_tracking_global_attention; "
             "kept low because the frozen geometry heads read the drifting features."
-        ),
-    )
-    parser.add_argument(
-        "--holdout_fraction",
-        type=float,
-        default=0.0,
-        help=(
-            "Fraction of query trajectories held out of supervision and scored "
-            "separately, as spatially separated regions rather than random rows. "
-            "0 (the default) keeps the whole correspondence set supervised, "
-            "exactly as before the split existed, so archived runs stay "
-            "reproducible. A held-out score catches the encoder fitting the "
-            "supervised rows specifically; it does not catch a global transform "
-            "of the whole track field, which is what the alignment-scale drift "
-            "figures are for."
-        ),
-    )
-    parser.add_argument(
-        "--holdout_band_count",
-        type=int,
-        default=16,
-        help=(
-            "How many bands the split axis is cut into. More bands spread the "
-            "held-out sample over more regions, so it is less dominated by "
-            "whichever objects happen to sit in any one of them."
-        ),
-    )
-    parser.add_argument(
-        "--holdout_band_offset",
-        type=int,
-        default=0,
-        help=(
-            "Shifts which bands are held out. The split is otherwise a pure "
-            "function of scene geometry and these flags -- there is no seed, "
-            "because a seed would change the answer without changing its "
-            "meaning. This is the deterministic way to ask whether a result is "
-            "robust to *which* regions were held out."
-        ),
-    )
-    parser.add_argument(
-        "--holdout_gutter_m",
-        type=float,
-        default=0.10,
-        help=(
-            "Metres of separation enforced between supervised and held-out "
-            "query points; trajectories inside the gutter are supervised by "
-            "neither side. The track field is smooth, so without a gutter a "
-            "held-out point next to a supervised one is free interpolation."
         ),
     )
     parser.add_argument(
@@ -409,25 +360,6 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--late_global_blocks must be in [1, {MAX_LATE_GLOBAL_BLOCKS}]"
         )
-    if (
-        not math.isfinite(args.holdout_fraction)
-        or not 0 <= args.holdout_fraction <= 0.5
-    ):
-        raise ValueError("--holdout_fraction must be finite and in [0, 0.5]")
-    if args.holdout_band_count < 2:
-        raise ValueError("--holdout_band_count must be at least 2")
-    if args.holdout_fraction > 0:
-        period = max(2, round(1.0 / args.holdout_fraction))
-        if args.holdout_band_count < period:
-            raise ValueError(
-                f"--holdout_band_count must be at least {period} at "
-                f"--holdout_fraction {args.holdout_fraction}, or no band is "
-                "held out"
-            )
-    if args.holdout_band_offset < 0:
-        raise ValueError("--holdout_band_offset must be non-negative")
-    if not math.isfinite(args.holdout_gutter_m) or args.holdout_gutter_m < 0:
-        raise ValueError("--holdout_gutter_m must be finite and non-negative")
     if not math.isfinite(args.sync_weight) or args.sync_weight < 0:
         raise ValueError("--sync_weight must be finite and non-negative")
     if (
@@ -899,8 +831,6 @@ def _evaluate(
     sync_weight=0.0,
     sync_metric_scale,
     shuffled_views,
-    held_out_correspondences,
-    initial_held_out_anchors,
 ):
     """Score the trained model two ways, plus the control arms.
 
@@ -917,14 +847,6 @@ def _evaluate(
     inference would use the geometry), and — when ``shuffled_views`` is not
     None — a like-for-like score of the same trained model with one camera's
     indices shuffled (position-only).
-
-    The held-out score is a fourth loss on the *same* forward, against the same
-    initial alignment and the held-out slice of the same gathered anchors, so it
-    costs no extra forward and no extra Sim(3) fit. It is reported and
-    deliberately **not** gated: ``_exit_criteria_failure`` defines what an
-    archived run's ``success`` field means, no defensible threshold exists yet
-    (choosing one is what the encoder_lr sweep is for), and the held-out set is
-    the smallest and noisiest of the four numbers.
     """
 
     model.eval()
@@ -966,14 +888,6 @@ def _evaluate(
             confidence_alpha=confidence_alpha,
             sync_weight=sync_weight,
         )
-        held_out_loss, held_out_error = _held_out_score(
-            raw,
-            scene,
-            held_out_correspondences,
-            initial_alignment,
-            initial_held_out_anchors,
-            huber_delta_m=huber_delta_m,
-        )
         shuffled_loss = None
         shuffled_error = None
         if shuffled_views is not None:
@@ -992,8 +906,6 @@ def _evaluate(
     return {
         "loss_shuffled": shuffled_loss,
         "metric_error_shuffled_m": shuffled_error,
-        "loss_held_out": held_out_loss,
-        "metric_error_held_out_m": held_out_error,
         "sync_consistency": sync_stats,
         "reconstruction_drift": drift,
         "loss_refit": float(refit.loss.item()),
@@ -1013,75 +925,6 @@ def _evaluate(
         "confidence_diagnostics": like_for_like.diagnostics,
         "loss_breakdown": _breakdown_to_floats(like_for_like.loss_breakdown),
     }
-
-
-def _print_holdout_split(report: dict) -> None:
-    """The supervised/held-out partition, with N stated for every count."""
-
-    if not report["enabled"]:
-        print(
-            "holdout_split=off (--holdout_fraction 0): all "
-            f"{report['supervised_row_count']} rows supervised"
-        )
-        return
-    total = (
-        report["supervised_row_count"]
-        + report["held_out_row_count"]
-        + report["gutter_row_count"]
-    )
-    print(
-        f"holdout_split=on: supervised={report['supervised_row_count']}/{total} "
-        f"held_out={report['held_out_row_count']}/{total} "
-        f"({report['realized_held_out_fraction']:.1%}) "
-        f"gutter={report['gutter_row_count']}/{total}"
-    )
-    print(
-        f"  axis={report['axis']} extent={report['axis_extent_m']:.3f} m; "
-        f"{report['band_count']} bands of {report['band_width_m']:.3f} m, "
-        f"period={report['period']} offset={report['band_offset']}, "
-        f"held_out_bands={report['held_out_band_indices']}"
-    )
-    print(
-        f"  separation: {report['min_query_time_separation_m']:.3f} m minimum at "
-        f"query time (gutter {report['gutter_m']:.3f} m); "
-        f"{report['min_window_separation_m']:.3f} m minimum over the window "
-        "(diagnostic, not enforced)"
-    )
-    print(f"  per_anchor_held_out={report['per_anchor_held_out_counts']}")
-
-
-def _held_out_score(
-    raw_predictions,
-    scene,
-    held_out_correspondences,
-    alignment,
-    held_out_anchors,
-    *,
-    huber_delta_m,
-):
-    """Position-only loss and metric error on the held-out rows.
-
-    Position-only on purpose: this is a generalization number, and the exit
-    gates already read a position-only loss, so the two stay commensurable.
-    Scored against the alignment and anchors it is handed -- always the
-    *initial* ones -- because a refit absorbs a global transform and would hide
-    exactly the failure this number exists to detect.
-
-    Returns ``(None, None)`` when the split is off.
-    """
-
-    if held_out_correspondences.count == 0:
-        return None, None
-    result = sparse_tracking_loss(
-        _tracking_only(raw_predictions),
-        scene,
-        held_out_correspondences,
-        alignment,
-        held_out_anchors,
-        huber_delta_m=huber_delta_m,
-        collect_diagnostics=False,
-    )
-    return float(result.loss.item()), float(result.metric_error.item())
 
 
 def _print_eligibility(report: dict) -> None:
@@ -1149,15 +992,9 @@ def _print_eligibility(report: dict) -> None:
 
 
 def _report_eligibility_only(scene, args) -> None:
-    """Build correspondences and report the splits, without CUDA or a checkpoint.
+    """Build correspondences and report the split, without CUDA or a checkpoint."""
 
-    This is the only checkpoint-free entry point that has correspondences at all
-    (``--parse_only`` returns before they are built), so it is where a held-out
-    split can be inspected before an allocation is spent on it. A scene whose
-    geometry defeats the banding raises here, on CPU, in seconds.
-    """
-
-    scene_correspondences, eligibility = build_anchor_correspondences(scene)
+    _, eligibility = build_anchor_correspondences(scene)
     print(f"scene={scene.name}")
     print(
         "query_anchors="
@@ -1174,23 +1011,6 @@ def _report_eligibility_only(scene, args) -> None:
         )
     )
     _print_eligibility(eligibility)
-    # An anchor set that reaches nothing is this report's subject, not an error:
-    # the eligibility table above already says why, and raising here would turn
-    # the cheap diagnostic into the failure it exists to explain.
-    holdout_split = None
-    if scene_correspondences.count == 0:
-        print("holdout_split=skipped (no eligible correspondences to split)")
-    else:
-        split = split_correspondences_by_region(
-            scene,
-            scene_correspondences,
-            holdout_fraction=args.holdout_fraction,
-            band_count=args.holdout_band_count,
-            band_offset=args.holdout_band_offset,
-            gutter_m=args.holdout_gutter_m,
-        )
-        holdout_split = split.report
-        _print_holdout_split(holdout_split)
     if args.output_dir:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1204,7 +1024,6 @@ def _report_eligibility_only(scene, args) -> None:
                     "query_anchors": [list(pair) for pair in scene.query_anchors],
                     "time_varying_depth": _time_varying_depth_report(scene),
                     "eligibility": eligibility,
-                    "holdout_split": holdout_split,
                 },
                 indent=2,
             )
@@ -1329,21 +1148,8 @@ def main() -> None:
         baseline_raw,
         scene,
     )
-    scene_correspondences, eligibility = build_anchor_correspondences(scene)
+    correspondences, eligibility = build_anchor_correspondences(scene)
     _print_eligibility(eligibility)
-    # Rebinding `correspondences` to the supervised side is the whole edit: the
-    # split keeps its rows scene-level, so every per-anchor slice, sample count
-    # and training-step call below is unchanged.
-    split = split_correspondences_by_region(
-        scene,
-        scene_correspondences,
-        holdout_fraction=args.holdout_fraction,
-        band_count=args.holdout_band_count,
-        band_offset=args.holdout_band_offset,
-        gutter_m=args.holdout_gutter_m,
-    )
-    _print_holdout_split(split.report)
-    correspondences = split.supervised
     anchor_count = len(scene.anchor_observation_slots)
     per_anchor_correspondences = [
         correspondences.select_query_slot(anchor_index)
@@ -1370,16 +1176,6 @@ def main() -> None:
             f"{eligibility['rejected']}. Anchoring at a time other than 0 needs "
             "the per-frame depth sidecar; anchoring in another camera is what "
             "reaches queries occluded in the first."
-            + (
-                ""
-                if not split.report["enabled"]
-                else (
-                    " --holdout_fraction is also live, which removed "
-                    f"{split.report['held_out_row_count']} held-out and "
-                    f"{split.report['gutter_row_count']} gutter rows from "
-                    "supervision."
-                )
-            )
         )
     # Each anchor's share of the supervised samples. Weighting by this and
     # backwarding per anchor is exactly one combined reduction="mean"; the
@@ -1406,21 +1202,11 @@ def main() -> None:
         f"{anchor_sample_counts} (total {total_anchor_samples}); "
         f"active_anchors={active_anchor_count}/{anchor_count}"
     )
-    # Gathered once from the scene-level set and sliced for each side, so the
-    # supervised and held-out scores cannot disagree about their anchors.
-    all_query_anchors = gather_query_anchor_points(
+    initial_query_anchors = gather_query_anchor_points(
         baseline_raw,
         scene,
-        scene_correspondences,
+        correspondences,
     )
-    initial_query_anchors = all_query_anchors[
-        split.supervised_rows.to(all_query_anchors.device)
-    ]
-    initial_held_out_anchors = all_query_anchors[
-        split.held_out_rows.to(all_query_anchors.device)
-    ]
-    del all_query_anchors
-    held_out_correspondences = split.held_out
     confidence_enabled = args.confidence_weight > 0
     requested_alpha = _parse_confidence_alpha(args.confidence_alpha)
     sync_metric_scale = (
@@ -1440,14 +1226,6 @@ def main() -> None:
     baseline_confidence = _confidence_stats(baseline_raw)
     baseline_loss = float(baseline_result.loss.item())
     baseline_error = float(baseline_result.metric_error.item())
-    baseline_held_out_loss, baseline_held_out_error = _held_out_score(
-        baseline_raw,
-        scene,
-        held_out_correspondences,
-        initial_alignment,
-        initial_held_out_anchors,
-        huber_delta_m=args.huber_delta_m,
-    )
     baseline_sync = synchronized_consistency_stats(
         baseline_raw["track_multi"],
         scene.slot_time_indices,
@@ -1541,14 +1319,6 @@ def main() -> None:
     initial_confidence = _confidence_stats(initial_raw)
     initial_loss = float(initial_result.loss.item())
     initial_error = float(initial_result.metric_error.item())
-    initial_held_out_loss, initial_held_out_error = _held_out_score(
-        initial_raw,
-        scene,
-        held_out_correspondences,
-        initial_alignment,
-        initial_held_out_anchors,
-        huber_delta_m=args.huber_delta_m,
-    )
     initial_sync = synchronized_consistency_stats(
         initial_raw["track_multi"],
         scene.slot_time_indices,
@@ -1796,8 +1566,6 @@ def main() -> None:
         sync_weight=args.sync_weight,
         sync_metric_scale=sync_metric_scale,
         shuffled_views=_shuffled_index_views(scene),
-        held_out_correspondences=held_out_correspondences,
-        initial_held_out_anchors=initial_held_out_anchors,
     )
     # Re-checked after training: the head has moved, so a run can start clean and
     # only then push confidence logits far enough to overflow.
@@ -1945,22 +1713,6 @@ def main() -> None:
         "learning_rates": learning_rates,
         "sync_weight": args.sync_weight,
         "min_index_advantage": args.min_index_advantage,
-        # --- Held-out generalization arm. Reported, never gated: see _evaluate.
-        "holdout_fraction": args.holdout_fraction,
-        "holdout_band_count": args.holdout_band_count,
-        "holdout_band_offset": args.holdout_band_offset,
-        "holdout_gutter_m": args.holdout_gutter_m,
-        "holdout_split": split.report,
-        # Lifted flat out of holdout_split so a sweep script can read the two
-        # numbers that decide whether an arm is informative without walking in.
-        "supervised_row_count": split.report["supervised_row_count"],
-        "held_out_row_count": split.report["held_out_row_count"],
-        "baseline_held_out_position_loss": baseline_held_out_loss,
-        "initial_held_out_position_loss": initial_held_out_loss,
-        "final_held_out_position_loss": evaluation["loss_held_out"],
-        "baseline_held_out_metric_error_m": baseline_held_out_error,
-        "initial_held_out_metric_error_m": initial_held_out_error,
-        "final_held_out_metric_error_m": evaluation["metric_error_held_out_m"],
         # The released checkpoint scored with the same alignment and anchors as
         # every other like-for-like number; the bar the trained model must beat.
         "baseline_position_loss": baseline_loss,
@@ -2012,20 +1764,6 @@ def main() -> None:
     print(f"final_position_loss_refit={evaluation['loss_refit']:.8f}")
     if evaluation["loss_shuffled"] is not None:
         print(f"final_position_loss_shuffled={evaluation['loss_shuffled']:.8f}")
-    if evaluation["loss_held_out"] is not None:
-        print(
-            "held_out_position_loss="
-            f"baseline {baseline_held_out_loss:.8f}, "
-            f"initial {initial_held_out_loss:.8f}, "
-            f"final {evaluation['loss_held_out']:.8f} "
-            f"({split.report['held_out_row_count']} rows, not gated)"
-        )
-        print(
-            "held_out_metric_error_m="
-            f"baseline {baseline_held_out_error:.8f}, "
-            f"initial {initial_held_out_error:.8f}, "
-            f"final {evaluation['metric_error_held_out_m']:.8f}"
-        )
     print(f"initial_metric_error_m={initial_error:.8f}")
     print(f"final_metric_error_m={final_error:.8f}")
     print(f"final_metric_error_refit_m={evaluation['metric_error_refit_m']:.8f}")

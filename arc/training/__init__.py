@@ -49,9 +49,7 @@ from .sparse_tracking import (
     ELIGIBILITY_ASSIGNMENT_RULE,
     ELIGIBILITY_REJECTION_STAGES,
     ELIGIBILITY_ROLLUP_RULE,
-    HELD_OUT_SPLIT_RULE,
     DetachedSim3,
-    HeldOutSplit,
     SparseCorrespondences,
     SparseTrackingLossResult,
     build_anchor_correspondences,
@@ -61,7 +59,6 @@ from .sparse_tracking import (
     reconstruction_drift_report,
     sparse_targets,
     sparse_tracking_loss,
-    split_correspondences_by_region,
 )
 
 __all__ = [
@@ -74,10 +71,8 @@ __all__ = [
     "ELIGIBILITY_ASSIGNMENT_RULE",
     "ELIGIBILITY_REJECTION_STAGES",
     "ELIGIBILITY_ROLLUP_RULE",
-    "HELD_OUT_SPLIT_RULE",
     "DetachedSim3",
     "DumpedKubricScene",
-    "HeldOutSplit",
     "ImageTransform",
     "Observation",
     "SparseCorrespondences",
@@ -108,7 +103,6 @@ __all__ = [
     "save_temporal_tracking_checkpoint",
     "sparse_targets",
     "sparse_tracking_loss",
-    "split_correspondences_by_region",
     "synchronized_consistency_loss",
     "synchronized_consistency_stats",
     "synchronized_pair_indices",

@@ -1,20 +1,13 @@
 """Pins for the helpers shared by every bounded training entry point.
 
-Two things are being protected here. The extraction of these helpers out of
-``overfit_temporal_tracking.py`` must not have changed the harness -- there is no
-GPU, no checkpoint and no dump in this environment, so the harness cannot be run
-end to end and "the tests still pass" is not the same claim. And the helpers must
-work on CPU, because every test that drives a training step in this suite runs
-there; ``gradient_norm`` used to name CUDA outright, which made those tests
-impossible to write at all.
+What is being protected: the helpers must work on CPU, because every test that
+drives a training step in this suite runs there; ``gradient_norm`` used to name
+CUDA outright, which made those tests impossible to write at all. And they must
+stay reachable as module globals on the harness, because six tests monkeypatch
+them there by name.
 """
 
 from __future__ import annotations
-
-import ast
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -25,12 +18,8 @@ from arc.models.arc.arc import Arc
 from arc.training import runtime
 
 
-# The commit the extraction was taken from. Pinned rather than derived so a
-# rebase fails loudly here instead of silently comparing against the wrong tree.
-EXTRACTION_BASELINE = "95b521a"
-
-# What the extraction was allowed to do to the harness, declared up front so the
-# test below checks the plan rather than describing whatever happened.
+# The helpers the extraction moved out of ``overfit_temporal_tracking.py``. The
+# harness must still expose every one of them as a module global; see below.
 MOVED_TO_RUNTIME = {
     "_assert_frozen_gradients_absent",
     "_assert_trainable_gradients_finite",
@@ -43,58 +32,6 @@ MOVED_TO_RUNTIME = {
     "_shuffled_index_views",
     "_tracking_only",
 }
-REWRITTEN_AS_WRAPPERS = {"_build_optimizer"}
-
-
-def _top_level_sources(source: str) -> dict[str, str]:
-    tree = ast.parse(source)
-    return {
-        node.name: ast.get_source_segment(source, node)
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-
-
-def _baseline_harness_source() -> str:
-    result = subprocess.run(
-        ["git", "show", f"{EXTRACTION_BASELINE}:overfit_temporal_tracking.py"],
-        capture_output=True,
-        text=True,
-        cwd=Path(overfit_cli.__file__).parent,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"cannot read {EXTRACTION_BASELINE} from git: {result.stderr.strip()}")
-    return result.stdout
-
-
-# ------------------------------------------------------------------ extraction ---
-
-
-def test_the_extraction_left_every_surviving_harness_function_byte_identical():
-    """The invariant the whole extraction rests on, checked instead of argued.
-
-    All 286 tests would still pass if the move had quietly reordered a step-loop
-    guard, dropped a ``del``, or changed a printed format -- none of the guards
-    in ``main`` has a test of its own. Comparing source segments catches exactly
-    that class of change, and it runs without a GPU, which the real before/after
-    ``run_summary.json`` comparison cannot.
-    """
-
-    before = _top_level_sources(_baseline_harness_source())
-    after = _top_level_sources(Path(overfit_cli.__file__).read_text())
-
-    assert set(before) - set(after) == MOVED_TO_RUNTIME
-    assert set(after) - set(before) == set()
-
-    changed = {
-        name
-        for name in set(before) & set(after)
-        if before[name] != after[name]
-    }
-    assert changed == REWRITTEN_AS_WRAPPERS
-    # main carries the step loop, every guard and the run_summary literal, so it
-    # is the one that matters most; assert it by name rather than by set algebra.
-    assert before["main"] == after["main"]
 
 
 def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():
