@@ -65,6 +65,47 @@ def expected_trainable_set(freeze_mode, late_global_blocks):
     )
 
 
+def assert_trainable_parameter_set(
+    model,
+    *,
+    freeze_mode: str,
+    max_time_indices: int,
+    late_global_blocks: int | None = None,
+) -> dict:
+    """Fail if the freeze mask is not exactly the set the mode promises.
+
+    This is the guard the whole module exists for: a refactor that silently
+    changes which parameters train must stop the run here rather than quietly
+    cost GPU weeks.  Both drivers call it, so there is one expectation and one
+    message -- a second copy beside a caller is how the two drift until only one
+    of them is still checking anything.
+
+    Returns the trainable-parameter report so a caller can log it without asking
+    the model twice.
+    """
+
+    report = model.get_trainable_parameter_report()
+    expected_tensors, expected_non_embedding = expected_trainable_set(
+        freeze_mode,
+        late_global_blocks,
+    )
+    expected_parameter_count = (
+        expected_non_embedding + max_time_indices * TIME_EMBEDDING_DIM
+    )
+    note = "" if late_global_blocks is None else f", k={late_global_blocks}"
+    if (
+        report["tensor_count"] != expected_tensors
+        or report["parameter_count"] != expected_parameter_count
+    ):
+        raise RuntimeError(
+            f"Unexpected {freeze_mode}{note} parameter set: "
+            f"{report['tensor_count']} tensors / "
+            f"{report['parameter_count']} parameters; expected "
+            f"{expected_tensors} / {expected_parameter_count}"
+        )
+    return report
+
+
 def autocast_context(precision: str):
     if precision == "32":
         return nullcontext()
@@ -242,27 +283,9 @@ def tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
     return kept
 
 
-def confidence_stats(raw_predictions) -> dict[str, float] | None:
-    """Summarize the track head's confidence channel.
+def _quantile_summary(values: torch.Tensor) -> dict[str, float]:
+    """Mean and the 5/50/95 percentiles of one flat tensor."""
 
-    Nothing supervises it unless the confidence term is enabled: the position
-    loss is a Huber on xyz, and xyz and confidence are split off the *same* final
-    conv, so the channel gets a zero gradient while its trunk moves.
-    ``score_joint.py`` thresholds this confidence absolutely to derive occlusion,
-    which feeds OA and AJ, so an unsupervised mean shift is not harmless.  Log it
-    so drift is attributable.
-
-    Note ``torch.quantile`` refuses inputs above 2**24 elements.  At the one-scene
-    harness's sizes that is three orders of magnitude away; a driver running wider
-    windows or more anchors has to guard it rather than assume it.
-    """
-
-    confidence = raw_predictions.get("conf_track_multi")
-    if confidence is None:
-        return None
-    values = confidence.detach().float().flatten()
-    if values.numel() == 0:
-        return None
     quantiles = torch.tensor([0.05, 0.5, 0.95], device=values.device)
     p05, p50, p95 = torch.quantile(values, quantiles).tolist()
     return {
@@ -270,6 +293,68 @@ def confidence_stats(raw_predictions) -> dict[str, float] | None:
         "p05": float(p05),
         "p50": float(p50),
         "p95": float(p95),
+    }
+
+
+def confidence_stats(raw_predictions) -> dict | None:
+    """Summarize the track head's confidence channel, per anchor.
+
+    Nothing supervises it unless the confidence term is enabled: the position
+    loss is a Huber on xyz, and xyz and confidence are split off the *same* final
+    conv, so the channel gets a zero gradient while its trunk moves.
+    ``score_joint.py`` thresholds this confidence **absolutely** to derive
+    occlusion, which feeds OA and AJ, so an unsupervised mean shift is not
+    harmless.  Log it so drift is attributable.
+
+    **Why per anchor, and not pooled.**  That same scorer matches each query in
+    whichever anchor fits it best, so whether anchor 1's confidence distribution
+    sits where anchor 0's does is exactly the thing worth knowing.  Pooling the
+    anchors averages that away.  It also removes a hard ceiling: ``torch.quantile``
+    refuses inputs above ``2**24`` elements, and a pooled ``(1,Q,S,H,W)`` at the
+    committed 48 observations crosses it at the *second* anchor (Q*S <= 88 at
+    378x504).  A per-anchor slice is ``S*H*W`` **independent of Q**, so the cap
+    binds only if ``S`` alone passed 88 observations -- well beyond what the card
+    fits.  The diagnostic therefore stops capping the science at one anchor.
+
+    At ``Q == 1`` the returned dict is exactly what the pooled version returned:
+    the same four keys over the identical elements in the identical order.
+    Per-anchor detail appears only when there is more than one anchor, which
+    keeps ``run_summary.json`` unchanged for every single-anchor run.
+
+    The pooled ``mean`` stays exact above ``Q == 1`` because the slices are equal
+    sized.  Pooled *quantiles* are **not** recoverable from per-anchor quantiles
+    and are reported as ``None`` rather than fabricated; ``torch.sort`` has no cap
+    and reproduces this function's linear-interpolation convention exactly, if one
+    is ever genuinely wanted.
+    """
+
+    confidence = raw_predictions.get("conf_track_multi")
+    if confidence is None:
+        return None
+    values = confidence.detach().float()
+    if values.numel() == 0:
+        return None
+    # The anchor axis is read off the tensor rather than assumed, so a head that
+    # ever changes layout fails here instead of silently summarizing the wrong
+    # axis. Every producer in this repo emits (1,Q,S,H,W).
+    if values.ndim != 5 or values.shape[0] != 1:
+        raise ValueError(
+            "conf_track_multi must have shape (1,Q,S,H,W) for the anchor axis to "
+            f"be unambiguous, got {tuple(values.shape)}"
+        )
+
+    per_anchor = [
+        _quantile_summary(values[0, anchor].reshape(-1))
+        for anchor in range(int(values.shape[1]))
+    ]
+    if len(per_anchor) == 1:
+        return per_anchor[0]
+    return {
+        "mean": float(values.mean().item()),
+        "p05": None,
+        "p50": None,
+        "p95": None,
+        "per_anchor": per_anchor,
     }
 
 

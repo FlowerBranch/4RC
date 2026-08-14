@@ -212,21 +212,47 @@ def test_time_selection_stays_in_window_and_is_strictly_increasing():
             assert bound in {BOUND_BUDGET, BOUND_EMBEDDING_ROWS, BOUND_WINDOW}
 
 
-def test_the_committed_window_is_four_cameras_by_ten_times_at_stride_two():
-    """The first run's window, pinned so a default drift is visible here."""
+def test_the_committed_window_is_four_cameras_by_twelve_times_at_stride_two():
+    """The first run's window, pinned so a default drift is visible here.
+
+    48 observations, measured at 132.2 GiB on an H200 — 94% of the card, which is
+    why the number is pinned rather than left to a default someone can nudge.
+    """
 
     times, bound = select_times(
         frame_start=0,
         seq_len=24,
         view_count=4,
-        budget=40,
-        stride=2,
+        budget=train_cli.DEFAULT_OBSERVATION_BUDGET,
+        stride=train_cli.DEFAULT_STRIDE,
         max_time_indices=32,
     )
 
-    assert times == (0, 2, 4, 6, 8, 10, 12, 14, 16, 18)
+    assert train_cli.DEFAULT_OBSERVATION_BUDGET == 48
+    assert times == (0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
     assert bound == BOUND_BUDGET
-    assert len(times) * 4 <= 40
+    assert len(times) * 4 == 48
+    # T=12 is inside the embedding table, which is the other ceiling on a window.
+    assert len(times) <= 32
+
+
+def test_the_forty_observation_fallback_keeps_the_embedding_contract():
+    """`--observation_budget 40` is the documented way down from 94% occupancy.
+
+    It must change only how many times a window carries, never what a row means:
+    the stride is unchanged, so row k is still k*stride frames after the anchor
+    and a patch stays loadable across the change.
+    """
+
+    fallback, _ = select_times(
+        frame_start=0, seq_len=24, view_count=4, budget=40, stride=2, max_time_indices=32
+    )
+    committed, _ = select_times(
+        frame_start=0, seq_len=24, view_count=4, budget=48, stride=2, max_time_indices=32
+    )
+
+    assert fallback == committed[: len(fallback)]
+    assert len(fallback) * 4 == 40
 
 
 def test_which_bound_decided_the_time_count_is_reported():
@@ -410,17 +436,21 @@ def test_plan_only_reports_a_manifest_without_cuda_or_a_checkpoint(tmp_path, mon
     summary = json.loads(out.read_text())
     assert summary["planned_steps"] == 3
     assert summary["distinct_scenes"] == 3
-    assert summary["observations_per_step"] == {"40": 3}
+    assert summary["observations_per_step"] == {"48": 3}
     assert summary["time_bound"] == {BOUND_BUDGET: 3}
     assert summary["duplicate_track_ids"]["total"] == 3
     assert summary["records_with_scene_transform"] == 3
 
 
-def test_the_trainer_refuses_to_train_rather_than_silently_doing_nothing(tmp_path, monkeypatch):
-    """Landing 2 ships the planner only; the training paths must say so.
+def test_the_trainer_names_the_one_missing_piece_rather_than_planning_quietly(
+    tmp_path, monkeypatch
+):
+    """Landing 3 has the loop but not the scene source; it must say which.
 
-    An entry point that accepted the flags and quietly planned instead would be
-    the worst version of a partial landing.
+    An entry point that accepted the training flags and quietly planned instead
+    would be the worst version of a partial landing — and a generic "not
+    implemented" would send someone auditing the loop, which is written. The
+    message names `scene_provider` and why it is unbound.
     """
 
     manifest = _write_manifest(tmp_path / "manifest.jsonl", [_record()])
@@ -428,7 +458,7 @@ def test_the_trainer_refuses_to_train_rather_than_silently_doing_nothing(tmp_pat
         sys, "argv", ["train_temporal_tracking.py", "--manifest", str(manifest)]
     )
 
-    with pytest.raises(NotImplementedError, match="Only --plan_only is implemented"):
+    with pytest.raises(NotImplementedError, match="scene_provider is not bound yet"):
         train_cli.main()
 
 

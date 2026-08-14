@@ -25,6 +25,19 @@ from .dumped_kubric import (
     load_dumped_kubric_scene,
     scene_from_datapoint,
 )
+from .schedule import (
+    apply_learning_rate,
+    capture_base_learning_rates,
+    warmup_cosine_scale,
+)
+from .trainer_state import (
+    TRAINER_STATE_VERSION,
+    build_trainer_state,
+    capture_rng_state,
+    read_trainer_state,
+    restore_rng_state,
+    save_atomically,
+)
 from .manifest_plan import (
     ManifestPlanError,
     PlanTally,
@@ -86,6 +99,15 @@ __all__ = [
     "load_temporal_tracking_checkpoint",
     "ManifestPlanError",
     "PlanTally",
+    "TRAINER_STATE_VERSION",
+    "apply_learning_rate",
+    "build_trainer_state",
+    "capture_base_learning_rates",
+    "capture_rng_state",
+    "read_trainer_state",
+    "restore_rng_state",
+    "save_atomically",
+    "warmup_cosine_scale",
     "Skipped",
     "StepPlan",
     "build_scene",

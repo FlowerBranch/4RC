@@ -45,10 +45,10 @@ from arc.training.runtime import (  # noqa: E402
     EXPECTED_TRAINABLE_SETS,
     LATE_GLOBAL_PER_BLOCK,
     MAX_LATE_GLOBAL_BLOCKS,
-    TIME_EMBEDDING_DIM,
     TIME_EMBEDDING_KEY,
     assert_frozen_gradients_absent as _assert_frozen_gradients_absent,
     assert_trainable_gradients_finite as _assert_trainable_gradients_finite,
+    assert_trainable_parameter_set,
     autocast_context as _autocast_context,
     build_optimizer,
     confidence_gradient_norms as _confidence_gradient_norms,
@@ -1105,24 +1105,12 @@ def main() -> None:
         "" if late_global_blocks is None else f", k={late_global_blocks}"
     )
     model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
-    report = model.get_trainable_parameter_report()
-    expected_tensors, expected_non_embedding = _expected_trainable_set(
-        args.freeze_mode,
-        late_global_blocks,
+    report = assert_trainable_parameter_set(
+        model,
+        freeze_mode=args.freeze_mode,
+        max_time_indices=args.max_time_indices,
+        late_global_blocks=late_global_blocks,
     )
-    expected_parameter_count = (
-        expected_non_embedding + args.max_time_indices * TIME_EMBEDDING_DIM
-    )
-    if (
-        report["tensor_count"] != expected_tensors
-        or report["parameter_count"] != expected_parameter_count
-    ):
-        raise RuntimeError(
-            f"Unexpected {args.freeze_mode}{late_global_note} parameter set: "
-            f"{report['tensor_count']} tensors / "
-            f"{report['parameter_count']} parameters; expected "
-            f"{expected_tensors} / {expected_parameter_count}"
-        )
     print(
         "trainable="
         f"{report['tensor_count']} tensors / {report['parameter_count']} "
