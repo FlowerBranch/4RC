@@ -442,15 +442,13 @@ def test_plan_only_reports_a_manifest_without_cuda_or_a_checkpoint(tmp_path, mon
     assert summary["records_with_scene_transform"] == 3
 
 
-def test_the_trainer_names_the_one_missing_piece_rather_than_planning_quietly(
-    tmp_path, monkeypatch
-):
-    """Landing 3 has the loop but not the scene source; it must say which.
+def test_training_without_a_checkpoint_or_output_dir_is_refused(tmp_path, monkeypatch):
+    """The trainer trains now, so what must not happen is a silent plan-and-exit.
 
-    An entry point that accepted the training flags and quietly planned instead
-    would be the worst version of a partial landing — and a generic "not
-    implemented" would send someone auditing the loop, which is written. The
-    message names `scene_provider` and why it is unbound.
+    Landing 4 bound `scene_provider`, so the old "not implemented" refusal is
+    gone; the remaining way to get nothing while looking healthy is to accept the
+    training flags with nowhere to load weights from or write results to. That
+    fails at argument validation, before a GPU is touched.
     """
 
     manifest = _write_manifest(tmp_path / "manifest.jsonl", [_record()])
@@ -458,8 +456,11 @@ def test_the_trainer_names_the_one_missing_piece_rather_than_planning_quietly(
         sys, "argv", ["train_temporal_tracking.py", "--manifest", str(manifest)]
     )
 
-    with pytest.raises(NotImplementedError, match="scene_provider is not bound yet"):
+    with pytest.raises(SystemExit) as excinfo:
         train_cli.main()
+
+    # argparse's own error path, so the message names the missing flags.
+    assert excinfo.value.code == 2
 
 
 def test_an_all_unreplayable_manifest_exits_non_zero(tmp_path, monkeypatch):

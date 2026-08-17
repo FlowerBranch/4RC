@@ -38,6 +38,11 @@ from .trainer_state import (
     restore_rng_state,
     save_atomically,
 )
+from .predictions import (
+    PREDICTION_KEYS,
+    build_prediction_arrays,
+    write_scene_predictions,
+)
 from .manifest_plan import (
     ManifestPlanError,
     PlanTally,
@@ -98,6 +103,9 @@ __all__ = [
     "gather_query_anchor_points",
     "load_temporal_tracking_checkpoint",
     "ManifestPlanError",
+    "PREDICTION_KEYS",
+    "build_prediction_arrays",
+    "write_scene_predictions",
     "PlanTally",
     "TRAINER_STATE_VERSION",
     "apply_learning_rate",

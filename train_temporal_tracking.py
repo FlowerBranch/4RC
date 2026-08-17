@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Multi-scene temporal-tracking trainer, replaying MVTracker's sample stream.
 
-**Landing 3 of four: everything but the scene source.** The planner, the training
-step, the schedule, gradient clipping, checkpoint/resume, signal handling and the
-occupancy guard are written and tested. What is *not* here is one function --
-``scene_provider(plan) -> DumpedKubricScene`` -- so ``--manifest`` cannot yet train
-end to end against real data. That seam is waiting on a cluster measurement which
-decides whether scenes arrive from the live MVTracker dataset or through the
-dumper, and the step does not depend on the answer: both routes produce a
-``DumpedKubricScene``, so the step is written against the scene rather than its
-origin.
+The planner, the training step, the schedule, gradient clipping, checkpoint/resume,
+signal handling, the occupancy guard, the scene source and the held-out eval are
+all here, so ``--manifest`` trains end to end.  Scenes arrive through
+:class:`arc.training.scene_provider.MVTrackerSceneProvider`, which replays each
+record against MVTracker's own loader rather than a reimplementation.
+
+**What "replaying the sample stream" claims, at its honest granularity:** the same
+scenes, windows, view sets and step ordering as the run being replayed -- and each
+run's own tracks and query points, because the eligible pool is rebuilt from
+post-crop visibility and the crop is drawn from an unrecorded global RNG stream.
+Measured twice on one scene, two draws shared a fifth of their track ids (jaccard
+0.256 and 0.219); of the trajectories they did share, 52.5% also landed on the same
+query time, so roughly one supervised query point in five is identical between the
+runs.  The comparison that carries the result is the held-out curve at
+``--eval_every 500``, not a per-step input diff.
 
 ``--plan_only`` works on its own and is worth running before any GPU is
 allocated: it walks a real manifest and reports what every step *would* select, so
@@ -49,6 +55,7 @@ from arc.training.runtime import (
     tracking_only,
 )
 from arc.training.sample_manifest import MANIFEST_VERSION, read_manifest
+from arc.training.scene_provider import SceneProviderError
 from arc.training.schedule import (
     apply_learning_rate,
     capture_base_learning_rates,
@@ -56,6 +63,7 @@ from arc.training.schedule import (
 )
 from arc.training.trainer_state import (
     build_trainer_state,
+    capture_rng_state,
     read_trainer_state,
     restore_rng_state,
     save_atomically,
@@ -125,6 +133,96 @@ class StepOutcome:
     gradient_norms: dict
     peak_bytes: int = 0
     confidence: dict | None = None
+
+
+def scene_skip_cause(error: Exception) -> str:
+    """Bucket a scene-load failure, so a tally says *what* is wrong.
+
+    The causes have different remedies -- a missing scene usually means the wrong
+    ``data_root``, a small pool means a degenerate scene -- so a single "failed"
+    count would report the symptom of a broken run and a healthy one identically.
+    """
+
+    text = str(error)
+    if "is not in the pool" in text:
+        return "scene_absent"
+    if "eligible tracks" in text:
+        return "pool_too_small"
+    if "nothing to supervise" in text:
+        return "no_recorded_tracks_present"
+    return "other"
+
+
+def check_scene_skip_rate(
+    skips,
+    *,
+    attempted: int,
+    consecutive: int,
+    max_fraction: float,
+    max_consecutive: int,
+    min_attempts: int = 50,
+) -> None:
+    """Abort when scene loads fail systematically, with the tally.
+
+    Skipping is right for one degenerate scene in thousands and wrong for a
+    broken ``--data_root``: without a limit, a wrong root produces a run that
+    advances its counter for two days, records no gradients and writes a summary
+    that reads as complete. That is the failure this guards, and it is the exact
+    shape an inherited ``max_videos=30`` cap took before it was fixed.
+
+    **Two rules, because one does not cover both ends of a run.** A *fraction*
+    is meaningless early -- one skip in the first two steps is 50% -- so it only
+    applies once ``min_attempts`` steps have been tried. A run of *consecutive*
+    failures needs no denominator and is what a broken root actually looks like,
+    so it catches the same fault within a few steps instead of fifty.
+    """
+
+    total = sum(skips.values())
+    causes = dict(sorted(skips.items()))
+    if consecutive >= max_consecutive:
+        raise RuntimeError(
+            f"{consecutive} consecutive steps could not load their scene "
+            f"(--max_consecutive_scene_skips {max_consecutive}); causes: {causes}. "
+            "A run of failures back to back is a broken data root, not bad luck"
+        )
+    if attempted < min_attempts or not total:
+        return
+    fraction = total / attempted
+    if fraction <= max_fraction:
+        return
+    raise RuntimeError(
+        f"{total} of {attempted} steps could not load their scene "
+        f"({fraction:.1%} > --max_scene_skip_fraction {max_fraction:.1%}); "
+        f"causes: {causes}. This is a broken data root or an over-restricted "
+        "pool, not a few bad scenes"
+    )
+
+
+def cuda_scene_provider(provider):
+    """Wrap a scene provider so loaded scenes arrive on the GPU.
+
+    **The move has to happen inside the loader, and that is forced rather than
+    chosen.** :meth:`SceneCache.fingerprint` records ``id(...)`` and the device of
+    each view's ``img``, while ``move_views_to_cuda`` *rebinds* ``view["img"]`` to
+    a new tensor on a new device. Moving a scene that came *out* of the cache
+    therefore trips the mutation guard on the next hit. ``SceneCache.get`` loads
+    and only then fingerprints, so a provider that returns an already-moved scene
+    is consistent with itself.
+
+    **Only the views move.** ``build_anchor_correspondences`` runs every step and
+    takes ``.cpu().numpy()`` of trajectories, visibility, intrinsics, extrinsics
+    and a depth slice per anchor; moving the whole scene would turn that into a
+    per-step round trip. The loss path already handles the split -- it takes its
+    device from the predictions and moves what it needs.
+    """
+
+    def load(plan):
+        scene = provider(plan)
+        if torch.cuda.is_available():
+            move_views_to_cuda(scene.views)
+        return scene
+
+    return load
 
 
 class SceneCache:
@@ -249,7 +347,7 @@ def train_step(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    correspondences = build_anchor_correspondences(scene)
+    correspondences, eligibility = build_anchor_correspondences(scene)
     with autocast_context(precision):
         raw = model(scene.views, force_no_output_conversion=True)
         alignment, alignment_report = fit_scene_sim3(raw, scene)
@@ -302,6 +400,220 @@ def train_step(
         gradient_norms=norms,
         peak_bytes=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
         confidence=stats,
+    )
+
+
+def evaluate_held_out(
+    *,
+    model,
+    plans,
+    scene_provider,
+    precision: str,
+    huber_delta_m: float,
+    step: int,
+    output_dir: Path,
+    emit_predictions: bool = True,
+) -> dict:
+    """Score the held-out scenes without leaving a trace on the training run.
+
+    Two things are restored afterwards, and both matter. The **RNG streams**,
+    because an eval that consumed randomness would shift every subsequent
+    training draw and make a run with `--eval_every` differ from one without --
+    which is exactly what work-order test 5 asserts. And the **module modes**: the
+    step loop leaves `model.head` and `model.cam_dec` in `eval()` while the root
+    is in `train()`, so a bare `model.train()` here would silently re-enable the
+    frozen heads' training behaviour for every step after the first eval.
+
+    Predictions are written in the cluster scorers' schema and **not scored** --
+    ``evaluate_3dpt`` lives in the other environment.
+    """
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+        sparse_tracking_loss,
+    )
+    from arc.training.predictions import write_scene_predictions
+    from arc.training.runtime import shuffled_index_views
+
+    rng = capture_rng_state()
+    modes = {name: module.training for name, module in model.named_modules()}
+    directory = Path(output_dir) / "eval" / f"step-{step}"
+    per_scene: list[dict] = []
+
+    try:
+        model.eval()
+        for plan in plans:
+            scene = scene_provider(plan)
+            correspondences, eligibility = build_anchor_correspondences(scene)
+            with torch.no_grad(), autocast_context(precision):
+                raw = model(scene.views, force_no_output_conversion=True)
+                alignment, alignment_report = fit_scene_sim3(raw, scene)
+                anchors = gather_query_anchor_points(raw, scene, correspondences)
+                result = sparse_tracking_loss(
+                    tracking_only(raw),
+                    scene,
+                    correspondences,
+                    alignment,
+                    anchors,
+                    huber_delta_m=huber_delta_m,
+                )
+                entry = {
+                    "scene": plan.seq_name,
+                    "position_loss": float(result.loss.item()),
+                    "metric_error_m": float(result.metric_error.item()),
+                    "sample_count": int(result.sample_count),
+                    "alignment_scale": float(alignment_report["scale"]),
+                    "confidence": confidence_stats(raw),
+                }
+
+                # The index-advantage arm: the same model scored with one camera's
+                # time indices reversed. None when the window has no cross-camera
+                # synchronization to break, and reported as None rather than 0.
+                shuffled = shuffled_index_views(scene)
+                if shuffled is not None:
+                    shuffled_raw = model(shuffled, force_no_output_conversion=True)
+                    shuffled_result = sparse_tracking_loss(
+                        tracking_only(shuffled_raw),
+                        scene,
+                        correspondences,
+                        alignment,
+                        anchors,
+                        huber_delta_m=huber_delta_m,
+                    )
+                    entry["position_loss_shuffled"] = float(shuffled_result.loss.item())
+                    del shuffled_raw, shuffled_result
+                else:
+                    entry["position_loss_shuffled"] = None
+
+                if emit_predictions:
+                    arrays = _prediction_arrays(raw, scene, correspondences, alignment, anchors)
+                    write_scene_predictions(
+                        directory / "pred" / f"{plan.seq_name}.npz", arrays
+                    )
+            per_scene.append(entry)
+            del raw, scene
+    finally:
+        restore_rng_state(rng)
+        for name, module in model.named_modules():
+            module.training = modes[name]
+
+    losses = [entry["position_loss"] for entry in per_scene]
+    errors = [entry["metric_error_m"] for entry in per_scene]
+    shuffled_losses = [
+        entry["position_loss_shuffled"]
+        for entry in per_scene
+        if entry["position_loss_shuffled"] is not None
+    ]
+    metrics = {
+        "step": step,
+        "scenes": len(per_scene),
+        "position_loss": sum(losses) / len(losses) if losses else None,
+        "metric_error_m": sum(errors) / len(errors) if errors else None,
+        # None, not 0, when no scene had a synchronized pair to break: a zero here
+        # would read as "reversal costs nothing", which is a finding rather than
+        # an absence of one.
+        "position_loss_shuffled": (
+            sum(shuffled_losses) / len(shuffled_losses) if shuffled_losses else None
+        ),
+        "per_scene": per_scene,
+    }
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    return metrics
+
+
+def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
+    """Assemble one scene's bundle in the scorers' schema.
+
+    **The axis change is the substance here.** This repo's observation axis ``S``
+    is camera-major over ``cameras x times``; the scorers' axis is ``T``
+    timesteps with the cameras already fused, and their ``gt_vis_any`` is
+    visibility reduced with ``any`` over cameras. So each covered timestep's
+    cameras are combined before writing.
+
+    The fusion is a **confidence-weighted mean**, mirroring `score_joint.py`
+    verbatim (``clip(conf, 1e-6)`` then a weighted average) rather than inventing
+    a rule: that is what the existing joint-pass numbers were produced with, so a
+    different rule here would make these files incomparable with them.
+    """
+
+    from arc.training import gather_at_correspondences, sparse_targets
+    from arc.training.predictions import build_prediction_arrays
+
+    positions, visible, _finite, mask = sparse_targets(scene, correspondences)
+    metric = float(scene.track_upscaling_factor)
+    # From the predictions, matching `sparse_tracking_loss` (`device =
+    # tracks.device`). Taking it from `positions` inverts that: targets follow the
+    # correspondences, which `build_anchor_correspondences` builds on CPU, so this
+    # would gather a CUDA `track_multi` with CPU indices once the views move.
+    device = raw["track_multi"].device
+    # `sparse_targets` returns on the correspondences' device, which is CPU once
+    # only the views have moved. Everything below indexes these with slot indices
+    # derived from `device`, so they are co-located here rather than at each use.
+    positions = positions.to(device)
+    visible = visible.to(device)
+    mask = mask.to(device)
+
+    displacement = gather_at_correspondences(raw["track_multi"], correspondences.to(device))
+    predicted = (
+        alignment.to(device=device, dtype=torch.float32).apply_points(
+            torch.as_tensor(anchors, device=device, dtype=torch.float32)[:, None, :]
+            + displacement
+        )
+        * metric
+    )
+    target = positions * metric
+
+    confidence = raw.get("conf_track_multi")
+    weights = (
+        gather_at_correspondences(confidence, correspondences.to(device)).clamp_min(1e-6)
+        if confidence is not None
+        else torch.ones_like(mask, dtype=torch.float32)
+    )
+
+    slot_times = scene.slot_times.to(device)
+    covered = sorted({int(value) for value in slot_times.tolist()})
+    fused, fused_gt, fused_visible = [], [], []
+    for original_time in covered:
+        slots = (slot_times == original_time).nonzero(as_tuple=True)[0]
+        weight = weights[:, slots]
+        fused.append(
+            (predicted[:, slots] * weight[..., None]).sum(dim=1)
+            / weight.sum(dim=1)[..., None]
+        )
+        # The target does not depend on which camera saw it, so any slot of this
+        # instant carries it; taking the first is exact, not an approximation.
+        fused_gt.append(target[:, slots[0]])
+        fused_visible.append(visible[:, slots].any(dim=1))
+
+    predicted_tn = torch.stack(fused, dim=0)
+    target_tn = torch.stack(fused_gt, dim=0)
+    visible_tn = torch.stack(fused_visible, dim=0)
+
+    # Column 0 is the index into the covered timesteps, never the original frame.
+    position_of_time = {value: index for index, value in enumerate(covered)}
+    query_times = [
+        position_of_time[int(value)] for value in correspondences.query_times.tolist()
+    ]
+    query_xyz = scene.trajectories_world.to(device)[
+        correspondences.query_times.to(device),
+        correspondences.trajectory_indices.to(device),
+    ] * metric
+    queries = torch.cat(
+        [torch.tensor(query_times, device=device, dtype=torch.float32)[:, None], query_xyz],
+        dim=1,
+    )
+
+    return build_prediction_arrays(
+        predicted_positions=predicted_tn,
+        ground_truth_positions=target_tn,
+        # The scorer wants predicted visibility and inverts this, so what is
+        # stored is occlusion.
+        occluded=~visible_tn,
+        query_points=queries,
+        visible_any_camera=visible_tn,
     )
 
 
@@ -396,7 +708,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Report what every step would select and exit. Needs no GPU, no "
-            "checkpoint and no scene data. Currently the only supported mode"
+            "checkpoint and no scene data"
         ),
     )
     parser.add_argument(
@@ -456,6 +768,89 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument("--scene_cache", type=int, default=1)
+    training.add_argument(
+        "--max_scene_skip_fraction",
+        type=float,
+        default=0.02,
+        help=(
+            "Abort if more than this share of steps cannot load their scene "
+            "(default: %(default)s). Skipping absorbs a few degenerate scenes; "
+            "above this the root is wrong and the run would otherwise advance "
+            "its counter for days while recording no gradients"
+        ),
+    )
+    training.add_argument(
+        "--max_consecutive_scene_skips",
+        type=int,
+        default=10,
+        help=(
+            "Abort after this many scene loads fail back to back (default: "
+            "%(default)s). Needs no denominator, so it catches a broken root "
+            "within a few steps rather than waiting for a rate to be meaningful"
+        ),
+    )
+    training.add_argument(
+        "--dataset_name",
+        default="kubric-multiview-v3",
+        help=(
+            "Dataset name parsed for depth source and duster variants only. It "
+            "no longer decides which cameras a step sees: the provider loads "
+            "every view and indexes the record's own (default: %(default)s)"
+        ),
+    )
+    training.add_argument("--size", type=int, default=512)
+    training.add_argument(
+        "--min_shared_queries",
+        type=int,
+        default=64,
+        help=(
+            "Skip a step whose scene has a smaller eligible track pool than "
+            "(default: %(default)s) -- too small to be worth a step. A real "
+            "scene's pool is thousands, so this catches a broken scene rather "
+            "than trimming a distribution"
+        ),
+    )
+    training.add_argument(
+        "--honour_recorded_tracks",
+        action="store_true",
+        help=(
+            "Supervise only the tracks a record names, instead of every eligible "
+            "track in the scene. Off by default because it cannot be honoured: "
+            "two loads of one scene share about a fifth of their track ids "
+            "(jaccard 0.256 and 0.219 over two runs), and the eligible pool -- "
+            "itself redrawn each load -- holds 71-81%% of any draw, since both "
+            "are rebuilt from post-crop visibility and the crop is never "
+            "recorded. Missing ids are counted, not fatal -- unless a record "
+            "shares nothing at all with the pool, which skips the step"
+        ),
+    )
+
+    evaluation = parser.add_argument_group("held-out eval")
+    evaluation.add_argument(
+        "--eval_every",
+        type=int,
+        default=500,
+        help=(
+            "Steps between held-out evals. Pinned to MVTracker's CURVE_EVAL_FREQ "
+            "so the two curves overlay step for step (default: %(default)s)"
+        ),
+    )
+    evaluation.add_argument("--val_scenes_file", help="JSON list of held-out scene names")
+    evaluation.add_argument(
+        "--val_data_root",
+        help=(
+            "Directory the held-out scenes sit directly under -- the same kind of "
+            "resolved path a manifest row's data_root carries, not a split root. "
+            "Required whenever --val_scenes_file is given"
+        ),
+    )
+    evaluation.add_argument(
+        "--val_cameras",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2, 3],
+        help="Cameras for the held-out window; kubric-multiview-v3-views0123 (default: %(default)s)",
+    )
     return parser
 
 
@@ -476,6 +871,21 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--observation_budget {args.observation_budget} cannot seat even one "
             f"time at --min_views {args.min_views}"
+        )
+    # Refused HERE, at parse time, and not where the plans are built: that call
+    # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
+    # burn a full model load on a cluster node before reporting a missing flag --
+    # and it would surface as a traceback, since main()'s ValueError handler
+    # wraps only this function.
+    #
+    # Never guessed, either: the manifest's rows name the *training* directory
+    # and the held-out set is a different one by construction, so any fallback
+    # would silently score training scenes and file them as held-out.
+    if args.val_scenes_file and not args.val_data_root:
+        raise ValueError(
+            "--val_scenes_file needs --val_data_root: the held-out scenes live in "
+            "their own directory, and it cannot be derived from the manifest, "
+            "whose rows name the training directory"
         )
 
 
@@ -499,7 +909,11 @@ def _plan_summary(tally, args) -> dict:
         "observations_per_step": dict(sorted(observations.items())),
         "time_bound": dict(bounds),
         "stride": dict(strides),
-        "tracks_per_step": (
+        # The RECORDED draw's size, not what a step supervises: with
+        # --honour_recorded_tracks off (the default) every step supervises the
+        # scene's whole eligible pool, measured at 5486-5789 entries against a
+        # recorded ~2048. Named accordingly so the two are not confused.
+        "recorded_tracks_per_step": (
             None
             if not tracks
             else {"min": min(tracks), "max": max(tracks), "mean": sum(tracks) / len(tracks)}
@@ -553,7 +967,7 @@ def _print_plan(tally, summary, *, limit: int = 20) -> None:
         "views_per_step",
         "observations_per_step",
         "time_bound",
-        "tracks_per_step",
+        "recorded_tracks_per_step",
         "duplicate_track_ids",
         "records_with_scene_transform",
         "skipped",
@@ -572,13 +986,14 @@ def run_training(
     scene_provider,
     step_fn=train_step,
     output_dir: Path,
+    val_plans=None,
 ) -> dict:
     """The loop: schedule, step, guard, checkpoint, and stop when asked.
 
     ``scene_provider`` and ``step_fn`` are injected so the loop can be driven end
     to end without a GPU or a scene source -- which is what lets resume, the
     schedule and the cache be tested at all, and is also the seam the real scene
-    source plugs into once the cluster probe decides which one it is.
+    source plugs into: main() builds MVTrackerSceneProvider and wraps it.
     """
 
     # Captured BEFORE any optimizer.load_state_dict: that call overwrites each
@@ -615,11 +1030,32 @@ def run_training(
         resumed_from = str(args.resume)
         print(f"resumed from {resumed_from} at step {start_step}")
 
+    # Wrapped here rather than in main() so the wiring is on the path the CPU
+    # tests already drive; main() cannot run without a GPU, so a fix installed
+    # there would be untested by construction. Both consumers are covered, since
+    # evaluate_held_out takes this same callable.
+    scene_provider = cuda_scene_provider(scene_provider)
     cache = SceneCache(scene_provider, size=args.scene_cache)
+
+    # Prove the held-out set is reachable BEFORE spending training time on it.
+    # Without this a wrong --val_data_root surfaces at the first eval, which at
+    # --eval_every 500 is hours into a two-day allocation; the eval's own load is
+    # not covered by the step loop's skip policy, so it would end the run. This
+    # also exercises the CUDA move against the real provider at step 0.
+    # Deliberately NOT retained: this is a reachability check, not a cache, and
+    # holding every held-out scene resident would cost GiB at a peak already
+    # close to the guard.
+    for plan in val_plans or []:
+        scene_provider(plan)
+    if val_plans:
+        print(f"held_out_preflight_ok={len(val_plans)}")
     history: list[StepOutcome] = []
+    evaluations: list[dict] = []
     scene = None
     interrupted = None
     last_saved_step = None
+    scene_load_skips: Counter = Counter()
+    consecutive_skips = 0
 
     for step in range(start_step, args.num_steps):
         signal_name = stop_requested()
@@ -640,34 +1076,76 @@ def run_training(
         # Drop this loop's own reference before the cache loads the next scene, or
         # the old one stays alive across the load and two are resident at the peak.
         scene = None
-        scene = cache.get(plan)
+        try:
+            scene = cache.get(plan)
+        except SceneProviderError as error:
+            # Skip the step, but ADVANCE THE COUNTER. The premise is a curve that
+            # overlays MVTracker's step for step: retrying with the next plan would
+            # put a different scene at this step and desynchronise the two runs for
+            # the rest of the run. Losing one sample in thousands does not.
+            scene_load_skips[scene_skip_cause(error)] += 1
+            consecutive_skips += 1
+            print(f"step={step} scene={plan.seq_name} skipped: {error}")
+            check_scene_skip_rate(
+                scene_load_skips,
+                attempted=step - start_step + 1,
+                consecutive=consecutive_skips,
+                max_fraction=args.max_scene_skip_fraction,
+                max_consecutive=args.max_consecutive_scene_skips,
+            )
 
-        outcome = step_fn(
-            model=model,
-            scene=scene,
-            plan=plan,
-            optimizer=optimizer,
-            scaler=scaler,
-            precision=args.precision,
-            huber_delta_m=args.huber_delta_m,
-            grad_clip=args.grad_clip,
-            learning_rates=learning_rates,
-            step=step,
-        )
-        check_device_headroom(
-            outcome.peak_bytes, step=step, max_fraction=args.max_device_fraction
-        )
-        history.append(outcome)
-        print(
-            f"step={step}/{args.num_steps} scene={outcome.seq_name} "
-            f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
-            f"lr={learning_rates[0]:.3g} align_scale={outcome.alignment_scale:.6f} "
-            f"align_residual_m={outcome.alignment_residual_m:.6f} "
-            f"samples={outcome.sample_count} "
-            f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
-        )
+        # Deliberately NOT `continue`: the eval and checkpoint boundaries below
+        # are properties of the step *number*, not of whether this step produced
+        # a gradient. Skipping past them would drop the held-out point whenever a
+        # scene failed to load exactly on an --eval_every boundary -- a hole in
+        # the one curve this trainer exists to produce, with nothing in the
+        # output saying why. The eval scores the model against held-out scenes
+        # and does not depend on this step's scene at all.
+        if scene is not None:
+            consecutive_skips = 0
+            outcome = step_fn(
+                model=model,
+                scene=scene,
+                plan=plan,
+                optimizer=optimizer,
+                scaler=scaler,
+                precision=args.precision,
+                huber_delta_m=args.huber_delta_m,
+                grad_clip=args.grad_clip,
+                learning_rates=learning_rates,
+                step=step,
+            )
+            check_device_headroom(
+                outcome.peak_bytes, step=step, max_fraction=args.max_device_fraction
+            )
+            history.append(outcome)
+            print(
+                f"step={step}/{args.num_steps} scene={outcome.seq_name} "
+                f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
+                f"lr={learning_rates[0]:.3g} align_scale={outcome.alignment_scale:.6f} "
+                f"align_residual_m={outcome.alignment_residual_m:.6f} "
+                f"samples={outcome.sample_count} "
+                f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
+            )
 
         completed = step + 1
+        if val_plans and args.eval_every and completed % args.eval_every == 0:
+            metrics = evaluate_held_out(
+                model=model,
+                plans=val_plans,
+                scene_provider=scene_provider,
+                precision=args.precision,
+                huber_delta_m=args.huber_delta_m,
+                step=completed,
+                output_dir=output_dir,
+            )
+            evaluations.append(metrics)
+            print(
+                f"eval step={completed} scenes={metrics['scenes']} "
+                f"held_out_loss={metrics['position_loss']} "
+                f"held_out_metric_error_m={metrics['metric_error_m']} "
+                f"shuffled={metrics['position_loss_shuffled']}"
+            )
         if args.save_every and completed % args.save_every == 0:
             _write_checkpoint(model, optimizer, scaler, base_learning_rates,
                               step=completed, output_dir=output_dir, args=args)
@@ -690,7 +1168,9 @@ def run_training(
         "resumed_from": resumed_from,
         "interrupted_by": interrupted,
         "scene_cache": {"hits": cache.hits, "misses": cache.misses},
+        "scene_load_skips": dict(sorted(scene_load_skips.items())),
         "history": history,
+        "evaluations": evaluations,
     }
 
 
@@ -818,22 +1298,140 @@ def main() -> None:
         print(f"PASS planned {len(tally.planned)} steps from {manifest_path}")
         return
 
-    # Everything above this line is landing 2 and works. Below it, exactly one
-    # piece is missing, and it is named rather than approximated: a plan has to
-    # become a DumpedKubricScene, and whether that comes from the live MVTracker
-    # dataset or through the dumper is what the cluster probe decides. The loop,
-    # the step, the schedule, the checkpointing and the guards are all written
-    # and tested against an injected provider (see run_training).
-    raise NotImplementedError(
-        "scene_provider is not bound yet, so --manifest cannot train end to end. "
-        "Everything else in the loop is implemented and tested: the training "
-        "step, warmup+cosine, gradient clipping, checkpoint/resume, SIGUSR1/"
-        "SIGTERM handling, the scene cache and the occupancy guard. What is "
-        "missing is the one function mapping a StepPlan to a DumpedKubricScene, "
-        "which waits on the merged-env probe (does RC_ENV drive MVTracker's live "
-        "dataset at acceptable latency, or does the dumper become the replay?). "
-        "Use --plan_only until it lands."
+    if not args.checkpoint_dir or not args.output_dir:
+        parser.error("--checkpoint_dir and --output_dir are required to train")
+
+    import random
+
+    import numpy as np
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    from arc.models.arc.arc import Arc
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    install_signal_handlers()
+
+    late_global_blocks = (
+        args.late_global_blocks
+        if args.freeze_mode == "temporal_tracking_late_global"
+        else None
     )
+    model = Arc.from_pretrained(
+        args.checkpoint_dir, max_time_indices=args.max_time_indices
+    ).to("cuda")
+    model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    report = assert_trainable_parameter_set(
+        model,
+        freeze_mode=args.freeze_mode,
+        max_time_indices=args.max_time_indices,
+        late_global_blocks=late_global_blocks,
+    )
+    print(
+        f"trainable={report['tensor_count']} tensors / "
+        f"{report['parameter_count']} parameters ({args.freeze_mode})"
+    )
+
+    optimizer, learning_rates, _encoder = build_optimizer(
+        model,
+        lr=args.lr,
+        embedding_lr=args.embedding_lr,
+        encoder_lr=args.encoder_lr,
+    )
+    print(f"learning_rates={learning_rates}")
+    scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "16-mixed")
+
+    provider = MVTrackerSceneProvider(
+        dataset_name=args.dataset_name,
+        size=args.size,
+        min_shared_queries=args.min_shared_queries,
+        honour_recorded_tracks=args.honour_recorded_tracks,
+    )
+    val_plans = _val_plans(args)
+    if val_plans:
+        print(f"held_out_scenes={len(val_plans)} at --eval_every {args.eval_every}")
+
+    output_dir = Path(args.output_dir)
+    result = run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        plans=tally.planned,
+        args=args,
+        scene_provider=provider,
+        output_dir=output_dir,
+        val_plans=val_plans,
+    )
+
+    summary = {
+        **_plan_summary(tally, args),
+        "start_step": result["start_step"],
+        "completed_steps": result["completed_steps"],
+        "resumed_from": result["resumed_from"],
+        "interrupted_by": result["interrupted_by"],
+        "scene_cache": result["scene_cache"],
+        "scene_load_skips": result["scene_load_skips"],
+        "evaluations": result["evaluations"],
+        "trainable_tensor_count": report["tensor_count"],
+        "trainable_parameter_count": report["parameter_count"],
+        "learning_rates": learning_rates,
+        # Zero unless --honour_recorded_tracks: nothing is requested otherwise.
+        # Reported rather than raised on, because a recorded draw is not
+        # reproducible (V6(c)) and a raise would fire on nearly every record.
+        "honour_recorded_tracks": bool(args.honour_recorded_tracks),
+        "requested_track_ids": provider.requested_track_ids,
+        "missing_track_ids": provider.missing_track_ids,
+        **_gate_verdicts(
+            {
+                "interrupted_by": result["interrupted_by"],
+                "completed_steps": result["completed_steps"],
+                "planned_steps": len(tally.planned),
+            }
+        ),
+    }
+    (output_dir / "run_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(f"summary={output_dir / 'run_summary.json'}")
+    # Reported verdicts, never an exit code: the verdict of a multi-scene run is
+    # the held-out curve, not a threshold on a single number.
+    print(f"gates_passed={summary['gates_passed']}")
+
+
+def _val_plans(args) -> list[StepPlan]:
+    """Held-out scenes as plans, so eval and training share one scene path.
+
+    These carry no ``track_indices``: there is no recorded draw to replay on the
+    held-out side, so every eligible track is supervised. The window matches
+    training's, which is what makes the two curves the same measurement.
+    """
+
+    if not args.val_scenes_file:
+        return []
+    names = json.loads(Path(args.val_scenes_file).read_text())
+    cameras = tuple(args.val_cameras)
+    times = tuple(
+        range(0, min(args.observation_budget // len(cameras), args.max_time_indices) * args.stride, args.stride)
+    )
+    return [
+        StepPlan(
+            step=-1,
+            seq_name=str(name),
+            data_root=args.val_data_root,
+            cameras=cameras,
+            times=times,
+            frame_start=0,
+            seq_len=len(times) * args.stride,
+            stride=args.stride,
+            time_bound="budget",
+            track_indices=(),
+            scene_transform=None,
+            depth_type="gt",
+        )
+        for name in names
+    ]
 
 
 if __name__ == "__main__":

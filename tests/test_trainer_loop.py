@@ -16,6 +16,7 @@ resumed segment, because the final value alone hides it.
 
 from __future__ import annotations
 
+import json
 import signal
 import sys
 from dataclasses import dataclass
@@ -28,6 +29,9 @@ import torch
 import torch.nn as nn
 
 import train_temporal_tracking as train_cli
+from arc.training.predictions import PREDICTION_KEYS
+from arc.training.scene_provider import SceneProviderError
+from arc.training.manifest_plan import StepPlan
 from arc.training.schedule import (
     apply_learning_rate,
     capture_base_learning_rates,
@@ -202,6 +206,11 @@ def _loop_args(tmp_path, **overrides):
         resume=None,
         max_device_fraction=0.97,
         scene_cache=1,
+        # Present so a val_plans-carrying run reaches the eval instead of dying on
+        # a missing attribute; 0 keeps every existing test's behaviour unchanged.
+        eval_every=0,
+        max_scene_skip_fraction=0.02,
+        max_consecutive_scene_skips=10,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -493,6 +502,120 @@ def test_the_cache_key_separates_two_windows_on_one_scene(tmp_path):
     assert train_cli.SceneCache.key(wide) != train_cli.SceneCache.key(narrow)
 
 
+# ------------------------------------------------------------- the real step ---
+
+
+class _FakeArc(nn.Module):
+    """The submodule surface ``train_step`` reaches for, and nothing else.
+
+    Every other loop test injects ``step_fn``, so the real ``train_step`` body was
+    never executed -- which is how it shipped calling
+    ``build_anchor_correspondences`` without unpacking its ``(correspondences,
+    eligibility)`` tuple. A stub that produces a differentiable ``track_multi``
+    from real parameters is enough to run the body end to end on CPU, gradient
+    guards included.
+    """
+
+    def __init__(self, observations, height, width):
+        super().__init__()
+        self.observations, self.height, self.width = observations, height, width
+        self.head = nn.Linear(1, 1)
+        self.cam_dec = nn.Linear(1, 1)
+        self.motion_decoder = nn.Linear(1, 1)
+        self.track_head = nn.Linear(1, 1)
+        embedding = nn.Module()
+        embedding.time_index_embedding = nn.Embedding(8, 2)
+        pretrained = nn.Module()
+        pretrained.pretrained = embedding
+        self.backbone = pretrained
+        # The reconstruction and camera heads are frozen under every temporal
+        # preset. Leaving them trainable here would trip
+        # assert_trainable_gradients_finite on parameters the real model never
+        # asks for a gradient on -- the guard is right, the fake was wrong.
+        self.head.requires_grad_(False)
+        self.cam_dec.requires_grad_(False)
+
+    def forward(self, views, force_no_output_conversion=False):
+        # Every trainable parameter must receive a gradient or train_step's own
+        # guards fire -- which is part of what is being tested, so the forward
+        # touches biases as well as weights.
+        scale = (
+            self.motion_decoder.weight.sum()
+            + self.motion_decoder.bias.sum()
+            + self.track_head.weight.sum()
+            + self.track_head.bias.sum()
+            + self.backbone.pretrained.time_index_embedding.weight.sum()
+        )
+        tracks = torch.ones(
+            1, 1, self.observations, self.height, self.width, 3
+        ) * scale
+        return {
+            "track_multi": tracks,
+            "track_query_idx": torch.tensor([0], dtype=torch.long),
+            "depth": torch.ones(1, self.observations, self.height, self.width),
+            "pose_enc": torch.zeros(1, self.observations, 9),
+        }
+
+
+def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
+    """Covers the body every other loop test injects past.
+
+    Not a numerical check -- it asserts the step completes, produces a finite
+    loss and reports the guards it ran. That is enough to catch the class of
+    defect that actually occurred: an API on the `arc/training` side changing
+    shape under a call site nothing executes.
+    """
+
+    import arc.training.sparse_tracking as sparse_module
+    from arc.training import load_dumped_kubric_scene
+    from test_sparse_tracking import _write_scene
+
+    _write_scene(tmp_path, time_count=4, view_count=2, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    )
+
+    # Identity alignment, the same lever the sparse-tracking tests use: hand
+    # fit_scene_sim3 the scene's own metric pointmap so the fit is exact and the
+    # step's arithmetic is what is under test, not the geometry fixture.
+    target, _ = sparse_module._metric_pointmap_at_anchor(
+        scene, scene.query_observation_slot
+    )
+    pointmaps = torch.from_numpy(target).float().expand(
+        1, scene.num_observations, *target.shape
+    ).contiguous()
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    optimizer = torch.optim.AdamW(
+        [{"params": list(model.parameters()), "lr": 1e-3}]
+    )
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    outcome = train_cli.train_step(
+        model=model,
+        scene=scene,
+        plan=plan,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        learning_rates=[1e-3],
+        step=0,
+    )
+
+    assert outcome.step == 0
+    assert outcome.seq_name == "0000"
+    assert np.isfinite(outcome.loss)
+    assert outcome.sample_count > 0
+    # The guards ran and found gradient on every trainable group.
+    for group in ("time_embedding", "motion_decoder", "track_head"):
+        assert outcome.gradient_norms[group] > 0, group
+    assert "clipped_total" in outcome.gradient_norms
+
+
 # ----------------------------------------------------------------- signals ---
 
 
@@ -572,3 +695,400 @@ def test_the_headroom_guard_is_inert_without_cuda_and_names_the_step_with_it(mon
     train_cli.check_device_headroom(50 * 2**30, step=7, max_fraction=0.9)
     with pytest.raises(RuntimeError, match=r"step 7: peak .* over --max_device_fraction"):
         train_cli.check_device_headroom(95 * 2**30, step=7, max_fraction=0.9)
+
+
+# ------------------------------------------------------ the eval, end to end ---
+
+
+def _cpu_eval_scene(tmp_path, monkeypatch):
+    """A real two-camera window plus identity alignment, ready for the eval.
+
+    Two cameras is required rather than tidy: at one camera
+    ``shuffled_index_views`` returns ``None`` early and the index-advantage arm
+    never runs, which is where one of the two bugs this test exists for lives.
+    """
+
+    import arc.training.sparse_tracking as sparse_module
+    from arc.training import load_dumped_kubric_scene
+    from test_sparse_tracking import _write_scene
+
+    _write_scene(tmp_path, time_count=4, view_count=2, depth_sidecar=True)
+    scene = load_dumped_kubric_scene(
+        tmp_path, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    )
+    target, _ = sparse_module._metric_pointmap_at_anchor(
+        scene, scene.query_observation_slot
+    )
+    pointmaps = torch.from_numpy(target).float().expand(
+        1, scene.num_observations, *target.shape
+    ).contiguous()
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+    return scene
+
+
+def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
+    """The test that would have caught both eval-fatal bugs.
+
+    ``evaluate_held_out`` had no test at all, and shipped calling an unimported
+    ``capture_rng_state`` and passing two arguments to a one-argument
+    ``shuffled_index_views``. Neither is subtle; both survived a 339-test suite
+    because nothing ever executed the function. `main()` is `.to("cuda")`
+    unconditionally, so no CPU test can reach it from above -- this calls the
+    function directly, the way the train_step test does.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=7,
+        output_dir=tmp_path / "out",
+    )
+
+    assert metrics["step"] == 7 and metrics["scenes"] == 1
+    # Not None at two cameras: a None here would mean the index-advantage arm was
+    # skipped, which is how the wrong-arity call could hide.
+    assert metrics["position_loss_shuffled"] is not None
+    assert metrics["per_scene"][0]["scene"] == "0000"
+
+    directory = tmp_path / "out" / "eval" / "step-7"
+    written = json.loads((directory / "metrics.json").read_text())
+    assert written["scenes"] == 1
+    loaded = np.load(directory / "pred" / "0000.npz")
+    assert set(loaded.files) == set(PREDICTION_KEYS)
+
+
+def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
+    """Work-order test 5's mechanism, at the level it actually operates.
+
+    The eval must leave no trace: it consumes randomness and calls
+    ``model.eval()``, and the step loop deliberately leaves ``head``/``cam_dec``
+    in eval() while the root trains. Restoring the root alone would silently
+    re-enable the frozen heads' training behaviour for every step after the
+    first eval.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    model.train()
+    model.head.eval()
+    model.cam_dec.eval()
+    before = {name: module.training for name, module in model.named_modules()}
+    torch.manual_seed(1234)
+    state = torch.random.get_rng_state()
+
+    train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=1,
+        output_dir=tmp_path / "out",
+        emit_predictions=False,
+    )
+
+    assert {name: module.training for name, module in model.named_modules()} == before
+    assert torch.equal(torch.random.get_rng_state(), state)
+
+
+# ---------------------------------------------------------- the device seam ---
+
+
+def test_the_cuda_wrapper_moves_the_views_when_cuda_is_present(monkeypatch):
+    """F3 was "a function is never called", so this asserts a call, not a device.
+
+    Asserting tensor placement would be vacuous on a CPU box, where cpu == cpu
+    passes whether or not the move happened.
+    """
+
+    moved = []
+    monkeypatch.setattr(train_cli, "move_views_to_cuda", moved.append)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    scene = SimpleNamespace(views=[{"img": torch.zeros(1)}])
+
+    loaded = train_cli.cuda_scene_provider(lambda plan: scene)(object())
+
+    assert loaded is scene, "the cache stores and fingerprints whatever this returns"
+    assert len(moved) == 1 and moved[0] is scene.views
+
+
+def test_the_cuda_wrapper_is_a_no_op_without_cuda(monkeypatch):
+    """Which is what keeps every CPU test working once the wrap is wired in."""
+
+    moved = []
+    monkeypatch.setattr(train_cli, "move_views_to_cuda", moved.append)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    scene = SimpleNamespace(views=[{"img": torch.zeros(1)}])
+
+    assert train_cli.cuda_scene_provider(lambda plan: scene)(object()) is scene
+    assert moved == []
+
+
+def test_run_training_wraps_its_provider(tmp_path, monkeypatch):
+    """The wiring, which the two tests above cannot see.
+
+    If ``run_training`` stopped wrapping, both of them would still pass -- the
+    move is skipped on CPU either way. Faking availability is what makes the
+    branch reachable here, so this pins the call site rather than arguing about
+    it.
+    """
+
+    moved = []
+    monkeypatch.setattr(train_cli, "move_views_to_cuda", moved.append)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    # A distinct views list per scene, so the count below cannot be satisfied by
+    # one scene being moved repeatedly.
+    train_cli.run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name, views=[]),
+        step_fn=_recording_step([]),
+        output_dir=tmp_path,
+    )
+
+    assert len(moved) == 4, "one move per scene load, through the loop's own cache"
+
+
+# ------------------------------------------------- scene-load failure policy ---
+
+
+def _failing_provider(bad_names):
+    def load(plan):
+        if plan.seq_name in bad_names:
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the pool at '/root' (0 scenes)"
+            )
+        return SimpleNamespace(name=plan.seq_name, views=[])
+
+    return load
+
+
+def test_one_unloadable_scene_skips_its_step_without_ending_the_run(tmp_path):
+    """Over 4956 scenes a single bad one must not end a two-day allocation.
+
+    And the step counter still ADVANCES: the whole premise is a curve that
+    overlays MVTracker's step for step, so putting the next plan's scene at this
+    step would desynchronise the two runs permanently. Losing one sample does not.
+    """
+
+    recorded = []
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    plans = _plans(4)
+
+    result = train_cli.run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4),
+        scene_provider=_failing_provider({plans[1].seq_name}),
+        step_fn=_recording_step(recorded),
+        output_dir=tmp_path,
+    )
+
+    assert result["completed_steps"] == 4, "the run reaches its full step count"
+    assert result["scene_load_skips"] == {"scene_absent": 1}
+    # The surviving steps keep their ORIGINAL numbers -- 1 is missing, not
+    # backfilled by what would otherwise have been step 2.
+    assert [entry.step for entry in recorded] == [0, 2, 3]
+
+
+def test_a_wholly_unloadable_pool_aborts_with_the_tally(tmp_path):
+    """Skipping must not become "silently do nothing for two days".
+
+    This is the shape a wrong --data_root takes, and the shape an inherited
+    max_videos=30 cap took: every step advancing, no gradients, a summary that
+    reads as a completed run.
+    """
+
+    plans = _plans(4)
+    model = _toy_model()
+    with pytest.raises(RuntimeError, match=r"consecutive steps could not load"):
+        train_cli.run_training(
+            model=model,
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=plans,
+            args=_loop_args(tmp_path, num_steps=4, max_consecutive_scene_skips=3),
+            scene_provider=_failing_provider({plan.seq_name for plan in plans}),
+            step_fn=_recording_step([]),
+            output_dir=tmp_path,
+        )
+
+
+def test_the_skip_causes_are_distinguished(tmp_path):
+    """A single "failed" count reports a broken root and a bad scene alike."""
+
+    absent = SceneProviderError("scene '0001' is not in the pool at '/root' (0 scenes)")
+    small = SceneProviderError("scene '0002': only 3 eligible tracks, below ...")
+    empty = SceneProviderError("scene '0003': ... leaves nothing to supervise")
+
+    assert train_cli.scene_skip_cause(absent) == "scene_absent"
+    assert train_cli.scene_skip_cause(small) == "pool_too_small"
+    assert train_cli.scene_skip_cause(empty) == "no_recorded_tracks_present"
+    assert train_cli.scene_skip_cause(SceneProviderError("unrecognised")) == "other"
+
+
+def test_val_scenes_without_a_val_root_is_refused_at_parse_time(tmp_path, monkeypatch, capsys):
+    """Refused through the CLI, not just by the function that would have raised.
+
+    Two things this pins that a direct call on the helper cannot. It must be a
+    clean ``parser.error`` -- exit 2 with a message -- rather than an unhandled
+    traceback, which is what it was when the check lived where the plans are
+    built, outside main()'s ValueError handler. And it must fire BEFORE
+    ``Arc.from_pretrained(...).to("cuda")``, or a cluster job burns a full model
+    load to be told a flag is missing. Reaching that load would need a manifest,
+    a checkpoint dir and a GPU, none of which exist here -- so the SystemExit
+    arriving at all is the proof that nothing downstream ran.
+    """
+
+    scenes = tmp_path / "val.json"
+    scenes.write_text(json.dumps(["0000"]))
+    monkeypatch.setattr(
+        sys, "argv",
+        ["train_temporal_tracking.py", "--manifest", str(tmp_path / "m.jsonl"),
+         "--val_scenes_file", str(scenes)],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        train_cli.main()
+
+    assert exit_info.value.code == 2
+    assert "--val_scenes_file needs --val_data_root" in capsys.readouterr().err
+
+
+def test_the_val_flag_pair_is_checked_by_the_argument_validator(tmp_path):
+    """And the unit underneath, so the message itself is pinned."""
+
+    args = _loop_args(
+        tmp_path, val_scenes_file="val.json", val_data_root=None,
+        min_views=2, max_time_indices=32, max_unreplayable_fraction=0.02,
+        max_records=None,
+    )
+
+    with pytest.raises(ValueError, match="--val_scenes_file needs --val_data_root"):
+        train_cli._validate_args(args)
+
+    args.val_data_root = "/held/out/dir"
+    train_cli._validate_args(args)
+
+
+def test_the_held_out_set_is_proved_reachable_before_the_first_step(tmp_path):
+    """A bad held-out root must die at step 0, not at the first eval.
+
+    evaluate_held_out loads through its own call, outside the step loop's skip
+    policy, so an unreachable val scene ends the run -- at --eval_every 500 that
+    is hours into a two-day allocation. The preflight also exercises the CUDA
+    move against the real provider before any training time is spent.
+    """
+
+    loaded = []
+
+    def provider(plan):
+        loaded.append(plan.seq_name)
+        if plan.seq_name == "val-bad":
+            raise SceneProviderError(f"scene {plan.seq_name!r} is not in the pool")
+        return SimpleNamespace(name=plan.seq_name, views=[])
+
+    val = [
+        StepPlan(
+            step=-1, seq_name=name, data_root="/val", cameras=(0, 1), times=(0, 2),
+            frame_start=0, seq_len=4, stride=2, time_bound="budget",
+            track_indices=(), scene_transform=None, depth_type=None,
+        )
+        for name in ("val-bad",)
+    ]
+    model = _toy_model()
+
+    with pytest.raises(SceneProviderError, match="not in the pool"):
+        train_cli.run_training(
+            model=model,
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=_plans(4),
+            args=_loop_args(tmp_path, num_steps=4),
+            scene_provider=provider,
+            step_fn=_recording_step([]),
+            output_dir=tmp_path,
+            val_plans=val,
+        )
+
+    # Before any training step ran, which is the whole point.
+    assert loaded == ["val-bad"]
+
+
+def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
+    tmp_path, monkeypatch
+):
+    """The hole S4 could have punched in the thing it was protecting.
+
+    Skipping a step must not skip that step's *boundaries*. The whole deliverable
+    is a held-out curve that overlays MVTracker's every --eval_every steps, so a
+    scene failing to load exactly on a boundary would drop that point silently --
+    a gap in the one output that carries the result, with nothing saying why. The
+    eval scores the model against held-out scenes and does not depend on the
+    training scene that failed, so there is no reason to lose it.
+
+    The earlier skip tests assert step numbers and would all pass with the
+    boundary skipped; this puts the failure on the boundary deliberately, and
+    drives the REAL evaluate_held_out rather than a stub, so the point it
+    produces is a real one.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    plans = _plans(4)
+    failing = plans[1].seq_name
+
+    def provider(plan):
+        if plan.seq_name == failing:
+            raise SceneProviderError(f"scene {plan.seq_name!r} is not in the pool")
+        return scene
+
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4, eval_every=2),
+        scene_provider=provider,
+        # The model here is a _FakeArc, for the real eval; the recording step_fn
+        # expects the toy model, so this test supplies its own no-op step. What
+        # is under test is which boundaries fire, not what a step computes.
+        step_fn=lambda *, step, plan, **_: train_cli.StepOutcome(
+            step=step, seq_name=plan.seq_name, loss=0.0, metric_error_m=0.0,
+            sample_count=1, alignment_scale=1.0, alignment_residual_m=0.0,
+            learning_rates=[1e-3], gradient_norms={},
+        ),
+        output_dir=tmp_path,
+        val_plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+    )
+
+    # Step 1 failed to load, and completed == 2 is an eval boundary.
+    assert result["scene_load_skips"] == {"scene_absent": 1}
+    assert [entry["step"] for entry in result["evaluations"]] == [2, 4], (
+        "the boundary at 2 must survive its own step's skip"
+    )
