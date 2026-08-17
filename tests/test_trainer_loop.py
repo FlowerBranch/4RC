@@ -991,6 +991,25 @@ def test_the_val_flag_pair_is_checked_by_the_argument_validator(tmp_path):
     train_cli._validate_args(args)
 
 
+def test_the_depth_clip_defaults_to_the_paired_runs_value_and_is_a_float():
+    """The flag exists so the mirrored value is visible, not buried in a dict.
+
+    24 is not this project's number -- it is configs/train.yaml's
+    datasets.train.kubric_max_depth in the mvtracker checkout. A run that has to
+    match a different paired run needs to say so on the command line, and a run
+    that matched should be able to prove it from its own artifacts.
+    """
+
+    args = train_cli.build_arg_parser().parse_args(["--manifest", "m.jsonl"])
+    assert args.kubric_max_depth == 24.0
+    assert isinstance(args.kubric_max_depth, float)
+
+    override = train_cli.build_arg_parser().parse_args(
+        ["--manifest", "m.jsonl", "--kubric_max_depth", "12.5"]
+    )
+    assert override.kubric_max_depth == 12.5
+
+
 def test_the_held_out_set_is_proved_reachable_before_the_first_step(tmp_path):
     """A bad held-out root must die at step 0, not at the first eval.
 
@@ -1013,6 +1032,7 @@ def test_the_held_out_set_is_proved_reachable_before_the_first_step(tmp_path):
             step=-1, seq_name=name, data_root="/val", cameras=(0, 1), times=(0, 2),
             frame_start=0, seq_len=4, stride=2, time_bound="budget",
             track_indices=(), scene_transform=None, depth_type=None,
+            real_len=None,
         )
         for name in ("val-bad",)
     ]

@@ -28,6 +28,19 @@ and not the same query points (see the class docstring) -- and the comparison th
 carries the result is the held-out curve.  It does mean a different aspect ratio
 reaches ``compute_image_transform``, which is tested at both shapes.
 
+**The photometric and depth augmentations are not replayed either.**  The paired
+run sets ``augmentations.probability 0.8`` with ``rgb`` and ``depth`` true; the
+replay inherits ``0.0``/false/false, so upstream's ``augment_this_datapoint`` is
+never true and no sample is jittered.  That is a real difference and it is left
+in place deliberately.  4RC's view dicts carry no depth, so depth on this path
+feeds the Sim(3) fit and the anchor lifting -- it builds *labels*, and perturbing
+it would inject noise into the supervision targets rather than robustness into
+the inputs.  The crop settles the rest by precedent: it is gated by
+``enable_cropping_augs`` alone rather than by the probability, so it perturbs
+every MVTracker sample more than rgb jitter would, and is already accepted as
+unreplayable.  What the pairing controls is which samples arrive in which order,
+never the training recipe.
+
 Importing MVTracker is deferred to the first load: this module is imported by the
 trainer's tests, which run in an environment where ``mvtracker`` is deliberately
 absent.
@@ -198,6 +211,7 @@ class MVTrackerSceneProvider:
         patch_size: int = 14,
         min_shared_queries: int = 64,
         honour_recorded_tracks: bool = False,
+        max_depth: float = 24.0,
     ):
         # There is deliberately no ``subset``: it was only ever a path component,
         # and after the override above it decides nothing. A held-out set is a
@@ -205,6 +219,11 @@ class MVTrackerSceneProvider:
         self.dataset_name = dataset_name
         self.size = size
         self.patch_size = patch_size
+        # Mirrors the paired run's `datasets.train.kubric_max_depth`, so it is a
+        # constructor parameter rather than a literal in the override dict:
+        # the value belongs to someone else's config and has to stay visible and
+        # overridable when that config moves.
+        self.max_depth = max_depth
         # Now guards "this scene's own pool is too small to be worth a step",
         # not "too little of a recorded draw survived".
         self.min_shared_queries = min_shared_queries
@@ -216,9 +235,18 @@ class MVTrackerSceneProvider:
         # Keyed on data_root alone, which is now fully determining.
         self._datasets: dict[str, object] = {}
 
-    def _dataset(self, data_root: str):
+    def _dataset(self, data_root: str, real_len: int | None):
+        """The loader for one ``data_root``, built once and reused.
+
+        ``real_len`` is the pool size the manifest recorded for this row, or
+        ``None`` for a plan that has no recorded row (the held-out set, which was
+        never drawn from a manifest). It is checked rather than trusted: see
+        :meth:`_check_pool_size`.
+        """
+
         cached = self._datasets.get(data_root)
         if cached is not None:
+            self._check_pool_size(cached, data_root, real_len)
             return cached
         try:
             from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
@@ -240,17 +268,52 @@ class MVTrackerSceneProvider:
         )
         kwargs.update(self.dataset_overrides(data_root))
         dataset = KubricMultiViewDataset(**kwargs)
+        # Cached BEFORE the check, deliberately. The object loaded fine; what is
+        # wrong is its pairing with this manifest, and that verdict is the same
+        # every step. Checking first would discard it, so the trainer's skip
+        # policy would rebuild -- rescanning the whole pool -- once per step until
+        # the consecutive-skip limit aborts. Cached, the retries re-raise from the
+        # cache hit above and cost nothing.
         self._datasets[data_root] = dataset
+        self._check_pool_size(dataset, data_root, real_len)
         return dataset
 
     @staticmethod
-    def dataset_overrides(data_root: str) -> dict:
+    def _check_pool_size(dataset, data_root: str, real_len: int | None) -> None:
+        """The pool this opened must be the pool the manifest drew from.
+
+        The `max_videos` cap was one way to get a quietly different pool; it is
+        not the only one, and the next will not look like it. A moved split, a
+        half-staged copy, an upstream default that starts filtering scenes -- each
+        gives a pool that loads fine and simply is not the one the recorded run
+        sampled, and every ``sample_index`` and ``seq_name`` read against it then
+        means something else. The manifest already records the wrap period, so
+        this is a comparison rather than an assumption, and it costs one ``len``.
+        """
+
+        if real_len is None:
+            return
+        loaded = len(list(getattr(dataset, "seq_names", [])))
+        if loaded != real_len:
+            raise SceneProviderError(
+                f"pool at {data_root!r} holds {loaded} scenes but the manifest "
+                f"recorded real_len={real_len}. The replay would draw from a "
+                "different pool than the run it is replaying"
+            )
+
+    def dataset_overrides(self, data_root: str) -> dict:
         """Everything `from_name`'s *evaluation* defaults get wrong for a replay.
 
         Split out so it can be tested without MVTracker importable. It is the
         whole of what this repo decides about how scenes are loaded, and three of
-        these seven were shipped-and-fatal before they were caught, so the reasons
+        these eight were shipped-and-fatal before they were caught, so the reasons
         are recorded per line rather than in a commit message.
+
+        Not every inherited default is wrong. ``ratio_dynamic`` and
+        ``ratio_very_dynamic`` are deliberately absent: they are overridden
+        upstream only under ``modes.pretrain_only``, which the paired run never
+        enters, so it trains at the same 0.5/0.25 and "fixing" them here would
+        *create* the divergence. There is a test saying so.
         """
 
         return {
@@ -285,6 +348,42 @@ class MVTrackerSceneProvider:
             # but wrong: rows name their own view sets, per row.
             "num_views": -1,
             "views_to_return": None,
+            # The only one of these that `from_name` never mentions: it is the
+            # CONSTRUCTOR default (kubric_multiview_dataset.py:212) of 1000, and
+            # the override to the paired run's 24 sits at :160, inside the
+            # `training_args` block a replay never enters. Depth beyond it is
+            # zeroed -- i.e. marked invalid -- unconditionally at :882, so
+            # inheriting 1000 trains on different geometry AND different labels
+            # than the run this is paired with, on every sample, without raising.
+            # Unlike the augmentations there is no draw here and nothing
+            # unrecordable: it is a value nobody chose, so it is simply set.
+            #
+            # KNOWN GAP: nothing verifies 24 is still what the paired run uses.
+            # There is a test pinning upstream's 1000 default, but that catches
+            # the loader changing, not the run's config moving. Do NOT close this
+            # by asserting `configs/train.yaml`'s value -- that reads as coverage
+            # while checking one of two sources, and the other is live:
+            # train_curve.sbatch already overrides `datasets.train.traj_per_sample`
+            # from the command line, so a `kubric_max_depth` override alongside it
+            # would pass such a test unnoticed. The instrument that actually works
+            # is the paired run's own RESOLVED config: hydra writes it to
+            # `.hydra/config.yaml` under `experiment_path`, which is the manifest's
+            # own directory, so it records what THAT manifest was drawn under,
+            # overrides included, and needs no sibling checkout. It would answer
+            # the same question for every other assumption this replay makes.
+            # Confirmed present at `experiment_path`/.hydra/ (config.yaml,
+            # hydra.yaml, overrides.yaml -- the last a direct record of what the
+            # job passed). Unbuilt because it is a larger change than this round,
+            # not because it is unverified.
+            #
+            # That config for run 19739167 reads `kubric_max_depth: 24`, so this
+            # value is checked against the paired run's OWN resolved config and
+            # not merely against a checkout of `train.yaml`. The same file also
+            # confirms the `camera_params_noise: false` and
+            # `variable_depth_type: false` that the rest of this override set
+            # depends on -- which is exactly the leverage that makes building the
+            # check worth someone's afternoon.
+            "max_depth": self.max_depth,
         }
 
     def select_columns(self, plan, pool) -> TrackSelection:
@@ -330,7 +429,7 @@ class MVTrackerSceneProvider:
     def __call__(self, plan):
         from arc.training import scene_from_datapoint
 
-        dataset = self._dataset(plan.data_root)
+        dataset = self._dataset(plan.data_root, plan.real_len)
         names = list(getattr(dataset, "seq_names", []))
         if plan.seq_name not in names:
             raise SceneProviderError(

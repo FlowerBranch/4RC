@@ -71,6 +71,12 @@ class StepPlan:
     track_indices: tuple[int, ...]
     scene_transform: dict | None
     depth_type: str | None
+    # The drawing pool's size, so a replay can prove it opened the same pool
+    # rather than assuming it. Deliberately has no default: ``None`` is a real
+    # answer -- a held-out plan was never drawn from a manifest and has no
+    # recorded pool -- and it should be given on purpose, not inherited by a
+    # caller that forgot the field exists.
+    real_len: int | None
     sample_index: int | None = None
     augmented: bool | None = None
 
@@ -333,6 +339,10 @@ def plan_record(
         track_indices=track_indices,
         scene_transform=record.get("scene_transform"),
         depth_type=record.get("depth_type"),
+        # Carried so the provider can check the pool it opens against the pool
+        # this row was drawn from. Read with `.get`: it is in the schema, but a
+        # row that omits it should plan and skip the check, not fail to plan.
+        real_len=None if record.get("real_len") is None else int(record["real_len"]),
         sample_index=record.get("sample_index"),
         augmented=record.get("augmented"),
     )

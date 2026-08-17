@@ -824,6 +824,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "shares nothing at all with the pool, which skips the step"
         ),
     )
+    training.add_argument(
+        "--kubric_max_depth",
+        type=float,
+        default=24.0,
+        help=(
+            "Metres beyond which the loader marks depth invalid. Mirrors the "
+            "paired run's configs/train.yaml datasets.train.kubric_max_depth; "
+            "MVTracker's loader defaults to 1000 whenever it is built without "
+            "training args, which is every replay, and the difference is silent "
+            "-- it moves geometry and labels rather than appearance "
+            "(default: %(default)s)"
+        ),
+    )
 
     evaluation = parser.add_argument_group("held-out eval")
     evaluation.add_argument(
@@ -1350,6 +1363,7 @@ def main() -> None:
         size=args.size,
         min_shared_queries=args.min_shared_queries,
         honour_recorded_tracks=args.honour_recorded_tracks,
+        max_depth=args.kubric_max_depth,
     )
     val_plans = _val_plans(args)
     if val_plans:
@@ -1385,6 +1399,11 @@ def main() -> None:
         "honour_recorded_tracks": bool(args.honour_recorded_tracks),
         "requested_track_ids": provider.requested_track_ids,
         "missing_track_ids": provider.missing_track_ids,
+        # In the run's own artifacts because it mirrors a value from another
+        # repo's config: when the two curves are compared, the depth clip each
+        # was trained under should be readable from the run rather than inferred
+        # from whichever version of train.yaml happens to be checked out.
+        "kubric_max_depth": float(args.kubric_max_depth),
         **_gate_verdicts(
             {
                 "interrupted_by": result["interrupted_by"],
@@ -1429,6 +1448,11 @@ def _val_plans(args) -> list[StepPlan]:
             track_indices=(),
             scene_transform=None,
             depth_type="gt",
+            # No recorded pool: these scenes come from a JSON list, not from a
+            # manifest row, so there is no drawn-from count to check the loaded
+            # pool against. Asserting the held-out pool's size here would be
+            # inventing a fact rather than replaying one.
+            real_len=None,
         )
         for name in names
     ]

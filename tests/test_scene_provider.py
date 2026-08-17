@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -597,7 +599,7 @@ EVAL_DEFAULT_KWARGS = {
 
 
 def test_the_provider_overrides_every_eval_default_that_breaks_a_replay():
-    """Three of these six were shipped-and-fatal, so each is pinned by name.
+    """Three of these eight were shipped-and-fatal, so each is pinned by name.
 
     `from_name` returns *evaluation* defaults whenever it is handed no
     `training_args`, which is always, here. Inheriting them silently gave a
@@ -607,7 +609,7 @@ def test_the_provider_overrides_every_eval_default_that_breaks_a_replay():
     from arc.training.scene_provider import MVTrackerSceneProvider
 
     kwargs = dict(EVAL_DEFAULT_KWARGS)
-    kwargs.update(MVTrackerSceneProvider.dataset_overrides("/rows/own/dir"))
+    kwargs.update(MVTrackerSceneProvider().dataset_overrides("/rows/own/dir"))
 
     # Verbatim, never a join: the row's data_root is already the directory scenes
     # sit directly under, so re-resolving it produced a path that existed nowhere.
@@ -624,6 +626,28 @@ def test_the_provider_overrides_every_eval_default_that_breaks_a_replay():
     # Replayed from the record, not redrawn.
     assert kwargs["enable_scene_transform_augs"] is False
     assert kwargs["enable_cropping_augs"] is False
+    # The paired run's clip, not the loader's 1000-metre constructor default.
+    # This one is invisible in EVAL_DEFAULT_KWARGS on purpose: `from_name` never
+    # emits `max_depth` at all, so nothing above would have shown it missing.
+    assert kwargs["max_depth"] == 24.0
+
+
+def test_the_depth_clip_is_the_paired_runs_and_is_overridable():
+    """The value mirrors another repo's config, so it must not be a literal here.
+
+    `from_name` never emits `max_depth`, so this is not an inherited kwarg being
+    corrected -- it is a constructor default (1000) that would otherwise apply
+    because a replay is built without training args. Nothing raises when it is
+    wrong; the run simply trains on geometry and labels clipped 40x further out
+    than the run it is paired with.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    assert MVTrackerSceneProvider().dataset_overrides("/d")["max_depth"] == 24.0
+    # Overridable, because the upstream config it mirrors can move.
+    provider = MVTrackerSceneProvider(max_depth=12.5)
+    assert provider.dataset_overrides("/d")["max_depth"] == 12.5
 
 
 def test_the_dynamic_ratios_are_left_alone_deliberately():
@@ -641,10 +665,177 @@ def test_the_dynamic_ratios_are_left_alone_deliberately():
 
     from arc.training.scene_provider import MVTrackerSceneProvider
 
-    overrides = MVTrackerSceneProvider.dataset_overrides("/rows/own/dir")
+    overrides = MVTrackerSceneProvider().dataset_overrides("/rows/own/dir")
 
     assert "ratio_dynamic" not in overrides
     assert "ratio_very_dynamic" not in overrides
+
+
+# --------------------------------------------------------- the pool guard ---
+
+
+@pytest.fixture
+def stub_loader(monkeypatch):
+    """MVTracker's loader, reduced to the two things ``_dataset`` uses of it.
+
+    Inserted through ``sys.modules`` like ``stub_transform_scene``, which is what
+    the provider's deferred import exists to allow. Records each construction so
+    a test can count pool scans, the expensive part of a real build.
+    """
+
+    import sys
+    import types
+
+    state = {"builds": []}
+
+    class _Dataset:
+        def __init__(self, **kwargs):
+            state["builds"].append(kwargs["data_root"])
+            state["kwargs"] = kwargs
+            # Two scenes, so any real_len a test asserts on disagrees loudly.
+            self.seq_names = ["0000", "0001"]
+
+        @staticmethod
+        def from_name(name, dataset_root, just_return_kwargs=False):
+            return {"data_root": os.path.join(dataset_root, "kubric-multiview", "test")}
+
+    module = types.ModuleType("mvtracker.datasets.kubric_multiview_dataset")
+    module.KubricMultiViewDataset = _Dataset
+    datasets = types.ModuleType("mvtracker.datasets")
+    datasets.kubric_multiview_dataset = module
+    root = types.ModuleType("mvtracker")
+    root.datasets = datasets
+    monkeypatch.setitem(sys.modules, "mvtracker", root)
+    monkeypatch.setitem(sys.modules, "mvtracker.datasets", datasets)
+    monkeypatch.setitem(
+        sys.modules, "mvtracker.datasets.kubric_multiview_dataset", module
+    )
+    return state
+
+
+def test_the_rows_data_root_reaches_the_loader_unjoined(stub_loader):
+    """The regression test for the defect that resolved every scene nowhere.
+
+    `from_name` builds its `data_root` by joining `<root>/kubric-multiview/
+    <subset>`. Handing it a row's already-resolved path as `dataset_root` made it
+    join a second time, so a row naming `.../kubric-multiview/train` opened
+    `.../kubric-multiview/train/kubric-multiview/test` -- a path that exists
+    nowhere, failing at construction on the first step of every plan.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    MVTrackerSceneProvider()._dataset("/pool/kubric-multiview/train", None)
+
+    used = stub_loader["kwargs"]["data_root"]
+    assert used == "/pool/kubric-multiview/train"
+    # The join would have appended a second one; nothing may re-resolve the path.
+    assert used.count("kubric-multiview") == 1
+    # And the value the provider decides reaches the loader, not just the dict.
+    assert stub_loader["kwargs"]["max_depth"] == 24.0
+
+
+def test_a_pool_of_the_wrong_size_is_refused_naming_both_counts():
+    """The generalisation of the max_videos bug, rather than a fix for it.
+
+    A cap was one way to open a quietly different pool; a moved split or a
+    half-staged copy are others, and the next one will not look like a cap. Each
+    loads fine and simply is not the pool the run sampled, after which every
+    seq_name resolves against the wrong set. The manifest already records the
+    wrap period, so this is a comparison, not an assumption.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    dataset = SimpleNamespace(seq_names=[f"{i:04d}" for i in range(30)])
+
+    with pytest.raises(SceneProviderError) as excinfo:
+        MVTrackerSceneProvider()._check_pool_size(dataset, "/pool", 4956)
+
+    # Both counts, because "wrong pool" is not actionable and "30 against 4956"
+    # names the cap on sight.
+    message = str(excinfo.value)
+    assert "30" in message and "4956" in message and "/pool" in message
+
+
+def test_a_matching_pool_passes_and_an_unrecorded_one_is_not_invented():
+    """None is a real answer, not a missing one.
+
+    Held-out plans come from a JSON list of names rather than a manifest row, so
+    they carry no drawn-from count. Guessing one -- say, asserting the held-out
+    pool matches the training pool -- would fail every correct run.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    provider = MVTrackerSceneProvider()
+    dataset = SimpleNamespace(seq_names=["0000", "0001", "0002"])
+
+    provider._check_pool_size(dataset, "/pool", 3)
+    provider._check_pool_size(dataset, "/pool", None)
+
+
+def test_the_pool_guard_reaches_a_cached_dataset_too():
+    """A second data_root's plan must not skip the check by hitting the cache.
+
+    The dataset is built once per data_root and reused, so a guard that only ran
+    on construction would check the first plan and wave through every later one
+    -- including the row whose real_len actually disagrees.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    provider = MVTrackerSceneProvider()
+    dataset = SimpleNamespace(seq_names=["0000", "0001"])
+    provider._datasets["/pool"] = dataset
+
+    assert provider._dataset("/pool", 2) is dataset
+    with pytest.raises(SceneProviderError, match="real_len=99"):
+        provider._dataset("/pool", 99)
+
+
+def test_a_mismatched_pool_is_built_once_however_many_steps_retry(stub_loader):
+    """The trainer skips a failed load and tries again, so this must be cheap.
+
+    Construction scans the whole pool -- thousands of scenes, per build. A guard
+    that ran before the object was cached would discard it, so every retry before
+    the consecutive-skip limit aborts would rescan from scratch. The verdict is
+    identical each time, so the object is kept and the retries re-raise off the
+    cache. This drives the real build path, not a pre-seeded cache, because the
+    ordering it pins is inside that path.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    provider = MVTrackerSceneProvider()
+
+    for _ in range(3):
+        with pytest.raises(SceneProviderError, match="real_len=4956"):
+            provider._dataset("/pool", 4956)
+
+    assert stub_loader["builds"] == ["/pool"], "the pool was rescanned on a retry"
+    assert "/pool" in provider._datasets, "a usable loader was thrown away"
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mvtracker") is None,
+    reason="upstream not importable; the fixture is pinned by inspection instead",
+)
+def test_the_loader_default_this_repo_overrides_is_still_1000():
+    """The drift alarm for max_depth, which no from_name kwarg would reveal.
+
+    EVAL_DEFAULT_KWARGS cannot carry this: `from_name` does not emit `max_depth`,
+    so the value the replay would inherit lives in the constructor signature. If
+    upstream ever changes that default, the override stops being a correction and
+    this says so on the cluster.
+    """
+
+    import inspect
+
+    from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
+
+    default = inspect.signature(KubricMultiViewDataset.__init__).parameters["max_depth"].default
+    assert default == 1000, f"upstream's max_depth default moved to {default!r}"
 
 
 @pytest.mark.skipif(
