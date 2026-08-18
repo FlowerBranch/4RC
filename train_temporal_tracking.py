@@ -1021,6 +1021,9 @@ def run_training(
         from arc.training.checkpoint import load_temporal_tracking_checkpoint
 
         payload = read_trainer_state(args.resume)
+        # Before any state is restored: a refused resume must leave the model,
+        # optimizer and RNG streams exactly as built.
+        check_resume_settings(payload.get("settings") or {}, args)
         # The weights, through the existing strict loader rather than a second
         # copy of the same overlay: it checks the key set against the model's own
         # trainable parameters, so a patch from a different freeze mode is refused
@@ -1187,6 +1190,29 @@ def run_training(
     }
 
 
+def _checkpoint_settings(args) -> dict:
+    """The flags a resume must agree on, in the checkpoint's plain types.
+
+    Built in one place so the writer and ``check_resume_settings`` cannot
+    drift: the checker compares stored values against exactly this dict.
+    """
+
+    return {
+        "observation_budget": args.observation_budget,
+        "stride": args.stride,
+        "min_views": args.min_views,
+        "max_time_indices": args.max_time_indices,
+        # The plan summary's name for --exclude_data_root, so the checkpoint
+        # and run_summary.json read alike.
+        "excluded_data_roots": list(args.exclude_data_root),
+        "kubric_max_depth": float(args.kubric_max_depth),
+        "num_steps": args.num_steps,
+        "warmup_steps": args.warmup_steps,
+        "min_lr_scale": args.min_lr_scale,
+        "precision": args.precision,
+    }
+
+
 def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, output_dir, args) -> Path:
     """The temporal patch plus everything a resume needs, in one atomic file."""
 
@@ -1197,14 +1223,7 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
         optimizer=optimizer,
         base_learning_rates=base_learning_rates,
         scaler=scaler,
-        settings={
-            "observation_budget": args.observation_budget,
-            "stride": args.stride,
-            "num_steps": args.num_steps,
-            "warmup_steps": args.warmup_steps,
-            "min_lr_scale": args.min_lr_scale,
-            "precision": args.precision,
-        },
+        settings=_checkpoint_settings(args),
     )
     payload = {
         "freeze_mode": getattr(model, "freeze", None),
@@ -1216,6 +1235,55 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
         **state,
     }
     return save_atomically(payload, Path(output_dir) / "train_state.pt")
+
+
+# The two tiers mirror _checkpoint_settings, split by consequence. The refused
+# keys decide which plans main() builds (budget, stride, min_views,
+# max_time_indices, the excluded roots), what the loader hands those plans
+# (kubric_max_depth moves geometry and labels), or the numerics under the
+# restored scaler state (precision): a changed value means the "resumed" run
+# trains a different stream while its step counter continues. num_steps,
+# warmup_steps and min_lr_scale only reshape the remaining schedule, and
+# extending a finished run by raising num_steps is legitimate, so those warn.
+_RESUME_SETTINGS_REFUSED = (
+    "observation_budget",
+    "stride",
+    "min_views",
+    "max_time_indices",
+    "excluded_data_roots",
+    "kubric_max_depth",
+    "precision",
+)
+_RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
+
+
+def check_resume_settings(stored: dict, args) -> None:
+    """Compare a checkpoint's stored settings against this invocation's flags.
+
+    ``stored`` may be empty or partial: a checkpoint from before a settings key
+    existed still resumes, it just resumes unchecked on that key.
+    """
+
+    current = _checkpoint_settings(args)
+    for key in _RESUME_SETTINGS_REFUSED:
+        if key in stored and stored[key] != current[key]:
+            raise RuntimeError(
+                f"--resume checkpoint carries {key}={stored[key]!r} but this "
+                f"invocation has {key}={current[key]!r}. That would replay a "
+                "different stream -- or the same stream under different "
+                "geometry or numerics -- while the step counter continues, "
+                "and report it as one run; restore the flag, or start a fresh "
+                "run without --resume"
+            )
+    for key in _RESUME_SETTINGS_WARNED:
+        if key in stored and stored[key] != current[key]:
+            print(
+                f"WARNING --resume checkpoint carries {key}={stored[key]!r} "
+                f"but this invocation has {key}={current[key]!r}; "
+                "unlike the base rates, this flag DOES take effect for the "
+                "remaining steps",
+                file=sys.stderr,
+            )
 
 
 def _gate_verdicts(summary: dict) -> dict:
@@ -1230,7 +1298,7 @@ def _gate_verdicts(summary: dict) -> dict:
         "completed_all_steps": (
             None
             if summary["interrupted_by"]
-            else summary["completed_steps"] >= summary["planned_steps"]
+            else summary["completed_steps"] >= summary["target_steps"]
         ),
     }
     evaluated = [value for value in gates.values() if value is not None]
@@ -1381,6 +1449,18 @@ def main() -> None:
         val_plans=val_plans,
     )
 
+    # train_step resets the CUDA peak counter at every step, so the reading here
+    # covers only the tail since the last reset; the run-wide peak is the max
+    # over the per-step readings, with the tail folded in for whatever the final
+    # eval and checkpoint write allocated after the last step's reset.
+    peak_gpu_memory_bytes = max(
+        (outcome.peak_bytes for outcome in result["history"]), default=0
+    )
+    if torch.cuda.is_available():
+        peak_gpu_memory_bytes = max(
+            peak_gpu_memory_bytes, int(torch.cuda.max_memory_allocated())
+        )
+
     summary = {
         **_plan_summary(tally, args),
         "start_step": result["start_step"],
@@ -1404,11 +1484,25 @@ def main() -> None:
         # was trained under should be readable from the run rather than inferred
         # from whichever version of train.yaml happens to be checked out.
         "kubric_max_depth": float(args.kubric_max_depth),
+        "num_steps": args.num_steps,
+        "warmup_steps": args.warmup_steps,
+        "seed": args.seed,
+        "freeze_mode": args.freeze_mode,
+        "precision": args.precision,
+        "gpu_name": (
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        ),
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
         **_gate_verdicts(
             {
                 "interrupted_by": result["interrupted_by"],
                 "completed_steps": result["completed_steps"],
-                "planned_steps": len(tally.planned),
+                # The loop's target is range(start_step, num_steps): plans wrap
+                # when num_steps exceeds the planned count and only a prefix
+                # replays when it is below it (the normal case, 20k against a
+                # ~50k-record manifest). The manifest's planned_steps is data,
+                # not the bar -- it stays in the summary above.
+                "target_steps": args.num_steps,
             }
         ),
     }

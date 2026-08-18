@@ -211,6 +211,11 @@ def _loop_args(tmp_path, **overrides):
         eval_every=0,
         max_scene_skip_fraction=0.02,
         max_consecutive_scene_skips=10,
+        # _checkpoint_settings reads these at every checkpoint write and resume.
+        min_views=2,
+        max_time_indices=32,
+        exclude_data_root=[],
+        kubric_max_depth=24.0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -334,6 +339,80 @@ def test_resume_reproduces_an_uninterrupted_run_at_every_step(tmp_path):
         torch.testing.assert_close(
             parameter, dict(reference_model.named_parameters())[name],
             rtol=1e-6, atol=1e-6, msg=f"{name} diverged across the resume",
+        )
+
+
+def test_a_resume_that_changes_the_replayed_stream_is_refused(tmp_path):
+    """A changed budget or stride re-plans a different stream under a continued
+    step counter; the loop must refuse before restoring any state."""
+
+    train_cli._STOP_REQUESTED.clear()
+    _run(tmp_path / "a", _loop_args(tmp_path, num_steps=4), [])
+    checkpoint = tmp_path / "a" / "train_state.pt"
+    assert checkpoint.is_file()
+
+    with pytest.raises(RuntimeError, match="stride") as excinfo:
+        _run(
+            tmp_path / "b",
+            _loop_args(tmp_path, num_steps=4, resume=str(checkpoint), stride=4),
+            [],
+        )
+    assert "stride=2" in str(excinfo.value) and "stride=4" in str(excinfo.value)
+
+
+def test_a_resume_that_extends_the_run_warns_and_continues(tmp_path, capsys):
+    """Raising num_steps is how a finished run is extended; it must proceed,
+    but say so, because the cosine's denominator changes with it."""
+
+    train_cli._STOP_REQUESTED.clear()
+    _run(tmp_path / "a", _loop_args(tmp_path, num_steps=4), [])
+    checkpoint = tmp_path / "a" / "train_state.pt"
+
+    second: list[_Recorded] = []
+    _run(
+        tmp_path / "b",
+        _loop_args(tmp_path, num_steps=6, resume=str(checkpoint)),
+        second,
+    )
+
+    error_output = capsys.readouterr().err
+    assert "num_steps=4" in error_output and "num_steps=6" in error_output
+    assert [r.step for r in second] == [4, 5]
+
+
+def test_a_checkpoint_without_stored_settings_resumes_unchecked(tmp_path, capsys):
+    """Checkpoints written before the settings field existed still resume."""
+
+    train_cli.check_resume_settings({}, _loop_args(tmp_path, stride=4))
+    assert capsys.readouterr().err == ""
+
+
+def test_the_settings_refusal_names_both_values(tmp_path):
+    with pytest.raises(RuntimeError) as excinfo:
+        train_cli.check_resume_settings(
+            {"precision": "bf16-mixed"}, _loop_args(tmp_path, precision="32")
+        )
+    assert "bf16-mixed" in str(excinfo.value)
+    assert "'32'" in str(excinfo.value)
+
+
+def test_the_refusal_covers_the_mapped_and_coerced_settings(tmp_path):
+    """excluded_data_roots is stored under the plan summary's name rather than
+    the args attribute, and kubric_max_depth as a float; both are as
+    stream-defining as stride, so both must still be compared."""
+
+    with pytest.raises(RuntimeError) as excinfo:
+        train_cli.check_resume_settings(
+            {"excluded_data_roots": ["/old"]},
+            _loop_args(tmp_path, exclude_data_root=["/new"]),
+        )
+    assert "/old" in str(excinfo.value) and "/new" in str(excinfo.value)
+
+    # 1000 is what MVTracker's loader defaults to when built without training
+    # args -- exactly the silent drift the flag exists to prevent.
+    with pytest.raises(RuntimeError, match="kubric_max_depth"):
+        train_cli.check_resume_settings(
+            {"kubric_max_depth": 1000.0}, _loop_args(tmp_path)
         )
 
 
@@ -662,15 +741,32 @@ def test_an_interrupted_run_reports_no_verdict_rather_than_a_pass():
     """
 
     interrupted = train_cli._gate_verdicts(
-        {"interrupted_by": "SIGUSR1", "completed_steps": 3, "planned_steps": 100}
+        {"interrupted_by": "SIGUSR1", "completed_steps": 3, "target_steps": 100}
     )
     finished = train_cli._gate_verdicts(
-        {"interrupted_by": None, "completed_steps": 100, "planned_steps": 100}
+        {"interrupted_by": None, "completed_steps": 100, "target_steps": 100}
     )
 
     assert interrupted["gates_passed"] is None
     assert interrupted["gates_evaluated"] == 0
     assert finished["gates_passed"] is True
+
+
+def test_the_gate_targets_num_steps_not_the_manifests_planned_count():
+    """--num_steps below the planned count is the normal case (20k against a
+    ~50k-record manifest): the loop targets range(start_step, num_steps), so a
+    run that finished every step it was asked for must not report a failed gate.
+    Regression: the gate compared completed_steps against planned_steps."""
+
+    finished_short = train_cli._gate_verdicts(
+        {"interrupted_by": None, "completed_steps": 20000, "target_steps": 20000}
+    )
+    unfinished = train_cli._gate_verdicts(
+        {"interrupted_by": None, "completed_steps": 19999, "target_steps": 20000}
+    )
+
+    assert finished_short["gates_passed"] is True
+    assert unfinished["gates_passed"] is False
 
 
 # ------------------------------------------------------------ device guard ---
