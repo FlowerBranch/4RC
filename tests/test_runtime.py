@@ -34,7 +34,7 @@ from arc.training import runtime
 
 # The commit `main` is pinned against. Forward-looking: bump it deliberately when
 # a change to the harness is intended, and never to make a red test go green.
-HARNESS_BASELINE = "893a6e5"
+HARNESS_BASELINE = "bdedf18"
 
 # The helpers the extractions moved out of ``overfit_temporal_tracking.py``. The
 # harness must still expose every one of them as a module global; see below.
