@@ -216,6 +216,10 @@ def _loop_args(tmp_path, **overrides):
         max_time_indices=32,
         exclude_data_root=[],
         kubric_max_depth=24.0,
+        # The canonical anchor spec: _checkpoint_settings stores it and the
+        # eval call site records it. The default is the single-anchor spec
+        # every existing test's behaviour assumes.
+        query_anchors=["0:0"],
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -380,18 +384,35 @@ def test_a_resume_that_extends_the_run_warns_and_continues(tmp_path, capsys):
     assert [r.step for r in second] == [4, 5]
 
 
-def test_a_checkpoint_without_stored_settings_resumes_unchecked(tmp_path, capsys):
-    """Checkpoints written before the settings field existed still resume."""
+def test_a_checkpoint_without_stored_settings_is_refused(tmp_path):
+    """A refused-tier key absent from the checkpoint refuses the resume.
 
-    train_cli.check_resume_settings({}, _loop_args(tmp_path, stride=4))
-    assert capsys.readouterr().err == ""
+    The tolerance this replaces let a pre-field checkpoint resume under a
+    different anchor spec -- or budget, or stride -- unchecked. The only
+    checkpoints predating the newest key are disposable short smokes, so
+    refusing loses nothing worth resuming.
+    """
+
+    with pytest.raises(RuntimeError, match="carries no stored"):
+        train_cli.check_resume_settings({}, _loop_args(tmp_path))
+
+    # A partial dict is refused too, naming the specific missing key.
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["query_anchors"]
+    with pytest.raises(RuntimeError, match="query_anchors"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    # Warned-tier keys stay tolerant when absent: they only reshape the
+    # remaining schedule.
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["num_steps"]
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
 
 
 def test_the_settings_refusal_names_both_values(tmp_path):
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, precision="bf16-mixed"))
     with pytest.raises(RuntimeError) as excinfo:
-        train_cli.check_resume_settings(
-            {"precision": "bf16-mixed"}, _loop_args(tmp_path, precision="32")
-        )
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, precision="32"))
     assert "bf16-mixed" in str(excinfo.value)
     assert "'32'" in str(excinfo.value)
 
@@ -401,19 +422,47 @@ def test_the_refusal_covers_the_mapped_and_coerced_settings(tmp_path):
     the args attribute, and kubric_max_depth as a float; both are as
     stream-defining as stride, so both must still be compared."""
 
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, exclude_data_root=["/old"]))
     with pytest.raises(RuntimeError) as excinfo:
         train_cli.check_resume_settings(
-            {"excluded_data_roots": ["/old"]},
-            _loop_args(tmp_path, exclude_data_root=["/new"]),
+            stored, _loop_args(tmp_path, exclude_data_root=["/new"])
         )
     assert "/old" in str(excinfo.value) and "/new" in str(excinfo.value)
 
     # 1000 is what MVTracker's loader defaults to when built without training
     # args -- exactly the silent drift the flag exists to prevent.
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, kubric_max_depth=1000.0))
     with pytest.raises(RuntimeError, match="kubric_max_depth"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+
+def test_a_resume_that_changes_the_anchor_spec_is_refused(tmp_path):
+    """The spec is stream-defining: it decides which observations each step
+    supervises and how the loss reduces over them, so a changed -- or reordered
+    -- spec under a continued step counter is a different run. Order matters:
+    the first anchor owns the Sim(3) and assignment tiebreaks on anchor index."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    with pytest.raises(RuntimeError) as excinfo:
         train_cli.check_resume_settings(
-            {"kubric_max_depth": 1000.0}, _loop_args(tmp_path)
+            stored, _loop_args(tmp_path, query_anchors=["0:0", "1:0"])
         )
+    assert "['0:0']" in str(excinfo.value)
+    assert "['0:0', '1:0']" in str(excinfo.value)
+
+    reordered = train_cli._checkpoint_settings(
+        _loop_args(tmp_path, query_anchors=["1:0", "0:0"])
+    )
+    with pytest.raises(RuntimeError, match="query_anchors"):
+        train_cli.check_resume_settings(
+            reordered, _loop_args(tmp_path, query_anchors=["0:0", "1:0"])
+        )
+
+    # The matching spec continues.
+    train_cli.check_resume_settings(
+        train_cli._checkpoint_settings(_loop_args(tmp_path, query_anchors=["0:0", "1:0"])),
+        _loop_args(tmp_path, query_anchors=["0:0", "1:0"]),
+    )
 
 
 def _stub_scene(name, *, times=(0, 2)):
@@ -593,6 +642,12 @@ class _FakeArc(nn.Module):
     eligibility)`` tuple. A stub that produces a differentiable ``track_multi``
     from real parameters is enough to run the body end to end on CPU, gradient
     guards included.
+
+    The step drives the decomposed surface (``_preprocess_input`` /
+    ``encode_features`` / ``reconstruct`` / ``track_for_query``) while the eval
+    drives ``forward``, so ``forward`` is composed from the pieces exactly the
+    way ``Arc._forward`` composes them -- otherwise the two paths could drift
+    apart inside this fake while both kept passing.
     """
 
     def __init__(self, observations, height, width):
@@ -614,10 +669,16 @@ class _FakeArc(nn.Module):
         self.head.requires_grad_(False)
         self.cam_dec.requires_grad_(False)
 
-    def forward(self, views, force_no_output_conversion=False):
+    def _preprocess_input(self, views):
+        images = torch.zeros(1, self.observations, 3, self.height, self.width)
+        # The real preprocessor reads the anchor slot list off the views; the
+        # fake mirrors that so a multi-anchor scene reaches the Q loop.
+        return images, views[0]["track_query_idx"], None
+
+    def encode_features(self, images, ref_view_strategy="first", time_indices=None):
         # Every trainable parameter must receive a gradient or train_step's own
-        # guards fire -- which is part of what is being tested, so the forward
-        # touches biases as well as weights.
+        # guards fire -- which is part of what is being tested, so the "taps"
+        # touch biases as well as weights.
         scale = (
             self.motion_decoder.weight.sum()
             + self.motion_decoder.bias.sum()
@@ -625,15 +686,38 @@ class _FakeArc(nn.Module):
             + self.track_head.bias.sum()
             + self.backbone.pretrained.time_index_embedding.weight.sum()
         )
-        tracks = torch.ones(
-            1, 1, self.observations, self.height, self.width, 3
-        ) * scale
+        return [scale]
+
+    def reconstruct(self, feats, images):
         return {
-            "track_multi": tracks,
-            "track_query_idx": torch.tensor([0], dtype=torch.long),
             "depth": torch.ones(1, self.observations, self.height, self.width),
             "pose_enc": torch.zeros(1, self.observations, 9),
         }
+
+    def track_for_query(self, feats, images, query_idx):
+        # (track, confidence) tuple, shaped (1,S,H,W,3) / (1,S,H,W) exactly as
+        # the real head returns them -- anchor_tracks adds the Q=1 axis.
+        track = (
+            torch.ones(1, self.observations, self.height, self.width, 3) * feats[0]
+        )
+        confidence = torch.ones(1, self.observations, self.height, self.width)
+        return track, confidence
+
+    def forward(self, views, force_no_output_conversion=False):
+        images, track_query_idx, time_indices = self._preprocess_input(views)
+        feats = self.encode_features(images, time_indices=time_indices)
+        output = self.reconstruct(feats, images)
+        query_slots = [
+            int(value)
+            for value in torch.as_tensor(track_query_idx).flatten().tolist()
+        ]
+        tracks, confidences = zip(
+            *(self.track_for_query(feats, images, slot) for slot in query_slots)
+        )
+        output["track_multi"] = torch.stack(tracks, dim=1)
+        output["conf_track_multi"] = torch.stack(confidences, dim=1)
+        output["track_query_idx"] = torch.tensor(query_slots, dtype=torch.long)
+        return output
 
 
 def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
@@ -693,6 +777,13 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     for group in ("time_embedding", "motion_decoder", "track_head"):
         assert outcome.gradient_norms[group] > 0, group
     assert "clipped_total" in outcome.gradient_norms
+    # The step reports its eligibility split for the run-level aggregation.
+    assert outcome.eligibility["total_query_count"] > 0
+    assert (
+        outcome.eligibility["eligible_query_count"]
+        + sum(outcome.eligibility["rejected"].values())
+        == outcome.eligibility["total_query_count"]
+    )
 
 
 # ----------------------------------------------------------------- signals ---
@@ -846,6 +937,7 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         huber_delta_m=0.05,
         step=7,
         output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
     )
 
     assert metrics["step"] == 7 and metrics["scenes"] == 1
@@ -857,6 +949,9 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     directory = tmp_path / "out" / "eval" / "step-7"
     written = json.loads((directory / "metrics.json").read_text())
     assert written["scenes"] == 1
+    # The spec the eval scored under, so a curve is never read against the
+    # wrong supervision scheme.
+    assert written["query_anchors"] == ["0:0"]
     loaded = np.load(directory / "pred" / "0000.npz")
     assert set(loaded.files) == set(PREDICTION_KEYS)
 
@@ -889,6 +984,7 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
         huber_delta_m=0.05,
         step=1,
         output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
         emit_predictions=False,
     )
 
@@ -1077,7 +1173,7 @@ def test_the_val_flag_pair_is_checked_by_the_argument_validator(tmp_path):
     args = _loop_args(
         tmp_path, val_scenes_file="val.json", val_data_root=None,
         min_views=2, max_time_indices=32, max_unreplayable_fraction=0.02,
-        max_records=None,
+        max_records=None, val_cameras=[0, 1, 2, 3],
     )
 
     with pytest.raises(ValueError, match="--val_scenes_file needs --val_data_root"):
@@ -1189,7 +1285,11 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
         ),
         scaler=torch.amp.GradScaler("cuda", enabled=False),
         plans=plans,
-        args=_loop_args(tmp_path, num_steps=4, eval_every=2),
+        # The distinctive spec pins that the loop hands the eval THE RUN'S
+        # spec rather than a constant: the eval records it verbatim, and the
+        # scene's own anchors are the provider's business, so the mismatch
+        # with this test's single-anchor scenes is deliberate.
+        args=_loop_args(tmp_path, num_steps=4, eval_every=2, query_anchors=["3:1"]),
         scene_provider=provider,
         # The model here is a _FakeArc, for the real eval; the recording step_fn
         # expects the toy model, so this test supplies its own no-op step. What
@@ -1208,3 +1308,542 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
     assert [entry["step"] for entry in result["evaluations"]] == [2, 4], (
         "the boundary at 2 must survive its own step's skip"
     )
+    written = json.loads(
+        (tmp_path / "eval" / "step-2" / "metrics.json").read_text()
+    )
+    assert written["query_anchors"] == ["3:1"], (
+        "the loop must record the run's own spec, not a constant"
+    )
+
+
+# ----------------------------------------- multi-anchor query supervision ---
+
+
+def _step_scene(tmp_path, monkeypatch, *, query_anchors=None, **scene_kwargs):
+    """A real dumped-fixture scene with identity alignment, for the real step."""
+
+    import arc.training.sparse_tracking as sparse_module
+    from arc.training import load_dumped_kubric_scene
+    from test_sparse_tracking import _write_scene
+
+    _write_scene(
+        tmp_path, time_count=4, view_count=2, depth_sidecar=True, **scene_kwargs
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
+        query_anchors=query_anchors,
+    )
+    target, _ = sparse_module._metric_pointmap_at_anchor(
+        scene, scene.query_observation_slot
+    )
+    pointmaps = torch.from_numpy(target).float().expand(
+        1, scene.num_observations, *target.shape
+    ).contiguous()
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+    return scene
+
+
+def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
+    tmp_path, monkeypatch
+):
+    """The default-spec invariant, pinned: same loss, same post-step weights.
+
+    The per-anchor step decomposes the forward into encode -> reconstruct ->
+    track_for_query and skips the cut at one active anchor, which is claimed to
+    be the exact pre-multi-anchor graph. This drives the real ``train_step``
+    against an in-test replica of the old combined pipeline on an identically
+    initialized copy, and requires equality -- not closeness -- of the loss and
+    of every parameter after the optimizer step.
+    """
+
+    import copy
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+        sparse_tracking_loss,
+    )
+    from arc.training.runtime import tracking_only
+
+    scene = _step_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    stepped = _FakeArc(scene.num_observations, height, width)
+    reference = copy.deepcopy(stepped)
+
+    outcome = train_cli.train_step(
+        model=stepped,
+        scene=scene,
+        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+        optimizer=torch.optim.AdamW(
+            [{"params": list(stepped.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        learning_rates=[1e-3],
+        step=0,
+    )
+
+    # The combined pipeline exactly as the step ran it before multi-anchor.
+    reference.train()
+    reference.head.eval()
+    reference.cam_dec.eval()
+    reference_optimizer = torch.optim.AdamW(
+        [{"params": list(reference.parameters()), "lr": 1e-3}]
+    )
+    reference_optimizer.zero_grad(set_to_none=True)
+    correspondences, _ = build_anchor_correspondences(scene)
+    raw = reference(scene.views, force_no_output_conversion=True)
+    alignment, _ = fit_scene_sim3(raw, scene)
+    anchors = gather_query_anchor_points(raw, scene, correspondences)
+    result = sparse_tracking_loss(
+        tracking_only(raw),
+        scene,
+        correspondences,
+        alignment,
+        anchors,
+        huber_delta_m=0.05,
+        collect_diagnostics=False,
+    )
+    result.total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in reference.parameters() if p.requires_grad], 1.0
+    )
+    reference_optimizer.step()
+
+    assert outcome.loss == float(result.loss.item())
+    assert outcome.sample_count == int(result.sample_count)
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in stepped.named_parameters():
+        assert torch.equal(parameter, reference_parameters[name]), name
+
+
+def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
+    tmp_path, monkeypatch
+):
+    """The per-anchor path, on a scene where the second anchor earns its keep.
+
+    Track 2 is occluded in camera 0 at time 0, so only the camera-1 anchor can
+    supervise it -- the recovery the second anchor exists for. The cut engages
+    (two active anchors), every gradient guard still fires, and the outcome's
+    counts stay consistent with the per-anchor split.
+    """
+
+    import copy
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+        sparse_tracking_loss,
+    )
+    from arc.training.runtime import (
+        anchor_sample_counts,
+        anchor_tracks,
+        encode_and_reconstruct,
+        tracking_only,
+    )
+
+    scene = _step_scene(
+        tmp_path,
+        monkeypatch,
+        query_anchors=((0, 0), (1, 0)),
+        invisible=((0, 0, 2),),
+    )
+    assert scene.query_anchors == ((0, 0), (1, 0))
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    # The expected weighted loss, from the pre-step weights: each anchor's mean
+    # times its share of the supervised samples, accumulated in anchor order --
+    # exactly what makes per-anchor backward equal one combined mean. Computed
+    # on an identical copy BEFORE train_step moves the parameters, so the
+    # assertion below is exact, and it fails if the step ever weights anchors
+    # by anything other than their sample counts.
+    reference = copy.deepcopy(model)
+    correspondences, _ = build_anchor_correspondences(scene)
+    counts = anchor_sample_counts(scene, correspondences, 2)
+    images, feats, recon = encode_and_reconstruct(reference, scene.views)
+    reference_alignment, _ = fit_scene_sim3(recon, scene)
+    anchor_points = gather_query_anchor_points(recon, scene, correspondences)
+    expected_loss = None
+    for anchor_index in range(2):
+        raw = anchor_tracks(reference, feats, images, scene, anchor_index)
+        result = sparse_tracking_loss(
+            tracking_only(raw),
+            scene,
+            correspondences.select_query_slot(anchor_index),
+            reference_alignment,
+            anchor_points[correspondences.anchor_rows(anchor_index)],
+            huber_delta_m=0.05,
+            collect_diagnostics=False,
+        )
+        contribution = float(result.loss.item()) * (counts[anchor_index] / sum(counts))
+        expected_loss = (
+            contribution if expected_loss is None else expected_loss + contribution
+        )
+
+    outcome = train_cli.train_step(
+        model=model,
+        scene=scene,
+        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        learning_rates=[1e-3],
+        step=0,
+    )
+
+    _, eligibility = build_anchor_correspondences(scene)
+    assert all(count > 0 for count in counts), (
+        "both anchors must supervise something for this test to test the cut"
+    )
+    assert np.isfinite(outcome.loss)
+    assert outcome.loss == expected_loss, (
+        "the step's loss must be the sample-count-weighted sum of the "
+        "per-anchor means, in anchor order"
+    )
+    assert outcome.sample_count == sum(counts)
+    for group in ("time_embedding", "motion_decoder", "track_head"):
+        assert outcome.gradient_norms[group] > 0, group
+    assert eligibility["per_anchor"][1]["assigned"] >= 1, (
+        "the occluded track must be recovered by the second anchor"
+    )
+    assert (
+        outcome.eligibility["eligible_query_count"]
+        + sum(outcome.eligibility["rejected"].values())
+        == outcome.eligibility["total_query_count"]
+    )
+
+
+def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
+    """The Q=2 eval path, which a real multi-anchor run hits at every boundary.
+
+    The eval keeps the combined forward (no_grad needs no cut), so a two-anchor
+    run is the first time anywhere that Q=2 flows through the model call, the
+    combined-correspondence loss, the shuffled-index arm and the prediction
+    writer. evaluate_held_out has already shipped two eval-fatal bugs precisely
+    because nothing executed it; this keeps the multi-anchor variant from
+    repeating that history.
+    """
+
+    scene = _step_scene(
+        tmp_path,
+        monkeypatch,
+        query_anchors=((0, 0), (1, 0)),
+        invisible=((0, 0, 2),),
+    )
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=3,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0", "1:0"],
+    )
+
+    assert metrics["scenes"] == 1
+    assert metrics["position_loss_shuffled"] is not None
+    entry = metrics["per_scene"][0]
+    # confidence_stats at Q=2 switches to the per-anchor form: pooled mean,
+    # None quantiles, one summary per anchor -- documented in runtime.
+    assert len(entry["confidence"]["per_anchor"]) == 2
+    assert entry["confidence"]["p50"] is None
+
+    directory = tmp_path / "out" / "eval" / "step-3"
+    written = json.loads((directory / "metrics.json").read_text())
+    assert written["query_anchors"] == ["0:0", "1:0"]
+    loaded = np.load(directory / "pred" / "0000.npz")
+    assert set(loaded.files) == set(PREDICTION_KEYS)
+
+
+def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
+    """An anchor set that reaches nothing must raise, citing the split.
+
+    Anchoring only at time 2 while every fixture query starts at time 0 rejects
+    everything at query_time_mismatch. This was fatal before multi-anchor too --
+    deep inside the loss, after the forward; now it raises before any GPU work,
+    and it must NOT be a SceneProviderError, which the loop's skip policy would
+    absorb as one bad scene.
+    """
+
+    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 2),))
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    with pytest.raises(RuntimeError, match="No anchor contributes") as excinfo:
+        train_cli.train_step(
+            model=model,
+            scene=scene,
+            plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            precision="32",
+            huber_delta_m=0.05,
+            grad_clip=1.0,
+            learning_rates=[1e-3],
+            step=0,
+        )
+    assert "query_time_mismatch" in str(excinfo.value)
+    assert not isinstance(excinfo.value, SceneProviderError)
+
+
+def test_a_malformed_anchor_pair_is_refused_at_parse_time():
+    # int() alone would admit "+1:0", " 1 : 2 ", unicode digits and "1_0:0"
+    # (slot TEN) -- each either misleading or a slot the user never typed, so
+    # the parse takes plain ASCII decimals only.
+    for bad in (
+        ["0"],
+        ["0:0:0"],
+        ["a:0"],
+        ["-1:0"],
+        ["0:-1"],
+        ["+1:0"],
+        ["1_0:0"],
+        [" 1 : 2 "],
+        [],
+    ):
+        with pytest.raises(ValueError):
+            train_cli.parse_query_anchor_slots(bad)
+    # "00:0" parses to the same slot as "0:0": a duplicate, not a new anchor.
+    with pytest.raises(ValueError, match="more than once"):
+        train_cli.parse_query_anchor_slots(["0:0", "00:0"])
+    # Order is preserved, never sorted: the first anchor owns the Sim(3).
+    assert train_cli.parse_query_anchor_slots(["1:0", "0:0"]) == ((1, 0), (0, 0))
+
+
+def _validator_args(tmp_path, **overrides):
+    """_loop_args plus the flags only _validate_args reads."""
+
+    merged = {
+        "max_unreplayable_fraction": 0.02,
+        "max_records": None,
+        "val_scenes_file": None,
+        "val_data_root": None,
+        "val_cameras": [0, 1, 2, 3],
+    }
+    merged.update(overrides)
+    return _loop_args(tmp_path, **merged)
+
+
+def test_an_anchor_view_slot_min_views_cannot_guarantee_is_refused_at_parse_time(
+    tmp_path,
+):
+    args = _validator_args(tmp_path, query_anchors=["0:0", "2:0"], min_views=2)
+    with pytest.raises(ValueError, match="--min_views >= 3"):
+        train_cli._validate_args(args)
+
+    # The same spec is fine once min_views guarantees the slot on every step.
+    args = _validator_args(tmp_path, query_anchors=["0:0", "2:0"], min_views=3)
+    train_cli._validate_args(args)
+
+
+def test_the_anchor_spec_is_canonicalized_format_only_and_order_preserving(tmp_path):
+    args = _validator_args(tmp_path, query_anchors=["01:02", "1:0", "0:0"])
+    train_cli._validate_args(args)
+    assert args.query_anchors == ["1:2", "1:0", "0:0"], (
+        "zero-padding normalized, order untouched"
+    )
+
+
+def test_an_anchor_the_val_window_cannot_seat_is_refused_at_parse_time(tmp_path):
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["1:0"],
+        val_scenes_file="val.json",
+        val_data_root="/held",
+        val_cameras=[0],
+        min_views=2,
+    )
+    with pytest.raises(ValueError, match="held-out window"):
+        train_cli._validate_args(args)
+
+    # 48 observations over 4 val cameras seat 12 times; slot 12 does not exist.
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["0:12"],
+        val_scenes_file="val.json",
+        val_data_root="/held",
+    )
+    with pytest.raises(ValueError, match="held-out window"):
+        train_cli._validate_args(args)
+
+
+def test_an_anchor_time_slot_a_planned_step_cannot_seat_is_refused_under_plan_only(
+    tmp_path, monkeypatch, capsys
+):
+    """Caught at submit time, GPU-free, naming the step that cannot seat it.
+
+    A step's window length is budget // views, capped by the record's own
+    window -- so a time slot can fit every step but one, and that one would
+    otherwise fail hours into an allocation.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [
+        _record(step=0, seq_name="0000"),
+        # seq_len 2 at stride 2 seats exactly one time, so time slot 1 cannot.
+        _record(step=1, seq_name="0001", seq_len=2),
+    ]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_temporal_tracking.py",
+            "--manifest",
+            str(manifest),
+            "--plan_only",
+            "--query_anchors",
+            "0:0",
+            "0:1",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        train_cli.main()
+
+    assert exit_info.value.code == 2
+    error_output = capsys.readouterr().err
+    assert "0:1" in error_output and "'0001'" in error_output
+
+
+def test_the_default_anchor_spec_plans_exactly_as_before(tmp_path, monkeypatch, capsys):
+    """--plan_only with defaults passes and records the single-anchor spec."""
+
+    from test_manifest_plan import _write_manifest
+
+    records = [_record(step=index, seq_name=f"{index:04d}") for index in range(2)]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    out = tmp_path / "plan.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_temporal_tracking.py",
+            "--manifest",
+            str(manifest),
+            "--plan_only",
+            "--json_out",
+            str(out),
+        ],
+    )
+
+    train_cli.main()
+
+    assert "PASS planned 2 steps" in capsys.readouterr().out
+    assert json.loads(out.read_text())["settings"]["query_anchors"] == ["0:0"]
+
+
+def test_the_anchor_spec_is_recorded_in_the_checkpoint_settings(tmp_path):
+    train_cli._STOP_REQUESTED.clear()
+    _run(tmp_path / "a", _loop_args(tmp_path, num_steps=4), [])
+    payload = read_trainer_state(tmp_path / "a" / "train_state.pt")
+    assert payload["settings"]["query_anchors"] == ["0:0"]
+    assert isinstance(payload["settings"]["query_anchors"], list)
+
+    # And the wiring end to end: resuming under a different spec is refused
+    # before any state is restored.
+    with pytest.raises(RuntimeError, match="query_anchors"):
+        _run(
+            tmp_path / "b",
+            _loop_args(
+                tmp_path,
+                num_steps=4,
+                resume=str(tmp_path / "a" / "train_state.pt"),
+                query_anchors=["0:0", "1:0"],
+            ),
+            [],
+        )
+
+
+def test_eligibility_counts_sum_over_executed_steps_into_the_totals(tmp_path):
+    """The run-level split the 2-anchor question is answered from.
+
+    Summed over executed steps only: a skipped scene load contributes nothing,
+    so the totals stay consistent with steps_counted as their denominator.
+    """
+
+    plans = _plans(4)
+    failing = plans[1].seq_name
+
+    def provider(plan):
+        if plan.seq_name == failing:
+            raise SceneProviderError(f"scene {plan.seq_name!r} is not in the pool")
+        return SimpleNamespace(name=plan.seq_name, views=[])
+
+    def step_fn(*, step, plan, **_):
+        return train_cli.StepOutcome(
+            step=step,
+            seq_name=plan.seq_name,
+            loss=0.0,
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=[1e-3],
+            gradient_norms={},
+            eligibility={
+                "total_query_count": 10,
+                "eligible_query_count": 6,
+                "rejected": {"query_time_mismatch": 3, "not_visible_in_anchor": 1},
+            },
+        )
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4),
+        scene_provider=provider,
+        step_fn=step_fn,
+        output_dir=tmp_path,
+    )
+
+    totals = result["eligibility_totals"]
+    assert totals["steps_counted"] == 3, "the skipped step contributes nothing"
+    assert totals["total_query_count"] == 30
+    assert totals["eligible_query_count"] == 18
+    assert totals["rejected"]["query_time_mismatch"] == 9
+    assert totals["rejected"]["not_visible_in_anchor"] == 3
+    # Every stage is present with an explicit zero, so the summary's split is
+    # readable without knowing the stage list by heart.
+    assert set(totals["rejected"]) == set(train_cli.ELIGIBILITY_REJECTION_STAGES)
+    assert totals["rejected"]["projection"] == 0
+
+
+def test_steps_without_eligibility_reports_leave_the_totals_at_zero(tmp_path):
+    """Injected step functions that report no split must not fake one."""
+
+    train_cli._STOP_REQUESTED.clear()
+    _, result = _run(tmp_path, _loop_args(tmp_path, num_steps=4), [])
+
+    assert result["eligibility_totals"] == {
+        "steps_counted": 0,
+        "total_query_count": 0,
+        "eligible_query_count": 0,
+        "rejected": dict.fromkeys(train_cli.ELIGIBILITY_REJECTION_STAGES, 0),
+    }

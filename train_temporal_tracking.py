@@ -7,6 +7,11 @@ all here, so ``--manifest`` trains end to end.  Scenes arrive through
 :class:`arc.training.scene_provider.MVTrackerSceneProvider`, which replays each
 record against MVTracker's own loader rather than a reimplementation.
 
+``--query_anchors`` supervises several query anchors per step, as relative
+slots into each step's own window; the memory mechanism is the overfit's
+per-anchor track-head pass behind the encoder/head boundary, shared via
+``arc.training.runtime`` (see ``train_step``).
+
 **What "replaying the sample stream" claims, at its honest granularity:** the same
 scenes, windows, view sets and step ordering as the run being replayed -- and each
 run's own tracks and query points, because the eligible pool is rebuilt from
@@ -44,15 +49,22 @@ from arc.training.manifest_plan import (
     plan_manifest,
 )
 from arc.training.runtime import (
+    accumulate_weighted,
+    anchor_sample_counts,
+    anchor_tracks,
     assert_frozen_gradients_absent,
     assert_trainable_gradients_finite,
     assert_trainable_parameter_set,
     autocast_context,
+    backward_through_cut,
     build_optimizer,
     confidence_stats,
+    cut_features,
+    encode_and_reconstruct,
     gradient_norm,
     move_views_to_cuda,
     tracking_only,
+    weighted_anchor_total,
 )
 from arc.training.sample_manifest import MANIFEST_VERSION, read_manifest
 from arc.training.scene_provider import SceneProviderError
@@ -61,6 +73,7 @@ from arc.training.schedule import (
     capture_base_learning_rates,
     warmup_cosine_scale,
 )
+from arc.training.sparse_tracking import ELIGIBILITY_REJECTION_STAGES
 from arc.training.trainer_state import (
     build_trainer_state,
     capture_rng_state,
@@ -133,6 +146,11 @@ class StepOutcome:
     gradient_norms: dict
     peak_bytes: int = 0
     confidence: dict | None = None
+    # The step's eligibility split, compact: total/eligible counts and the
+    # per-stage rejected dict -- not the full report with its rule strings and
+    # per-anchor detail, which at 20k steps of history would bloat the summary.
+    # None from injected step functions that do not compute it.
+    eligibility: dict | None = None
 
 
 def scene_skip_cause(error: Exception) -> str:
@@ -231,7 +249,11 @@ class SceneCache:
     Keying on the scene *name* alone would be wrong: cameras, times and anchors
     all vary per step, and the correspondences are derived from them, so two
     steps on the same scene with different windows need different objects. The
-    key is therefore everything ``build_scene`` consumed.
+    key is therefore everything ``build_scene`` consumed.  The anchor *spec* is
+    deliberately absent from it: the slots are run-constant (validated and
+    canonicalized before the loop starts), so each step's absolute anchors are
+    a pure function of the spec and the keyed window, and adding them would
+    only re-encode the key.
 
     Size one, and the previous entry is dropped *before* the next load starts —
     with the caller's own reference cleared first, or the loop's local keeps the
@@ -331,6 +353,18 @@ def train_step(
     Reuses the existing machinery unchanged — this adds nothing to
     ``arc/training``'s semantics. There is no within-scene split: `ef8bcff`
     deleted it, so every eligible correspondence is supervised.
+
+    Several anchors are supervised the way the overfit does it: the encoder and
+    the frozen reconstruction run once, each anchor's track-head pass backwards
+    immediately onto a detached cut of the backbone taps, and the summed cut
+    gradients flow through the encoder exactly once afterwards
+    (:func:`arc.training.runtime.cut_features` — the chain rule makes that
+    identical to one combined backward, while only one track-head graph is ever
+    alive; the overfit measured the marginal anchor at a flat ~2.3 GiB where a
+    widened Q axis would not fit the card). At a single active anchor the cut
+    is bypassed and the step runs the exact pre-multi-anchor graph:
+    ``Arc._forward`` is encode → reconstruct → per-query track with no other
+    glue, so the decomposition changes no kernel and no number.
     """
 
     from arc.training import (
@@ -348,22 +382,95 @@ def train_step(
         torch.cuda.reset_peak_memory_stats()
 
     correspondences, eligibility = build_anchor_correspondences(scene)
-    with autocast_context(precision):
-        raw = model(scene.views, force_no_output_conversion=True)
-        alignment, alignment_report = fit_scene_sim3(raw, scene)
-        anchors = gather_query_anchor_points(raw, scene, correspondences)
-        stats = confidence_stats(raw)
-        result = sparse_tracking_loss(
-            tracking_only(raw),
-            scene,
-            correspondences,
-            alignment,
-            anchors,
-            huber_delta_m=huber_delta_m,
-            collect_diagnostics=False,
+    anchor_count = len(scene.anchor_observation_slots)
+    per_anchor_correspondences = [
+        correspondences.select_query_slot(anchor_index)
+        for anchor_index in range(anchor_count)
+    ]
+    per_anchor_rows = [
+        correspondences.anchor_rows(anchor_index)
+        for anchor_index in range(anchor_count)
+    ]
+    sample_counts = anchor_sample_counts(scene, correspondences, anchor_count)
+    total_samples = sum(sample_counts)
+    if total_samples == 0:
+        # Fatal before any GPU work, deliberately: a scene like this was fatal
+        # before multi-anchor too, just later (inside the loss) and without the
+        # split that says why. Not a SceneProviderError, so the loop's skip
+        # policy cannot absorb it as one bad scene.
+        raise RuntimeError(
+            "No anchor contributes a supervised sample, so there is nothing to "
+            "train on. The eligibility split says why: of "
+            f"{eligibility['total_query_count']} queries, rejected="
+            f"{eligibility['rejected']}. Anchoring at another time reaches "
+            "queries that do not start at the window's first frame; anchoring "
+            "in another camera reaches queries occluded in the first."
         )
+    anchor_weights = [count / total_samples for count in sample_counts]
+    active_anchor_count = sum(1 for weight in anchor_weights if weight > 0)
 
-    scaler.scale(result.total_loss).backward()
+    with autocast_context(precision):
+        images, feats, recon = encode_and_reconstruct(model, scene.views)
+        alignment, alignment_report = fit_scene_sim3(recon, scene)
+        # Gathered ONCE from the scene-level correspondences; each anchor's
+        # slice stays aligned with its rebased set via the row mask. A rebased
+        # set must never reach gather_query_anchor_points itself — its
+        # query_slots are renumbered to 0 and would silently gather anchor 0's
+        # pointmaps for every anchor.
+        anchors = gather_query_anchor_points(recon, scene, correspondences)
+        if active_anchor_count == 1:
+            # One anchor needs no cut: its backward is the only one and runs
+            # straight through the encoder, exactly the pre-multi-anchor graph.
+            # The cut is not free — it holds an accumulated .grad on every
+            # backbone tap for the whole step — and the committed window was
+            # sized against the memory ceiling without one.
+            cut_feats, cut_pairs = feats, []
+        else:
+            cut_feats, cut_pairs = cut_features(feats)
+
+    stats = None
+    step_loss = None
+    step_metric_error = None
+    for anchor_index, anchor_weight in enumerate(anchor_weights):
+        if anchor_weight == 0.0:
+            continue
+        with autocast_context(precision):
+            raw = anchor_tracks(model, cut_feats, images, scene, anchor_index)
+            if raw["track_multi"].shape[2] != scene.num_observations:
+                raise RuntimeError(
+                    "Output observation axis does not match the scene's inputs"
+                )
+            if stats is None:
+                # First *active* anchor: anchor 0 is skipped when it has no
+                # supervised samples, and the log must not go silent for it.
+                stats = confidence_stats(raw)
+            result = sparse_tracking_loss(
+                tracking_only(raw),
+                scene,
+                per_anchor_correspondences[anchor_index],
+                alignment,
+                anchors[per_anchor_rows[anchor_index].to(anchors.device)],
+                huber_delta_m=huber_delta_m,
+                collect_diagnostics=False,
+            )
+            anchor_total = weighted_anchor_total(
+                result,
+                position_weight=anchor_weight,
+                confidence_weight=0.0,
+                sync_weight=0.0,
+            )
+        # Backward per anchor, so this anchor's track-head graph is freed
+        # before the next one allocates its own; the gradient lands on the cut
+        # and is pushed through the encoder once, after the loop.
+        scaler.scale(anchor_total).backward()
+        step_loss = accumulate_weighted(step_loss, result.loss, anchor_weight)
+        step_metric_error = accumulate_weighted(
+            step_metric_error, result.metric_error, anchor_weight
+        )
+        del raw, result, anchor_total
+
+    backward_through_cut(cut_pairs)
+    del cut_feats, cut_pairs, feats, recon, images
     scaler.unscale_(optimizer)
     assert_trainable_gradients_finite(model)
     norms = {
@@ -391,15 +498,23 @@ def train_step(
     return StepOutcome(
         step=step,
         seq_name=plan.seq_name,
-        loss=float(result.loss.detach().item()),
-        metric_error_m=float(result.metric_error.detach().item()),
-        sample_count=int(result.sample_count),
+        # Sample-count-weighted sum of per-anchor means: the combined mean over
+        # every supervised sample. At one anchor the weight is exactly 1.0, so
+        # this is the pre-multi-anchor number bit for bit.
+        loss=float(step_loss),
+        metric_error_m=float(step_metric_error),
+        sample_count=total_samples,
         alignment_scale=float(alignment_report["scale"]),
         alignment_residual_m=float(alignment_report["median_residual_metric"]),
         learning_rates=list(learning_rates),
         gradient_norms=norms,
         peak_bytes=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
         confidence=stats,
+        eligibility={
+            "total_query_count": eligibility["total_query_count"],
+            "eligible_query_count": eligibility["eligible_query_count"],
+            "rejected": dict(eligibility["rejected"]),
+        },
     )
 
 
@@ -412,9 +527,15 @@ def evaluate_held_out(
     huber_delta_m: float,
     step: int,
     output_dir: Path,
+    query_anchors,
     emit_predictions: bool = True,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
+
+    ``query_anchors`` is the run's canonical anchor spec (the ``VIEWSLOT:TIMESLOT``
+    strings), recorded in the metrics so an eval curve is never read against the
+    wrong supervision scheme; the scenes themselves already carry the resolved
+    anchors, because the same provider instance serves training and eval.
 
     Two things are restored afterwards, and both matter. The **RNG streams**,
     because an eval that consumed randomness would shift every subsequent
@@ -508,6 +629,7 @@ def evaluate_held_out(
     ]
     metrics = {
         "step": step,
+        "query_anchors": list(query_anchors),
         "scenes": len(per_scene),
         "position_loss": sum(losses) / len(losses) if losses else None,
         "metric_error_m": sum(errors) / len(errors) if errors else None,
@@ -634,6 +756,66 @@ def check_device_headroom(peak_bytes: int, *, step: int, max_fraction: float) ->
         )
 
 
+def parse_query_anchor_slots(values) -> tuple[tuple[int, int], ...]:
+    """Parse ``VIEWSLOT:TIMESLOT`` pairs, preserving the caller's order.
+
+    Rejected explicitly rather than coerced: a silently mis-parsed anchor would
+    supervise the wrong observation and still produce plausible numbers.  Order
+    is never normalized away, because it is stream-defining: the first anchor
+    owns the scene Sim(3) and best-anchor assignment tiebreaks on anchor index,
+    so ``1:0 0:0`` and ``0:0 1:0`` are different training streams.
+    """
+
+    pairs: list[tuple[int, int]] = []
+    for value in values:
+        parts = str(value).strip().split(":")
+        # Plain ASCII decimals only. int() alone would admit '+1', ' 1 ',
+        # '1_0' (ten!) and unicode digits -- every one either misleading or a
+        # slot the user never typed.
+        if len(parts) != 2 or not all(
+            part.isascii() and part.isdigit() for part in parts
+        ):
+            raise ValueError(
+                "--query_anchors entries must look like VIEWSLOT:TIMESLOT, "
+                f"with plain decimal slots, got {value!r}"
+            )
+        view_slot, time_slot = (int(part) for part in parts)
+        if (view_slot, time_slot) in pairs:
+            raise ValueError(
+                f"--query_anchors {view_slot}:{time_slot} is listed more than once"
+            )
+        pairs.append((view_slot, time_slot))
+    if not pairs:
+        raise ValueError(
+            "--query_anchors must contain at least one VIEWSLOT:TIMESLOT pair"
+        )
+    return tuple(pairs)
+
+
+def check_anchor_slots_seat(planned, anchor_slots) -> None:
+    """Every planned step must seat every anchor slot, checked at submit time.
+
+    View slots are already guaranteed by ``--min_views``; time slots are not --
+    a step's window length is ``budget // views``, capped -- so an unseatable
+    time slot would otherwise surface as an error at whatever step first plans
+    a short window, hours into an allocation.  Pure arithmetic on the tally: no
+    RNG, no GPU, no ``--output_dir``, so it runs under ``--plan_only`` and the
+    verdict arrives at submit time.
+    """
+
+    for plan in planned:
+        for view_slot, time_slot in anchor_slots:
+            if view_slot < len(plan.cameras) and time_slot < len(plan.times):
+                continue
+            raise ValueError(
+                f"--query_anchors {view_slot}:{time_slot} does not fit "
+                f"step={plan.step} scene={plan.seq_name!r}, which seats "
+                f"{len(plan.cameras)} views x {len(plan.times)} times. Slots "
+                "are relative to each step's own window, and the spec must fit "
+                "every planned step"
+            )
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Replay an MVTracker sample manifest to train 4RC temporal tracking"
@@ -678,6 +860,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Records with fewer views are skipped. Below two there is no "
             "synchronized cross-view pair, so the run cannot measure the thing "
             "temporal indexing exists for (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--query_anchors",
+        nargs="+",
+        default=["0:0"],
+        metavar="VIEWSLOT:TIMESLOT",
+        help=(
+            "Observations owning a dense query field, as relative slot pairs "
+            "into each replayed step's ordered view list and time window -- "
+            "unlike the overfit's absolute --query_anchor CAMERA:TIME, because "
+            "every step has its own cameras and times. In priority order; the "
+            "first is primary and owns the scene Sim(3). View slots are "
+            "validated against --min_views, the only per-step floor on how "
+            "many views a step seats; time slots are validated against every "
+            "planned step's own window, at plan time. Each query is supervised "
+            "once, from the anchor it fits best. Default %(default)s is "
+            "exactly the single-anchor behaviour every archived run trained "
+            "under"
         ),
     )
     parser.add_argument(
@@ -901,6 +1102,42 @@ def _validate_args(args: argparse.Namespace) -> None:
             "whose rows name the training directory"
         )
 
+    anchor_slots = parse_query_anchor_slots(args.query_anchors)
+    for view_slot, _time_slot in anchor_slots:
+        # --min_views is the only per-step floor on how many views a planned
+        # step seats, so it is the only parse-time guarantee a view slot can
+        # rest on. Time slots have no such floor and are checked against the
+        # actual plans, in main().
+        if view_slot >= args.min_views:
+            raise ValueError(
+                f"--query_anchors view slot {view_slot} needs --min_views >= "
+                f"{view_slot + 1}; min_views is the only per-step guarantee on "
+                "how many views a planned step seats"
+            )
+    if args.val_scenes_file:
+        # The held-out window derives purely from flags, so its seating is
+        # checkable here rather than at plan time.
+        val_times = _val_time_count(args)
+        for view_slot, time_slot in anchor_slots:
+            if view_slot >= len(args.val_cameras):
+                raise ValueError(
+                    f"--query_anchors view slot {view_slot} does not fit the "
+                    f"held-out window's {len(args.val_cameras)} cameras "
+                    "(--val_cameras)"
+                )
+            if time_slot >= val_times:
+                raise ValueError(
+                    f"--query_anchors time slot {time_slot} does not fit the "
+                    f"held-out window's {val_times} times (--observation_budget "
+                    "// len(--val_cameras), capped by --max_time_indices)"
+                )
+    # Canonical form, recorded everywhere the spec is recorded: format-only
+    # normalization ("01:00" becomes "1:0"), order preserved -- the order is
+    # stream-defining (see parse_query_anchor_slots).
+    args.query_anchors = [
+        f"{view_slot}:{time_slot}" for view_slot, time_slot in anchor_slots
+    ]
+
 
 def _plan_summary(tally, args) -> dict:
     strides = Counter(plan.stride for plan in tally.planned)
@@ -946,6 +1183,7 @@ def _plan_summary(tally, args) -> dict:
             "max_time_indices": args.max_time_indices,
             "min_views": args.min_views,
             "excluded_data_roots": list(args.exclude_data_root),
+            "query_anchors": list(args.query_anchors),
         },
     }
 
@@ -1067,6 +1305,17 @@ def run_training(
         print(f"held_out_preflight_ok={len(val_plans)}")
     history: list[StepOutcome] = []
     evaluations: list[dict] = []
+    # Per-stage eligibility, summed over this invocation's executed steps, so
+    # whether an anchor set saturates eligibility on the real stream is read
+    # off run_summary.json instead of extrapolated from the one-scene overfit.
+    # steps_counted is the denominator; injected step functions that report no
+    # eligibility (and skipped scene loads) contribute nothing.
+    eligibility_totals = {
+        "steps_counted": 0,
+        "total_query_count": 0,
+        "eligible_query_count": 0,
+        "rejected": dict.fromkeys(ELIGIBILITY_REJECTION_STAGES, 0),
+    }
     scene = None
     interrupted = None
     last_saved_step = None
@@ -1135,6 +1384,18 @@ def run_training(
                 outcome.peak_bytes, step=step, max_fraction=args.max_device_fraction
             )
             history.append(outcome)
+            if outcome.eligibility is not None:
+                eligibility_totals["steps_counted"] += 1
+                eligibility_totals["total_query_count"] += int(
+                    outcome.eligibility["total_query_count"]
+                )
+                eligibility_totals["eligible_query_count"] += int(
+                    outcome.eligibility["eligible_query_count"]
+                )
+                for stage, count in outcome.eligibility["rejected"].items():
+                    eligibility_totals["rejected"][stage] = (
+                        eligibility_totals["rejected"].get(stage, 0) + int(count)
+                    )
             print(
                 f"step={step}/{args.num_steps} scene={outcome.seq_name} "
                 f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
@@ -1154,6 +1415,7 @@ def run_training(
                 huber_delta_m=args.huber_delta_m,
                 step=completed,
                 output_dir=output_dir,
+                query_anchors=args.query_anchors,
             )
             evaluations.append(metrics)
             print(
@@ -1185,6 +1447,7 @@ def run_training(
         "interrupted_by": interrupted,
         "scene_cache": {"hits": cache.hits, "misses": cache.misses},
         "scene_load_skips": dict(sorted(scene_load_skips.items())),
+        "eligibility_totals": eligibility_totals,
         "history": history,
         "evaluations": evaluations,
     }
@@ -1205,6 +1468,10 @@ def _checkpoint_settings(args) -> dict:
         # The plan summary's name for --exclude_data_root, so the checkpoint
         # and run_summary.json read alike.
         "excluded_data_roots": list(args.exclude_data_root),
+        # The canonical order-preserving strings, as a list: torch.load with
+        # weights_only=True hands back a list, and ['0:0'] != ('0:0',) would
+        # spuriously refuse every legitimate resume if a tuple were stored.
+        "query_anchors": list(args.query_anchors),
         "kubric_max_depth": float(args.kubric_max_depth),
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
@@ -1240,17 +1507,20 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # The two tiers mirror _checkpoint_settings, split by consequence. The refused
 # keys decide which plans main() builds (budget, stride, min_views,
 # max_time_indices, the excluded roots), what the loader hands those plans
-# (kubric_max_depth moves geometry and labels), or the numerics under the
-# restored scaler state (precision): a changed value means the "resumed" run
-# trains a different stream while its step counter continues. num_steps,
-# warmup_steps and min_lr_scale only reshape the remaining schedule, and
-# extending a finished run by raising num_steps is legitimate, so those warn.
+# (kubric_max_depth moves geometry and labels), which observations each step
+# supervises and how the loss reduces over them (query_anchors), or the
+# numerics under the restored scaler state (precision): a changed value means
+# the "resumed" run trains a different stream while its step counter continues.
+# num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
+# and extending a finished run by raising num_steps is legitimate, so those
+# warn.
 _RESUME_SETTINGS_REFUSED = (
     "observation_budget",
     "stride",
     "min_views",
     "max_time_indices",
     "excluded_data_roots",
+    "query_anchors",
     "kubric_max_depth",
     "precision",
 )
@@ -1260,13 +1530,26 @@ _RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
 def check_resume_settings(stored: dict, args) -> None:
     """Compare a checkpoint's stored settings against this invocation's flags.
 
-    ``stored`` may be empty or partial: a checkpoint from before a settings key
-    existed still resumes, it just resumes unchecked on that key.
+    A refused-tier key **absent** from ``stored`` is itself refused: an
+    unverifiable stream is not a continuable one, and tolerating the gap would
+    let a checkpoint from before the key existed resume under a different
+    anchor spec -- or budget, or stride -- with nothing raising anywhere.  The
+    only checkpoints predating the newest key are disposable short smokes, so
+    nothing worth resuming is lost.  Warned-tier keys stay tolerant when
+    absent: they only reshape the remaining schedule.
     """
 
     current = _checkpoint_settings(args)
     for key in _RESUME_SETTINGS_REFUSED:
-        if key in stored and stored[key] != current[key]:
+        if key not in stored:
+            raise RuntimeError(
+                f"--resume checkpoint carries no stored {key!r}, so this "
+                "invocation cannot verify the resumed run would continue the "
+                "same stream. Only checkpoints from before the key existed "
+                "lack it -- disposable smokes, not runs worth continuing; "
+                "start a fresh run without --resume"
+            )
+        if stored[key] != current[key]:
             raise RuntimeError(
                 f"--resume checkpoint carries {key}={stored[key]!r} but this "
                 f"invocation has {key}={current[key]!r}. That would replay a "
@@ -1375,6 +1658,16 @@ def main() -> None:
         print("FAIL no record produced a replayable step", file=sys.stderr)
         raise SystemExit(1)
 
+    # Before the --plan_only return, deliberately: an anchor spec the planned
+    # stream cannot seat should fail at submit time, GPU-free, like every other
+    # plan defect.
+    try:
+        check_anchor_slots_seat(
+            tally.planned, parse_query_anchor_slots(args.query_anchors)
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.plan_only:
         print(f"PASS planned {len(tally.planned)} steps from {manifest_path}")
         return
@@ -1432,6 +1725,7 @@ def main() -> None:
         min_shared_queries=args.min_shared_queries,
         honour_recorded_tracks=args.honour_recorded_tracks,
         max_depth=args.kubric_max_depth,
+        query_anchor_slots=parse_query_anchor_slots(args.query_anchors),
     )
     val_plans = _val_plans(args)
     if val_plans:
@@ -1469,6 +1763,9 @@ def main() -> None:
         "interrupted_by": result["interrupted_by"],
         "scene_cache": result["scene_cache"],
         "scene_load_skips": result["scene_load_skips"],
+        # This invocation's executed steps, like history and evaluations: a
+        # resumed run's totals restart with it.
+        "eligibility_totals": result["eligibility_totals"],
         "evaluations": result["evaluations"],
         "trainable_tensor_count": report["tensor_count"],
         "trainable_parameter_count": report["parameter_count"],
@@ -1513,6 +1810,21 @@ def main() -> None:
     print(f"gates_passed={summary['gates_passed']}")
 
 
+def _val_time_count(args) -> int:
+    """How many times the held-out window seats, purely from flags.
+
+    Factored out of :func:`_val_plans` so the parse-time anchor-seating check
+    and the plans it vouches for cannot drift apart.  The window itself is
+    unchanged: ``_val_plans`` still builds ``range(0, count * stride, stride)``
+    starting at 0, which is what keeps held-out curves comparable with the
+    archived smokes.
+    """
+
+    return min(
+        args.observation_budget // len(args.val_cameras), args.max_time_indices
+    )
+
+
 def _val_plans(args) -> list[StepPlan]:
     """Held-out scenes as plans, so eval and training share one scene path.
 
@@ -1525,9 +1837,7 @@ def _val_plans(args) -> list[StepPlan]:
         return []
     names = json.loads(Path(args.val_scenes_file).read_text())
     cameras = tuple(args.val_cameras)
-    times = tuple(
-        range(0, min(args.observation_budget // len(cameras), args.max_time_indices) * args.stride, args.stride)
-    )
+    times = tuple(range(0, _val_time_count(args) * args.stride, args.stride))
     return [
         StepPlan(
             step=-1,

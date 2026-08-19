@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -212,6 +213,7 @@ class MVTrackerSceneProvider:
         min_shared_queries: int = 64,
         honour_recorded_tracks: bool = False,
         max_depth: float = 24.0,
+        query_anchor_slots: Sequence[tuple[int, int]] = ((0, 0),),
     ):
         # There is deliberately no ``subset``: it was only ever a path component,
         # and after the override above it decides nothing. A held-out set is a
@@ -228,6 +230,24 @@ class MVTrackerSceneProvider:
         # not "too little of a recorded draw survived".
         self.min_shared_queries = min_shared_queries
         self.honour_recorded_tracks = honour_recorded_tracks
+        # Relative (view_slot, time_slot) pairs, resolved per step against the
+        # plan's own ordered cameras and times, in priority order -- the first
+        # is primary and owns the Sim(3). The default resolves to
+        # (plan.cameras[0], plan.times[0]), which is build_scene's own default
+        # anchor, so it changes nothing. Negatives are refused at construction:
+        # resolve_query_anchors checks only the upper bound, so a -1 would
+        # otherwise wrap via Python indexing to the LAST camera and anchor a
+        # different observation than any documented slot meaning, silently.
+        slots = []
+        for view_slot, time_slot in query_anchor_slots:
+            view_slot, time_slot = int(view_slot), int(time_slot)
+            if view_slot < 0 or time_slot < 0:
+                raise ValueError(
+                    f"query anchor slot {view_slot}:{time_slot} is negative; "
+                    "slots index the step's own window and never wrap"
+                )
+            slots.append((view_slot, time_slot))
+        self.query_anchor_slots = tuple(slots)
         # Reported rather than raised on: how much of the recorded draw the
         # opt-in path failed to find. Meaningless when the flag is off.
         self.missing_track_ids = 0
@@ -426,6 +446,30 @@ class MVTrackerSceneProvider:
             )
         return selection
 
+    def resolve_query_anchors(self, plan) -> tuple[tuple[int, int], ...]:
+        """The step's absolute (camera id, original time) anchors, from slots.
+
+        Slots are relative to the step's own ordered view list and time window,
+        because every replayed step has its own; the trainer validates that
+        every planned step seats every slot before training starts.  A slot
+        that does not fit here is therefore a configuration error, and it
+        raises ``ValueError`` rather than ``SceneProviderError`` deliberately:
+        the step loop's skip policy absorbs ``SceneProviderError`` as one bad
+        scene, and a mis-sized anchor spec must kill the run instead.
+        """
+
+        anchors = []
+        for view_slot, time_slot in self.query_anchor_slots:
+            if view_slot >= len(plan.cameras) or time_slot >= len(plan.times):
+                raise ValueError(
+                    f"query anchor slot {view_slot}:{time_slot} does not fit "
+                    f"scene {plan.seq_name!r} with {len(plan.cameras)} views x "
+                    f"{len(plan.times)} times; the anchor spec must fit every "
+                    "planned step"
+                )
+            anchors.append((plan.cameras[view_slot], plan.times[time_slot]))
+        return tuple(anchors)
+
     def __call__(self, plan):
         from arc.training import scene_from_datapoint
 
@@ -455,6 +499,7 @@ class MVTrackerSceneProvider:
             sample,
             cameras=plan.cameras,
             times=plan.times,
+            query_anchors=self.resolve_query_anchors(plan),
             size=self.size,
             patch_size=self.patch_size,
         )

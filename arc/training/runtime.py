@@ -10,6 +10,11 @@ Nothing here knows about ``argparse``.  ``build_optimizer`` takes scalars rather
 than a ``Namespace`` precisely so a second driver with a different parser can
 call it without inheriting the first driver's flag names.
 
+The per-anchor supervision mechanism (``cut_features`` through
+``accumulate_weighted``) lives here for the same reason: the overfit built and
+measured it, the multi-scene trainer runs the identical structure, and a copy
+would let the two drivers' memory behaviour drift apart silently.
+
 Deliberately **not** re-exported from ``arc.training``'s ``__all__``:
 ``gradient_norm`` and ``move_views_to_cuda`` are device-specific, and the
 package's public surface is device-neutral.  Import them from
@@ -21,6 +26,9 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 import torch
+
+from arc.training.losses import compose_tracking_loss
+from arc.training.sparse_tracking import sparse_targets
 
 
 # Per freeze mode: (trainable tensor count, trainable parameters excluding the
@@ -281,6 +289,149 @@ def tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
     if keep_confidence:
         kept["conf_track_multi"] = raw_predictions["conf_track_multi"]
     return kept
+
+
+# --- The per-anchor memory mechanism, shared by both drivers. Several anchors
+# are supervised as one encoder pass plus one track-head pass per anchor, each
+# backwarded onto a detached cut of the backbone taps; the summed cut gradients
+# then flow through the encoder exactly once. The overfit measured the marginal
+# cost of an extra anchor at a flat ~2.3 GiB against a 135 GiB primary arm at
+# the 48-observation window -- which is what a widened Q axis cannot deliver.
+
+
+def cut_features(feats):
+    """Detach the backbone taps into leaves, returning the cut and its pairs.
+
+    This is the encoder/head boundary that lets several anchors be supervised
+    without holding several track-head graphs at once.  Each anchor's head pass
+    runs on the leaves and backwards immediately, freeing its own graph and
+    leaving its gradient on the cut; one
+    ``torch.autograd.backward(originals, leaf_grads)`` afterwards pushes the
+    summed gradient through the encoder exactly once.  Summing gradients at a
+    cut is the chain rule, so this is identical to one combined backward -- not
+    an approximation -- while the encoder is neither re-run nor re-differentiated
+    per anchor.
+    """
+
+    pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def cut(value):
+        if torch.is_tensor(value):
+            if not value.requires_grad:
+                return value
+            leaf = value.detach().requires_grad_(True)
+            pairs.append((value, leaf))
+            return leaf
+        if isinstance(value, (list, tuple)):
+            return type(value)(cut(item) for item in value)
+        return value
+
+    return cut(feats), pairs
+
+
+def backward_through_cut(pairs) -> None:
+    """Push the anchors' accumulated gradients back through the encoder once."""
+
+    if not pairs:
+        return
+    originals = [original for original, _ in pairs]
+    gradients = [
+        torch.zeros_like(leaf) if leaf.grad is None else leaf.grad
+        for _, leaf in pairs
+    ]
+    torch.autograd.backward(originals, gradients)
+
+
+def encode_and_reconstruct(model, views):
+    """The per-step work that does not depend on which frame is the query."""
+
+    images, _, time_indices = model._preprocess_input(views)
+    feats = model.encode_features(images, time_indices=time_indices)
+    return images, feats, model.reconstruct(feats, images)
+
+
+def anchor_tracks(model, feats, images, scene, anchor_index):
+    """One anchor's dense field, shaped as the Q=1 raw dict the loss expects."""
+
+    slot = scene.anchor_observation_slots[anchor_index]
+    track, track_conf = model.track_for_query(feats, images, slot)
+    return {
+        "track_multi": track[:, None],
+        "conf_track_multi": track_conf[:, None],
+        "track_query_idx": torch.tensor([slot], device=track.device),
+    }
+
+
+def anchor_sample_counts(scene, correspondences, anchor_count: int) -> list[int]:
+    """Supervised sample count per anchor, from the scene alone.
+
+    These are the weights that make per-anchor backward equal one combined
+    ``reduction="mean"``.  They come from ``sparse_targets``, the same masking
+    the loss itself applies, so the two cannot drift apart; and because nothing
+    in that mask reads a prediction, they are fixed for the whole run.
+    """
+
+    counts = []
+    for anchor_index in range(anchor_count):
+        anchor = correspondences.select_query_slot(anchor_index)
+        if anchor.count == 0:
+            counts.append(0)
+            continue
+        _, _, _, mask = sparse_targets(scene, anchor)
+        counts.append(int(mask.sum().item()))
+    return counts
+
+
+def weighted_anchor_total(
+    result,
+    *,
+    position_weight: float,
+    confidence_weight: float,
+    sync_weight: float,
+) -> torch.Tensor:
+    """One anchor's contribution to the combined objective.
+
+    ``compose_tracking_loss`` is linear in its terms, so backwarding each
+    anchor's weighted total in turn accumulates exactly the gradient of the sum
+    -- which is the combined loss, given the position and confidence weights are
+    that anchor's share of the supervised samples and the sync weight is its
+    share of the anchors.
+
+    One scope limit on that equivalence.  The sync share is
+    ``1 / active_anchor_count``, not ``1 / anchor_count``, so the objective
+    reproduced is a stacked forward over the **active** anchors.  A declared
+    anchor that supervises nothing is skipped entirely, and against the
+    ``Q = anchor_count`` reference ``_evaluate`` computes, its dense field would
+    have contributed a sync term this does not include.  Weighting by the active
+    count is the defensible choice -- an anchor with no supervised query still
+    has a displacement field, but nothing here has any evidence about it -- but
+    it does mean the two numbers differ in that case.
+
+    Terms are inserted in the same order ``sparse_tracking_loss`` uses, because
+    ``compose_tracking_loss`` sums in insertion order and float addition is not
+    associative: with a single anchor at weight 1.0 this must reproduce that
+    function's own ``total_loss`` bit for bit.
+    """
+
+    terms = {"position": result.loss}
+    weights = {"position": position_weight}
+    if result.sync_loss is not None:
+        terms["sync"] = result.sync_loss
+        weights["sync"] = sync_weight
+    if result.confidence_loss is not None:
+        terms["confidence"] = result.confidence_loss
+        weights["confidence"] = confidence_weight
+    total, _ = compose_tracking_loss(terms, weights)
+    return total
+
+
+def accumulate_weighted(total: float | None, value, weight: float) -> float | None:
+    """Running weighted sum of a reported scalar across anchors."""
+
+    if value is None:
+        return total
+    contribution = float(value.detach().item()) * float(weight)
+    return contribution if total is None else total + contribution
 
 
 def _quantile_summary(values: torch.Tensor) -> dict[str, float]:

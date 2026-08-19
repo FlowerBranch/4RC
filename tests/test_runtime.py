@@ -36,8 +36,10 @@ from arc.training import runtime
 # a change to the harness is intended, and never to make a red test go green.
 HARNESS_BASELINE = "893a6e5"
 
-# The helpers the extraction moved out of ``overfit_temporal_tracking.py``. The
+# The helpers the extractions moved out of ``overfit_temporal_tracking.py``. The
 # harness must still expose every one of them as a module global; see below.
+# The second group is the per-anchor supervision mechanism, moved when the
+# multi-scene trainer became its second consumer.
 MOVED_TO_RUNTIME = {
     "_assert_frozen_gradients_absent",
     "_assert_trainable_gradients_finite",
@@ -49,6 +51,13 @@ MOVED_TO_RUNTIME = {
     "_move_views_to_cuda",
     "_shuffled_index_views",
     "_tracking_only",
+    "_accumulate",
+    "_anchor_sample_counts",
+    "_anchor_tracks",
+    "_backward_through_cut",
+    "_cut_features",
+    "_encode_and_reconstruct",
+    "_weighted_anchor_total",
 }
 
 
@@ -109,6 +118,8 @@ def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():
     assert overfit_cli._confidence_stats is runtime.confidence_stats
     assert overfit_cli._autocast_context is runtime.autocast_context
     assert overfit_cli.EXPECTED_TRAINABLE_SETS is runtime.EXPECTED_TRAINABLE_SETS
+    assert overfit_cli._cut_features is runtime.cut_features
+    assert overfit_cli._weighted_anchor_total is runtime.weighted_anchor_total
 
 
 # --------------------------------------------------------------- gradient norm ---

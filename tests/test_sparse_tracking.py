@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+import arc.training.runtime as runtime_module
 import arc.training.sparse_tracking as sparse_module
 import overfit_temporal_tracking as overfit_cli
 from arc.models.arc.arc import Arc
@@ -5111,7 +5112,10 @@ def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
         return compose_tracking_loss(terms, weights)
 
     monkeypatch.setattr(sparse_module, "compose_tracking_loss", recording_compose)
-    monkeypatch.setattr(overfit_cli, "compose_tracking_loss", recording_compose)
+    # The helper lives in arc.training.runtime and resolves compose_tracking_loss
+    # from ITS module globals; patching the overfit module would intercept
+    # nothing since the move.
+    monkeypatch.setattr(runtime_module, "compose_tracking_loss", recording_compose)
 
     result = sparse_tracking_loss(
         raw,

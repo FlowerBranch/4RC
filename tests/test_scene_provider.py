@@ -860,3 +860,117 @@ def test_the_eval_default_fixture_still_matches_upstream():
             continue
         assert name in real, f"{name} vanished from from_name's kwargs"
         assert real[name] == value, f"{name}: fixture {value!r}, upstream {real[name]!r}"
+
+
+# ------------------------------------------------------------ query anchors ---
+
+
+def _anchor_plan(**record_overrides):
+    """A real StepPlan whose window the anchor slots index into.
+
+    ``views=[1, 0]`` on purpose: slot 0 then names camera id 1, which is what
+    separates a *relative* slot from an absolute camera id. ``seq_len=4`` at
+    stride 2 seats two times, matching the four-frame fixture scene.
+    ``scene_transform=None`` keeps ``__call__`` off the transform path, which
+    imports mvtracker; ``real_len=1`` matches the one-scene stub pool below.
+    """
+
+    from test_manifest_plan import _record
+    from arc.training.manifest_plan import plan_record
+
+    record = _record(
+        seq_name="0000",
+        views=[1, 0],
+        seq_len=4,
+        real_len=1,
+        scene_transform=None,
+        **record_overrides,
+    )
+    return plan_record(record, budget=48, stride=2)
+
+
+def test_the_default_provider_spec_resolves_to_build_scenes_own_default():
+    """(0, 0) resolves to (cameras[0], times[0]) -- exactly the anchor
+    build_scene chooses when query_anchors is omitted, so the default changes
+    nothing about existing runs."""
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    provider = MVTrackerSceneProvider()
+    plan = _anchor_plan()
+
+    assert provider.query_anchor_slots == ((0, 0),)
+    assert provider.resolve_query_anchors(plan) == (
+        (plan.cameras[0], plan.times[0]),
+    )
+
+
+def test_the_provider_resolves_relative_slots_against_the_steps_own_window(tmp_path):
+    """Slot 0:0 on a (1, 0) view list anchors camera id 1 -- relative, not
+    absolute -- and the resolved pair reaches the scene through
+    scene_from_datapoint end to end."""
+
+    from test_scene_sources import _datapoint_from_dump
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    scene_path = _write_scene(
+        tmp_path, time_count=4, view_count=2, depth_sidecar=True
+    )
+    plan = _anchor_plan()
+    assert plan.cameras == (1, 0) and len(plan.times) == 2
+
+    class _Pool:
+        seq_names = ["0000"]
+
+        def __getitem__(self, index):
+            datapoint = _datapoint_from_dump(scene_path)
+            # The provider's column selection reads the loaded sample's own
+            # eligible pool; the dump fixture carries three tracks.
+            datapoint.sample_track_indices = [0, 1, 2]
+            return datapoint, True
+
+    resolved_scenes = []
+    for slots, expected in (
+        (((0, 0),), ((1, plan.times[0]),)),
+        (((1, 1),), ((0, plan.times[1]),)),
+        (((0, 0), (1, 0)), ((1, plan.times[0]), (0, plan.times[0]))),
+    ):
+        provider = MVTrackerSceneProvider(
+            min_shared_queries=1, query_anchor_slots=slots
+        )
+        provider._datasets[plan.data_root] = _Pool()
+        scene = provider(plan)
+        assert scene.query_anchors == expected, slots
+        resolved_scenes.append(scene)
+
+    # The first anchor is primary: it owns the query observation slot.
+    primary = resolved_scenes[0].observations[
+        resolved_scenes[0].query_observation_slot
+    ]
+    assert primary.camera_id == 1
+    assert primary.original_time == plan.times[0]
+
+
+def test_an_anchor_slot_outside_the_plans_window_is_a_config_error_not_a_skip():
+    """The step loop's skip policy absorbs SceneProviderError as one bad scene;
+    a mis-sized anchor spec must kill the run instead, so it raises ValueError.
+    (The trainer refuses such a spec at plan time; this is the backstop.)"""
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    plan = _anchor_plan()
+    provider = MVTrackerSceneProvider(query_anchor_slots=((0, 5),))
+
+    with pytest.raises(ValueError, match="0:5") as excinfo:
+        provider.resolve_query_anchors(plan)
+    assert not isinstance(excinfo.value, SceneProviderError)
+
+    view_provider = MVTrackerSceneProvider(query_anchor_slots=((2, 0),))
+    with pytest.raises(ValueError, match="2:0"):
+        view_provider.resolve_query_anchors(plan)
+
+    # A negative slot is refused at construction: resolve_query_anchors checks
+    # only the upper bound, so -1 would otherwise wrap via Python indexing to
+    # the LAST camera and silently anchor a different observation.
+    with pytest.raises(ValueError, match="never wrap"):
+        MVTrackerSceneProvider(query_anchor_slots=((-1, 0),))
