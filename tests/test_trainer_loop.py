@@ -16,6 +16,7 @@ resumed segment, because the final value alone hides it.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import signal
 import sys
@@ -1847,3 +1848,293 @@ def test_steps_without_eligibility_reports_leave_the_totals_at_zero(tmp_path):
         "eligible_query_count": 0,
         "rejected": dict.fromkeys(train_cli.ELIGIBILITY_REJECTION_STAGES, 0),
     }
+
+
+# ------------------------------- an unsupervisable held-out scene ---
+
+
+def test_an_unsupervisable_held_out_scene_is_skipped_and_recorded(
+    tmp_path, monkeypatch
+):
+    """The eval's disposition is the opposite of train_step's, deliberately.
+
+    Anchoring only at time 2 while every fixture query starts at time 0 rejects
+    everything at query_time_mismatch, leaving an empty correspondence set. That
+    set used to reach `gather_query_anchor_points`, whose `rows.min()` is
+    unguarded -- so the scene died with a torch reduction error naming neither
+    the scene nor the reason, and the exception escaped `run_training`, skipping
+    the post-loop checkpoint and the summary. One bad held-out scene must not end
+    a multi-day run, so it is skipped and recorded instead.
+    """
+
+    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 2),))
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=5,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:2"],
+    )
+
+    # Scored zero scenes, and said so rather than raising.
+    assert metrics["scenes"] == 0
+    assert metrics["per_scene"] == []
+    # None, not 0.0: an average over nothing is an absence, not a measurement.
+    assert metrics["position_loss"] is None
+    assert metrics["metric_error_m"] is None
+
+    skipped = metrics["skipped_scenes"]
+    assert [entry["scene"] for entry in skipped] == ["0000"]
+    assert skipped[0]["reason"] == "no_eligible_correspondences"
+    # The split has to travel with the skip, or a reader cannot tell an anchor
+    # spec that reaches nothing from a held-out set that is simply missing.
+    split = skipped[0]["eligibility"]
+    assert split["eligible_query_count"] == 0
+    assert split["rejected"]["query_time_mismatch"] == split["total_query_count"] > 0
+
+    # And it reaches the file, which is the only thing a later reader has.
+    written = json.loads(
+        (tmp_path / "out" / "eval" / "step-5" / "metrics.json").read_text()
+    )
+    assert written["skipped_scenes"] == skipped
+    assert written["scenes"] == 0
+    # No prediction bundle for a scene that was never scored.
+    assert not (tmp_path / "out" / "eval" / "step-5" / "pred").exists()
+
+
+def test_one_unsupervisable_held_out_scene_leaves_the_others_scored(
+    tmp_path, monkeypatch
+):
+    """The skip is per scene: the rest of the held-out set still makes a point."""
+
+    good = _cpu_eval_scene(tmp_path / "good", monkeypatch)
+    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    height, width = good.views[0]["img"].shape[-2:]
+    model = _FakeArc(good.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[
+            plan_record(_record(seq_name="bad"), budget=48, stride=2),
+            plan_record(_record(seq_name="good"), budget=48, stride=2),
+        ],
+        scene_provider=lambda plan: bad if plan.seq_name == "bad" else good,
+        precision="32",
+        huber_delta_m=0.05,
+        step=1,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        emit_predictions=False,
+    )
+
+    assert [entry["scene"] for entry in metrics["skipped_scenes"]] == ["bad"]
+    assert [entry["scene"] for entry in metrics["per_scene"]] == ["good"]
+    # "scenes" counts the SCORED ones, so the curve point is not silently an
+    # average over a set half of which contributed nothing.
+    assert metrics["scenes"] == 1
+    assert metrics["position_loss"] is not None
+
+
+def test_an_unsupervisable_val_scene_does_not_end_the_run(tmp_path, monkeypatch):
+    """End to end: the run reaches its full step count and still checkpoints.
+
+    Two held-out scenes rather than one, and not for tidiness: at a one-scene
+    held-out set "one bad scene" and "the whole set is unsupervisable" are the
+    same event, and the preflight refuses the latter. Two is also the real shape
+    -- the policy exists so the good scenes keep producing a curve.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    good = _cpu_eval_scene(tmp_path / "good", monkeypatch)
+    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    height, width = good.views[0]["img"].shape[-2:]
+    model = _FakeArc(good.num_observations, height, width)
+
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, eval_every=2),
+        scene_provider=lambda plan: bad if plan.seq_name == "val-bad" else good,
+        step_fn=lambda *, step, plan, **_: train_cli.StepOutcome(
+            step=step, seq_name=plan.seq_name, loss=0.0, metric_error_m=0.0,
+            sample_count=1, alignment_scale=1.0, alignment_residual_m=0.0,
+            learning_rates=[1e-3], gradient_norms={},
+        ),
+        output_dir=tmp_path,
+        val_plans=[
+            plan_record(_record(seq_name=name), budget=48, stride=2)
+            for name in ("val-bad", "val-good")
+        ],
+    )
+
+    assert result["completed_steps"] == 4, "the run reaches its full step count"
+    assert [entry["step"] for entry in result["evaluations"]] == [2, 4]
+    first = result["evaluations"][0]
+    assert [entry["scene"] for entry in first["skipped_scenes"]] == ["val-bad"]
+    assert first["scenes"] == 1, "the good scene still makes the curve point"
+    assert first["position_loss"] is not None
+    # The post-loop checkpoint is what the escaping exception used to skip.
+    assert (tmp_path / "train_state.pt").is_file()
+
+
+def test_a_wholly_unsupervisable_held_out_set_dies_at_step_zero(
+    tmp_path, monkeypatch
+):
+    """Per scene the skip is right; for the whole set it would produce no curve.
+
+    A held-out set none of whose scenes can be supervised would otherwise spend
+    the entire allocation writing `scenes: 0` and a null loss at every boundary
+    -- a run that reads as complete and measured nothing, which is exactly what
+    the preflight exists to prevent.
+    """
+
+    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    stepped = []
+
+    with pytest.raises(RuntimeError, match="held-out scenes can be supervised"):
+        train_cli.run_training(
+            model=_toy_model(),
+            optimizer=torch.optim.AdamW(
+                [{"params": list(_toy_model().parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=_plans(4),
+            args=_loop_args(tmp_path, num_steps=4, query_anchors=["0:2"]),
+            scene_provider=lambda _plan: bad,
+            step_fn=lambda **kwargs: stepped.append(kwargs),
+            output_dir=tmp_path,
+            val_plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        )
+
+    assert stepped == [], "before any training time was spent, which is the point"
+
+
+# --------------------------------------- the per-step history file ---
+
+
+def _history(tmp_path):
+    return [
+        json.loads(line)
+        for line in (tmp_path / "history.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_every_step_is_flushed_to_the_history_file(tmp_path, monkeypatch):
+    """The curve has to reach a file, and run_summary.json is not that file.
+
+    gradient_norms (clipped_total included) and the training-stream confidence
+    stats were computed every step and discarded: the summary literal has no
+    history key, and `json.dumps` on a StepOutcome raises TypeError, which is
+    itself proof the key was never written. The step print carries neither.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    scene = _step_scene(tmp_path / "scene", monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(3),
+        args=_loop_args(tmp_path, num_steps=3),
+        scene_provider=lambda _plan: scene,
+        step_fn=train_cli.train_step,
+        output_dir=tmp_path,
+    )
+
+    records = _history(tmp_path)
+    assert [record["step"] for record in records] == [0, 1, 2]
+    # One record per StepOutcome field, under the dataclass's own names, so the
+    # file and the in-memory history cannot drift into two vocabularies.
+    assert set(records[0]) == {
+        field.name for field in dataclasses.fields(train_cli.StepOutcome)
+    }
+    # The two things that were being computed and thrown away.
+    assert "clipped_total" in records[0]["gradient_norms"]
+    assert records[0]["confidence"] is not None
+    assert records[0]["eligibility"]["total_query_count"] > 0
+    # Same steps as the returned history, which main() still reads for the peak.
+    assert [outcome.step for outcome in result["history"]] == [0, 1, 2]
+
+
+def test_the_history_survives_a_run_that_never_returns(tmp_path):
+    """The reason it is not a summary key.
+
+    run_summary.json is written only after run_training returns, so a segment
+    killed by the wall clock -- the normal end of 4 of the run's 5 segments --
+    writes none at all. A per-step flush leaves the steps that did happen.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+
+    def dying_step(*, step, plan, **_):
+        if step == 2:
+            raise RuntimeError("the wall clock, near enough")
+        return train_cli.StepOutcome(
+            step=step, seq_name=plan.seq_name, loss=float(step), metric_error_m=0.0,
+            sample_count=1, alignment_scale=1.0, alignment_residual_m=0.0,
+            learning_rates=[1e-3], gradient_norms={},
+        )
+
+    model = _toy_model()
+    with pytest.raises(RuntimeError, match="wall clock"):
+        train_cli.run_training(
+            model=model,
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=_plans(4),
+            args=_loop_args(tmp_path, num_steps=4),
+            scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+            step_fn=dying_step,
+            output_dir=tmp_path,
+        )
+
+    assert not (tmp_path / "run_summary.json").exists()
+    assert [record["step"] for record in _history(tmp_path)] == [0, 1]
+
+
+def test_a_resume_rewrites_the_history_from_its_restart_step(tmp_path):
+    """A killed segment's uncheckpointed steps must not be recorded twice.
+
+    The gradients of the steps after the last checkpoint were rolled back, so the
+    resumed segment recomputes them. Appending would leave two contradictory
+    records for the same step number and a curve that doubles back on itself.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    path = tmp_path / "history.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"step": step, "seq_name": "old", "loss": 9.0}) + "\n"
+            for step in range(4)
+        )
+    )
+
+    train_cli.open_step_history(tmp_path, start_step=2)
+
+    records = _history(tmp_path)
+    assert [record["step"] for record in records] == [0, 1]
+    assert all(record["seq_name"] == "old" for record in records), (
+        "the checkpointed prefix is kept verbatim"
+    )
+    # A fresh run, by contrast, keeps whatever is there and appends -- there is
+    # nothing to contradict.
+    train_cli.open_step_history(tmp_path, start_step=0)
+    assert [record["step"] for record in _history(tmp_path)] == [0, 1]

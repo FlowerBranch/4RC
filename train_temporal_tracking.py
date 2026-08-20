@@ -37,7 +37,7 @@ import json
 import signal
 import sys
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import torch
@@ -151,6 +151,21 @@ class StepOutcome:
     # per-anchor detail, which at 20k steps of history would bloat the summary.
     # None from injected step functions that do not compute it.
     eligibility: dict | None = None
+
+
+def compact_eligibility(eligibility: dict) -> dict:
+    """The subset of an eligibility report worth carrying per step and per scene.
+
+    Exactly what :attr:`StepOutcome.eligibility` documents. Shared between the
+    step's record and the eval's skip record so the two cannot drift into
+    reporting two different things under the name "the eligibility split".
+    """
+
+    return {
+        "total_query_count": eligibility["total_query_count"],
+        "eligible_query_count": eligibility["eligible_query_count"],
+        "rejected": dict(eligibility["rejected"]),
+    }
 
 
 def scene_skip_cause(error: Exception) -> str:
@@ -510,11 +525,7 @@ def train_step(
         gradient_norms=norms,
         peak_bytes=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
         confidence=stats,
-        eligibility={
-            "total_query_count": eligibility["total_query_count"],
-            "eligible_query_count": eligibility["eligible_query_count"],
-            "rejected": dict(eligibility["rejected"]),
-        },
+        eligibility=compact_eligibility(eligibility),
     )
 
 
@@ -547,6 +558,12 @@ def evaluate_held_out(
 
     Predictions are written in the cluster scorers' schema and **not scored** --
     ``evaluate_3dpt`` lives in the other environment.
+
+    A held-out scene whose anchor set reaches nothing is **skipped and recorded**,
+    never fatal -- the opposite disposition to ``train_step``'s, deliberately. One
+    unsupervisable held-out scene must not end a 4-5 segment run, and the skip is
+    reported in ``skipped_scenes`` with the split that says why, so a later reader
+    can tell a scene that was skipped from one that scored zero.
     """
 
     from arc.training import (
@@ -562,12 +579,36 @@ def evaluate_held_out(
     modes = {name: module.training for name, module in model.named_modules()}
     directory = Path(output_dir) / "eval" / f"step-{step}"
     per_scene: list[dict] = []
+    skipped: list[dict] = []
 
     try:
         model.eval()
         for plan in plans:
             scene = scene_provider(plan)
             correspondences, eligibility = build_anchor_correspondences(scene)
+            if correspondences.count == 0:
+                # Skipped and recorded rather than fatal -- see the docstring.
+                # Checked HERE, before any GPU work: gather_query_anchor_points
+                # reduces `rows.min()` unguarded, so an empty set dies inside
+                # torch with a reduction error that names neither the scene nor
+                # the reason. The narrow condition is deliberate; a broad
+                # `except ValueError` around the scene would also swallow the
+                # shape and wiring errors below, which must stay fatal.
+                skipped.append(
+                    {
+                        "scene": plan.seq_name,
+                        "reason": "no_eligible_correspondences",
+                        "eligibility": compact_eligibility(eligibility),
+                    }
+                )
+                print(
+                    f"eval step={step} scene={plan.seq_name} skipped: no anchor "
+                    "reaches an eligible query. The eligibility split says why: "
+                    f"of {eligibility['total_query_count']} queries, rejected="
+                    f"{eligibility['rejected']}"
+                )
+                del scene
+                continue
             with torch.no_grad(), autocast_context(precision):
                 raw = model(scene.views, force_no_output_conversion=True)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
@@ -639,6 +680,11 @@ def evaluate_held_out(
         "position_loss_shuffled": (
             sum(shuffled_losses) / len(shuffled_losses) if shuffled_losses else None
         ),
+        # Held-out scenes no anchor could supervise, each with the split that
+        # says why. "scenes" above counts the SCORED ones, so a reader can tell a
+        # scene that was skipped from one that scored zero -- which the averages,
+        # reducing over per_scene alone, would otherwise conflate.
+        "skipped_scenes": skipped,
         "per_scene": per_scene,
     }
     directory.mkdir(parents=True, exist_ok=True)
@@ -1227,6 +1273,50 @@ def _print_plan(tally, summary, *, limit: int = 20) -> None:
         print(f"{key}={summary[key]}")
 
 
+def open_step_history(output_dir, *, start_step: int) -> Path:
+    """Prepare the per-step record, dropping anything this resume replaces.
+
+    The curve lives in its own file rather than in a ``run_summary.json`` key for
+    two reasons. The summary is written only after :func:`run_training` returns,
+    so a segment killed by the wall clock writes none at all -- and a 4-5 segment
+    run is the norm here, not the exception. And 20k per-step records is exactly
+    the bloat the compact :attr:`StepOutcome.eligibility` field already exists to
+    keep out of the summary.
+
+    A killed segment leaves records for steps whose gradients were rolled back to
+    the last checkpoint, so a resume truncates at its own start step rather than
+    appending a second, contradictory record for the same step.
+    """
+
+    path = Path(output_dir) / "history.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if start_step > 0 and path.is_file():
+        kept = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and json.loads(line)["step"] < start_step
+        ]
+        # Rewritten through a rename, like every other artifact this writes: a
+        # crash mid-rewrite must not leave half a curve behind.
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+        temporary.replace(path)
+    return path
+
+
+def append_step_history(path: Path, outcome: StepOutcome) -> None:
+    """Flush one step's record, as its own line, before the next step begins.
+
+    Opened and closed per step deliberately: the point of the file is that it
+    survives a `kill -9` at the wall clock, which a buffered handle held across
+    the loop would not. One open per step is nothing against a step measured in
+    seconds of GPU work.
+    """
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(asdict(outcome)) + "\n")
+
+
 def run_training(
     *,
     model,
@@ -1299,11 +1389,46 @@ def run_training(
     # Deliberately NOT retained: this is a reachability check, not a cache, and
     # holding every held-out scene resident would cost GiB at a peak already
     # close to the guard.
+    #
+    # Correspondences are built too, not just the load. The eval skips a scene no
+    # anchor can supervise instead of dying on it, which is right per scene and
+    # wrong for a whole set: an unsupervisable held-out set would otherwise spend
+    # two days writing `scenes: 0` and a null loss at every boundary, producing no
+    # curve at all -- the same "run that reads as complete and measured nothing"
+    # this preflight already exists to prevent. Measured at ~11 us/query, so
+    # <=~260ms per scene against a load already costing seconds.
+    from arc.training import build_anchor_correspondences
+
+    unsupervisable: list[dict] = []
     for plan in val_plans or []:
-        scene_provider(plan)
+        val_scene = scene_provider(plan)
+        val_correspondences, val_eligibility = build_anchor_correspondences(val_scene)
+        if val_correspondences.count == 0:
+            unsupervisable.append(
+                {"scene": plan.seq_name, "eligibility": compact_eligibility(val_eligibility)}
+            )
+        del val_scene
     if val_plans:
-        print(f"held_out_preflight_ok={len(val_plans)}")
+        if len(unsupervisable) == len(val_plans):
+            raise RuntimeError(
+                f"None of the {len(val_plans)} held-out scenes can be supervised "
+                f"under --query_anchors {list(args.query_anchors)}, so the run "
+                "would produce no held-out curve. The eligibility split for "
+                f"{unsupervisable[0]['scene']} says why: of "
+                f"{unsupervisable[0]['eligibility']['total_query_count']} queries, "
+                f"rejected={unsupervisable[0]['eligibility']['rejected']}"
+            )
+        for entry in unsupervisable:
+            print(
+                f"held_out_preflight scene={entry['scene']} unsupervisable: "
+                f"rejected={entry['eligibility']['rejected']}; it will be skipped "
+                "at every eval"
+            )
+        print(
+            f"held_out_preflight_ok={len(val_plans) - len(unsupervisable)}/{len(val_plans)}"
+        )
     history: list[StepOutcome] = []
+    history_path = open_step_history(output_dir, start_step=start_step)
     evaluations: list[dict] = []
     # Per-stage eligibility, summed over this invocation's executed steps, so
     # whether an anchor set saturates eligibility on the real stream is read
@@ -1384,6 +1509,9 @@ def run_training(
                 outcome.peak_bytes, step=step, max_fraction=args.max_device_fraction
             )
             history.append(outcome)
+            # Before the eval and checkpoint boundaries below, so the step's
+            # record is on disk even if one of them is what kills the run.
+            append_step_history(history_path, outcome)
             if outcome.eligibility is not None:
                 eligibility_totals["steps_counted"] += 1
                 eligibility_totals["total_query_count"] += int(
@@ -1420,6 +1548,7 @@ def run_training(
             evaluations.append(metrics)
             print(
                 f"eval step={completed} scenes={metrics['scenes']} "
+                f"skipped={len(metrics['skipped_scenes'])} "
                 f"held_out_loss={metrics['position_loss']} "
                 f"held_out_metric_error_m={metrics['metric_error_m']} "
                 f"shuffled={metrics['position_loss_shuffled']}"
@@ -1781,6 +1910,23 @@ def main() -> None:
         # was trained under should be readable from the run rather than inferred
         # from whichever version of train.yaml happens to be checked out.
         "kubric_max_depth": float(args.kubric_max_depth),
+        # Run identity: what this run replayed, from where, against which
+        # held-out set, under which loss and clip. Every one of these had to be
+        # recovered from the sbatch script to read an archived summary, which is
+        # in the other repo and moves independently of this one.
+        "manifest": str(args.manifest),
+        "checkpoint_dir": str(args.checkpoint_dir),
+        "dataset_name": args.dataset_name,
+        "size": args.size,
+        "val_scenes_file": (
+            None if args.val_scenes_file is None else str(args.val_scenes_file)
+        ),
+        "val_data_root": (
+            None if args.val_data_root is None else str(args.val_data_root)
+        ),
+        "eval_every": args.eval_every,
+        "huber_delta_m": args.huber_delta_m,
+        "grad_clip": args.grad_clip,
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
         "seed": args.seed,
