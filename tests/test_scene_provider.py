@@ -974,3 +974,78 @@ def test_an_anchor_slot_outside_the_plans_window_is_a_config_error_not_a_skip():
     # the LAST camera and silently anchor a different observation.
     with pytest.raises(ValueError, match="never wrap"):
         MVTrackerSceneProvider(query_anchor_slots=((-1, 0),))
+
+    # And that raise is the default, which --adaptive_query_anchors relaxes.
+    assert MVTrackerSceneProvider().adaptive_query_anchors is False
+
+
+def test_adaptive_drops_the_slots_a_step_cannot_seat_and_keeps_spec_order():
+    """The flag turns the spec from a per-run contract into a per-step ceiling.
+
+    The manifest's steps carry 1-6 views, so under the contract one 2-view step
+    vetoes camera slot 3 for the whole stream. Here the same 2x2 step keeps the
+    slots it can seat and drops only slot 2, and the survivors stay in spec
+    order -- which is what makes the first of them primary.
+    """
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    plan = _anchor_plan()
+    assert plan.cameras == (1, 0) and len(plan.times) == 2
+
+    provider = MVTrackerSceneProvider(
+        query_anchor_slots=((1, 1), (2, 0), (0, 5), (0, 0)),
+        adaptive_query_anchors=True,
+    )
+
+    # 2:0 exceeds the views and 0:5 the times; the other two survive, in the
+    # order they were declared rather than sorted.
+    assert provider.resolve_query_anchors(plan) == (
+        (plan.cameras[1], plan.times[1]),
+        (plan.cameras[0], plan.times[0]),
+    )
+
+    # Negatives are still refused at construction: adaptive drops slots that are
+    # too LARGE, and a -1 would wrap rather than not fit.
+    with pytest.raises(ValueError, match="never wrap"):
+        MVTrackerSceneProvider(
+            query_anchor_slots=((-1, 0),), adaptive_query_anchors=True
+        )
+
+
+def test_the_first_surviving_anchor_owns_the_scene_under_adaptive(tmp_path):
+    """A dropped primary hands the Sim(3) to the next slot that seats.
+
+    Asserted through scene_from_datapoint rather than on the resolved tuple,
+    because "primary" is a property of the built scene: it is the observation
+    query_observation_slot points at.
+    """
+
+    from test_scene_sources import _datapoint_from_dump
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    scene_path = _write_scene(
+        tmp_path, time_count=4, view_count=2, depth_sidecar=True
+    )
+    plan = _anchor_plan()
+
+    class _Pool:
+        seq_names = ["0000"]
+
+        def __getitem__(self, index):
+            datapoint = _datapoint_from_dump(scene_path)
+            datapoint.sample_track_indices = [0, 1, 2]
+            return datapoint, True
+
+    provider = MVTrackerSceneProvider(
+        min_shared_queries=1,
+        # Slot 2 is declared first and this step cannot seat it.
+        query_anchor_slots=((2, 0), (1, 0)),
+        adaptive_query_anchors=True,
+    )
+    provider._datasets[plan.data_root] = _Pool()
+    scene = provider(plan)
+
+    assert scene.query_anchors == ((0, plan.times[0]),)
+    primary = scene.observations[scene.query_observation_slot]
+    assert primary.camera_id == 0 and primary.original_time == plan.times[0]

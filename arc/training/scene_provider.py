@@ -214,6 +214,7 @@ class MVTrackerSceneProvider:
         honour_recorded_tracks: bool = False,
         max_depth: float = 24.0,
         query_anchor_slots: Sequence[tuple[int, int]] = ((0, 0),),
+        adaptive_query_anchors: bool = False,
     ):
         # There is deliberately no ``subset``: it was only ever a path component,
         # and after the override above it decides nothing. A held-out set is a
@@ -248,6 +249,10 @@ class MVTrackerSceneProvider:
                 )
             slots.append((view_slot, time_slot))
         self.query_anchor_slots = tuple(slots)
+        # Whether the spec is a per-step ceiling or a per-run contract; see
+        # resolve_query_anchors. Off is the contract every archived run trained
+        # under.
+        self.adaptive_query_anchors = bool(adaptive_query_anchors)
         # Reported rather than raised on: how much of the recorded draw the
         # opt-in path failed to find. Meaningless when the flag is off.
         self.missing_track_ids = 0
@@ -450,17 +455,33 @@ class MVTrackerSceneProvider:
         """The step's absolute (camera id, original time) anchors, from slots.
 
         Slots are relative to the step's own ordered view list and time window,
-        because every replayed step has its own; the trainer validates that
-        every planned step seats every slot before training starts.  A slot
-        that does not fit here is therefore a configuration error, and it
-        raises ``ValueError`` rather than ``SceneProviderError`` deliberately:
-        the step loop's skip policy absorbs ``SceneProviderError`` as one bad
-        scene, and a mis-sized anchor spec must kill the run instead.
+        because every replayed step has its own, and the two modes differ only
+        in what an unseatable slot means.
+
+        **Strict** (the default): the spec is a per-run contract, and the
+        trainer validates that every planned step seats every slot before
+        training starts.  A slot that does not fit here is therefore a
+        configuration error, and it raises ``ValueError`` rather than
+        ``SceneProviderError`` deliberately: the step loop's skip policy
+        absorbs ``SceneProviderError`` as one bad scene, and a mis-sized anchor
+        spec must kill the run instead.
+
+        **Adaptive** (``--adaptive_query_anchors``): the spec is a per-step
+        ceiling, and a slot this step cannot seat is dropped rather than
+        vetoing it.  The manifest's steps carry 1-6 views, so under the
+        contract a single 2-view step refuses camera slot 3 for the whole
+        stream; the alternative, ``--min_views 4``, deletes a quarter of the
+        replayable rows instead.  Survivors keep spec order, so the first one
+        is primary and owns the Sim(3).  The trainer's plan-time check
+        guarantees at least one slot seats on *every* planned step, so this
+        never returns empty.
         """
 
         anchors = []
         for view_slot, time_slot in self.query_anchor_slots:
             if view_slot >= len(plan.cameras) or time_slot >= len(plan.times):
+                if self.adaptive_query_anchors:
+                    continue
                 raise ValueError(
                     f"query anchor slot {view_slot}:{time_slot} does not fit "
                     f"scene {plan.seq_name!r} with {len(plan.cameras)} views x "

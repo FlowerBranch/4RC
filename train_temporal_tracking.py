@@ -151,6 +151,15 @@ class StepOutcome:
     # per-anchor detail, which at 20k steps of history would bloat the summary.
     # None from injected step functions that do not compute it.
     eligibility: dict | None = None
+    # How many anchors this step realized, which under
+    # --adaptive_query_anchors is a property of the step rather than of the
+    # spec. Two numbers, because they answer different questions: `anchor_count`
+    # is what the step's window seated, `active_anchor_count` is how many of
+    # those reached a supervised sample. A slot dropped for not fitting and one
+    # seated but empty are different findings with different remedies. None from
+    # injected step functions, like `eligibility`.
+    anchor_count: int | None = None
+    active_anchor_count: int | None = None
 
 
 def compact_eligibility(eligibility: dict) -> dict:
@@ -468,6 +477,13 @@ def train_step(
                 huber_delta_m=huber_delta_m,
                 collect_diagnostics=False,
             )
+            # Position only, so the total is exactly anchor_weight * loss and
+            # the weights sum to 1 whatever this step's anchor count turned out
+            # to be. Worth knowing before sync is ever switched on here:
+            # weighted_anchor_total reduces the sync term by
+            # 1/active_anchor_count, so under --adaptive_query_anchors, where
+            # that count varies step to step, enabling it would silently reweight
+            # the objective between steps rather than across anchors.
             anchor_total = weighted_anchor_total(
                 result,
                 position_weight=anchor_weight,
@@ -515,7 +531,10 @@ def train_step(
         seq_name=plan.seq_name,
         # Sample-count-weighted sum of per-anchor means: the combined mean over
         # every supervised sample. At one anchor the weight is exactly 1.0, so
-        # this is the pre-multi-anchor number bit for bit.
+        # this is the pre-multi-anchor number bit for bit. The weights sum to 1
+        # at any anchor count, so a stream whose count varies step to step (what
+        # --adaptive_query_anchors produces) still reports each step's own mean
+        # over its own samples, with no 1/anchor_count anywhere.
         loss=float(step_loss),
         metric_error_m=float(step_metric_error),
         sample_count=total_samples,
@@ -526,6 +545,8 @@ def train_step(
         peak_bytes=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
         confidence=stats,
         eligibility=compact_eligibility(eligibility),
+        anchor_count=anchor_count,
+        active_anchor_count=active_anchor_count,
     )
 
 
@@ -838,8 +859,8 @@ def parse_query_anchor_slots(values) -> tuple[tuple[int, int], ...]:
     return tuple(pairs)
 
 
-def check_anchor_slots_seat(planned, anchor_slots) -> None:
-    """Every planned step must seat every anchor slot, checked at submit time.
+def check_anchor_slots_seat(planned, anchor_slots, *, adaptive: bool) -> None:
+    """The anchor spec must fit the planned stream, checked at submit time.
 
     View slots are already guaranteed by ``--min_views``; time slots are not --
     a step's window length is ``budget // views``, capped -- so an unseatable
@@ -847,19 +868,69 @@ def check_anchor_slots_seat(planned, anchor_slots) -> None:
     a short window, hours into an allocation.  Pure arithmetic on the tally: no
     RNG, no GPU, no ``--output_dir``, so it runs under ``--plan_only`` and the
     verdict arrives at submit time.
+
+    What "fits" means follows the spec's meaning.  **Strict**: every planned
+    step seats every slot, because the provider raises on one that does not.
+    **Adaptive**: the provider drops what a step cannot seat, so the same rule
+    would veto the flag's whole purpose.  Two weaker ones replace it, and
+    together they still refuse everything the strict rule caught for a reason:
+
+    * every declared slot seats on at least one planned step -- a slot no step
+      can seat is a typo, and adaptive would otherwise leave it silently inert
+      for the entire run rather than reporting it;
+    * at least one declared slot seats on *every* planned step -- otherwise
+      some step drops all of them, and an empty anchor tuple dies inside
+      ``build_scene`` mid-run.  ``0:0`` satisfies this for free.
     """
 
+    if not adaptive:
+        for plan in planned:
+            for view_slot, time_slot in anchor_slots:
+                if view_slot < len(plan.cameras) and time_slot < len(plan.times):
+                    continue
+                raise ValueError(
+                    f"--query_anchors {view_slot}:{time_slot} does not fit "
+                    f"step={plan.step} scene={plan.seq_name!r}, which seats "
+                    f"{len(plan.cameras)} views x {len(plan.times)} times. Slots "
+                    "are relative to each step's own window, and the spec must fit "
+                    "every planned step"
+                )
+        return
+
+    # One pass, both facts per slot: dict rather than two comprehensions over
+    # `planned`, which at ~69k plans would walk the tally once per slot.
+    seats_somewhere = dict.fromkeys(anchor_slots, False)
+    seats_everywhere = dict.fromkeys(anchor_slots, True)
     for plan in planned:
-        for view_slot, time_slot in anchor_slots:
+        for slot in anchor_slots:
+            view_slot, time_slot = slot
             if view_slot < len(plan.cameras) and time_slot < len(plan.times):
-                continue
-            raise ValueError(
-                f"--query_anchors {view_slot}:{time_slot} does not fit "
-                f"step={plan.step} scene={plan.seq_name!r}, which seats "
-                f"{len(plan.cameras)} views x {len(plan.times)} times. Slots "
-                "are relative to each step's own window, and the spec must fit "
-                "every planned step"
-            )
+                seats_somewhere[slot] = True
+            else:
+                seats_everywhere[slot] = False
+
+    unseatable = [slot for slot, seats in seats_somewhere.items() if not seats]
+    if unseatable:
+        listed = " ".join(f"{view}:{time}" for view, time in unseatable)
+        raise ValueError(
+            f"--query_anchors {listed} seats on none of the {len(planned)} "
+            "planned steps, so --adaptive_query_anchors would drop it at every "
+            "one and it would supervise nothing. Slots are relative to each "
+            "step's own window; the widest planned step seats "
+            # default=0 so an empty tally reports rather than dying on max()'s
+            # own "empty sequence" -- main() refuses that case before reaching
+            # here, but this function is callable on its own.
+            f"{max((len(plan.cameras) for plan in planned), default=0)} views x "
+            f"{max((len(plan.times) for plan in planned), default=0)} times"
+        )
+    if not any(seats_everywhere.values()):
+        raise ValueError(
+            f"no --query_anchors slot seats on all {len(planned)} planned "
+            "steps, so some step would drop every one of them and resolve to no "
+            "anchor at all. Under --adaptive_query_anchors the spec needs at "
+            "least one slot every step can seat; 0:0 always can, because "
+            "--min_views is at least 1 and every planned step seats a time"
+        )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -918,13 +989,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "into each replayed step's ordered view list and time window -- "
             "unlike the overfit's absolute --query_anchor CAMERA:TIME, because "
             "every step has its own cameras and times. In priority order; the "
-            "first is primary and owns the scene Sim(3). View slots are "
-            "validated against --min_views, the only per-step floor on how "
-            "many views a step seats; time slots are validated against every "
-            "planned step's own window, at plan time. Each query is supervised "
+            "first is primary and owns the scene Sim(3). Every planned step "
+            "must seat every slot: view slots are validated against "
+            "--min_views, the only per-step floor on how many views a step "
+            "seats, and time slots against every planned step's own window, at "
+            "plan time -- see --adaptive_query_anchors to relax that to a "
+            "per-step ceiling instead. Each query is supervised "
             "once, from the anchor it fits best. Default %(default)s is "
             "exactly the single-anchor behaviour every archived run trained "
             "under"
+        ),
+    )
+    parser.add_argument(
+        "--adaptive_query_anchors",
+        action="store_true",
+        help=(
+            "Treat --query_anchors as a per-step ceiling rather than a per-run "
+            "contract: a step that cannot seat a slot drops it instead of "
+            "vetoing the whole run. The manifest's steps carry 1-6 views, so "
+            "under the contract one 2-view step refuses camera slot 3 for the "
+            "entire stream, and the only way to get four camera anchors is "
+            "--min_views 4, which deletes a quarter of the replayable rows. "
+            "Survivors keep spec order, so the first one a step seats is "
+            "primary and owns its Sim(3), and the realized counts land in "
+            "run_summary.json. Off, the default, is exactly today's behaviour"
         ),
     )
     parser.add_argument(
@@ -1149,20 +1237,33 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
 
     anchor_slots = parse_query_anchor_slots(args.query_anchors)
-    for view_slot, _time_slot in anchor_slots:
-        # --min_views is the only per-step floor on how many views a planned
-        # step seats, so it is the only parse-time guarantee a view slot can
-        # rest on. Time slots have no such floor and are checked against the
-        # actual plans, in main().
-        if view_slot >= args.min_views:
-            raise ValueError(
-                f"--query_anchors view slot {view_slot} needs --min_views >= "
-                f"{view_slot + 1}; min_views is the only per-step guarantee on "
-                "how many views a planned step seats"
-            )
+    if not args.adaptive_query_anchors:
+        for view_slot, _time_slot in anchor_slots:
+            # --min_views is the only per-step floor on how many views a planned
+            # step seats, so it is the only parse-time guarantee a view slot can
+            # rest on. Time slots have no such floor and are checked against the
+            # actual plans, in main().
+            #
+            # Skipped under --adaptive_query_anchors, and this check is exactly
+            # what the flag exists to lift: a slot no longer has to be seatable
+            # on every step, so a per-run floor cannot decide it. The plan-time
+            # check takes over, on the real windows and for both axes at once.
+            if view_slot >= args.min_views:
+                raise ValueError(
+                    f"--query_anchors view slot {view_slot} needs --min_views >= "
+                    f"{view_slot + 1}; min_views is the only per-step guarantee on "
+                    "how many views a planned step seats"
+                )
     if args.val_scenes_file:
         # The held-out window derives purely from flags, so its seating is
         # checkable here rather than at plan time.
+        #
+        # Strict in BOTH modes, unlike the view-slot check above. That window is
+        # one fixed shape for the whole run rather than a stream of them, so an
+        # anchor it cannot seat is a typo and never a step property; and
+        # eval/*/metrics.json records the run's full spec as `query_anchors`, so
+        # dropping one silently would label the curve with supervision the eval
+        # never applied.
         val_times = _val_time_count(args)
         for view_slot, time_slot in anchor_slots:
             if view_slot >= len(args.val_cameras):
@@ -1230,6 +1331,7 @@ def _plan_summary(tally, args) -> dict:
             "min_views": args.min_views,
             "excluded_data_roots": list(args.exclude_data_root),
             "query_anchors": list(args.query_anchors),
+            "adaptive_query_anchors": bool(args.adaptive_query_anchors),
         },
     }
 
@@ -1441,6 +1543,14 @@ def run_training(
         "eligible_query_count": 0,
         "rejected": dict.fromkeys(ELIGIBILITY_REJECTION_STAGES, 0),
     }
+    # How many anchors the executed steps actually realized. Under
+    # --adaptive_query_anchors the spec is a ceiling, so what a run supervised
+    # is no longer readable off the spec -- these say it instead of leaving it
+    # to be inferred. Same scope as eligibility_totals, and the same denominator
+    # rule: a step whose outcome carries no count contributes nothing.
+    seated_anchor_counts: Counter = Counter()
+    active_anchor_counts: Counter = Counter()
+    anchor_count_steps = 0
     scene = None
     interrupted = None
     last_saved_step = None
@@ -1524,6 +1634,10 @@ def run_training(
                     eligibility_totals["rejected"][stage] = (
                         eligibility_totals["rejected"].get(stage, 0) + int(count)
                     )
+            if outcome.anchor_count is not None:
+                anchor_count_steps += 1
+                seated_anchor_counts[int(outcome.anchor_count)] += 1
+                active_anchor_counts[int(outcome.active_anchor_count)] += 1
             print(
                 f"step={step}/{args.num_steps} scene={outcome.seq_name} "
                 f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
@@ -1577,6 +1691,11 @@ def run_training(
         "scene_cache": {"hits": cache.hits, "misses": cache.misses},
         "scene_load_skips": dict(sorted(scene_load_skips.items())),
         "eligibility_totals": eligibility_totals,
+        "realized_anchor_counts": {
+            "steps_counted": anchor_count_steps,
+            "seated": dict(sorted(seated_anchor_counts.items())),
+            "active": dict(sorted(active_anchor_counts.items())),
+        },
         "history": history,
         "evaluations": evaluations,
     }
@@ -1601,6 +1720,9 @@ def _checkpoint_settings(args) -> dict:
         # weights_only=True hands back a list, and ['0:0'] != ('0:0',) would
         # spuriously refuse every legitimate resume if a tuple were stored.
         "query_anchors": list(args.query_anchors),
+        # Half of what the spec means: the same strings supervise a different
+        # set of observations depending on whether a step may drop from them.
+        "adaptive_query_anchors": bool(args.adaptive_query_anchors),
         "kubric_max_depth": float(args.kubric_max_depth),
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
@@ -1637,9 +1759,12 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # keys decide which plans main() builds (budget, stride, min_views,
 # max_time_indices, the excluded roots), what the loader hands those plans
 # (kubric_max_depth moves geometry and labels), which observations each step
-# supervises and how the loss reduces over them (query_anchors), or the
-# numerics under the restored scaler state (precision): a changed value means
-# the "resumed" run trains a different stream while its step counter continues.
+# supervises and how the loss reduces over them (query_anchors, plus
+# adaptive_query_anchors, which decides whether those slots bind on every step
+# or only where they fit -- the same strings supervise a different set of
+# observations either way), or the numerics under the restored scaler state
+# (precision): a changed value means the "resumed" run trains a different stream
+# while its step counter continues.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
@@ -1650,6 +1775,7 @@ _RESUME_SETTINGS_REFUSED = (
     "max_time_indices",
     "excluded_data_roots",
     "query_anchors",
+    "adaptive_query_anchors",
     "kubric_max_depth",
     "precision",
 )
@@ -1792,7 +1918,9 @@ def main() -> None:
     # plan defect.
     try:
         check_anchor_slots_seat(
-            tally.planned, parse_query_anchor_slots(args.query_anchors)
+            tally.planned,
+            parse_query_anchor_slots(args.query_anchors),
+            adaptive=args.adaptive_query_anchors,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -1855,6 +1983,7 @@ def main() -> None:
         honour_recorded_tracks=args.honour_recorded_tracks,
         max_depth=args.kubric_max_depth,
         query_anchor_slots=parse_query_anchor_slots(args.query_anchors),
+        adaptive_query_anchors=args.adaptive_query_anchors,
     )
     val_plans = _val_plans(args)
     if val_plans:
@@ -1895,6 +2024,11 @@ def main() -> None:
         # This invocation's executed steps, like history and evaluations: a
         # resumed run's totals restart with it.
         "eligibility_totals": result["eligibility_totals"],
+        # Same scope, and the companion to settings.query_anchors above: that
+        # says what was asked for, this says what the stream actually seated and
+        # supervised. They differ only under --adaptive_query_anchors, which is
+        # exactly when the spec stops being a readable answer.
+        "realized_anchor_counts": result["realized_anchor_counts"],
         "evaluations": result["evaluations"],
         "trainable_tensor_count": report["tensor_count"],
         "trainable_parameter_count": report["parameter_count"],

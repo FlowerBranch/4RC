@@ -221,6 +221,9 @@ def _loop_args(tmp_path, **overrides):
         # eval call site records it. The default is the single-anchor spec
         # every existing test's behaviour assumes.
         query_anchors=["0:0"],
+        # The spec's other half, stored alongside it: off is the per-run
+        # contract every existing test assumes.
+        adaptive_query_anchors=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1426,6 +1429,55 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
         assert torch.equal(parameter, reference_parameters[name]), name
 
 
+def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
+    tmp_path, monkeypatch
+):
+    """What --adaptive_query_anchors makes routine: a step whose realized anchor
+    count is below the spec's, reducing correctly anyway.
+
+    Here the drop is by eligibility rather than by seating -- every fixture query
+    starts at time 0, so the time-2 anchor is rejected wholesale at
+    query_time_mismatch -- but the arithmetic under test is the same either way,
+    because both reach train_step as a weight of zero. The weights sum to 1 over
+    whatever survives, so the reported loss is the mean over *this* step's
+    samples with no 1/anchor_count anywhere; a step supervising fewer anchors
+    must not report a proportionally smaller loss.
+    """
+
+    from arc.training import build_anchor_correspondences
+    from arc.training.runtime import anchor_sample_counts
+
+    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 0), (0, 2)))
+    height, width = scene.views[0]["img"].shape[-2:]
+    correspondences, _ = build_anchor_correspondences(scene)
+    counts = anchor_sample_counts(scene, correspondences, 2)
+    assert counts[0] > 0 and counts[1] == 0, "the second anchor must reach nothing"
+
+    outcome = train_cli.train_step(
+        model=_FakeArc(scene.num_observations, height, width),
+        scene=scene,
+        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+        optimizer=torch.optim.AdamW(
+            [{"params": [torch.nn.Parameter(torch.zeros(1))], "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        learning_rates=[1e-3],
+        step=0,
+    )
+
+    # Seated two, supervised one -- the distinction the histogram keeps, and the
+    # reason it carries both numbers rather than one.
+    assert outcome.anchor_count == 2
+    assert outcome.active_anchor_count == 1
+    # The denominator is this step's own supervised samples, not the spec's
+    # anchor count: the empty anchor contributes to neither sum.
+    assert outcome.sample_count == counts[0]
+    assert np.isfinite(outcome.loss) and outcome.loss > 0
+
+
 def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
     tmp_path, monkeypatch
 ):
@@ -1516,6 +1568,9 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
         "per-anchor means, in anchor order"
     )
     assert outcome.sample_count == sum(counts)
+    # Reported by the real step, not just by the injected ones the histogram
+    # tests drive: both anchors seated and both supervised something.
+    assert outcome.anchor_count == 2 and outcome.active_anchor_count == 2
     for group in ("time_embedding", "motion_decoder", "track_head"):
         assert outcome.gradient_norms[group] > 0, group
     assert eligibility["per_anchor"][1]["assigned"] >= 1, (
@@ -1657,6 +1712,48 @@ def test_an_anchor_view_slot_min_views_cannot_guarantee_is_refused_at_parse_time
     train_cli._validate_args(args)
 
 
+def test_adaptive_admits_a_view_slot_min_views_cannot_guarantee(tmp_path):
+    """This check is precisely what the flag exists to lift.
+
+    --min_views is a per-run floor, so it can only answer "does every step seat
+    this slot?" -- the question adaptive stops asking. Raising min_views to 4
+    instead is the alternative, and it deletes 17,624 of the manifest's 69,344
+    replayable rows. The plan-time check takes over, on the real windows.
+    """
+
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["0:0", "3:0"],
+        min_views=2,
+        adaptive_query_anchors=True,
+    )
+    train_cli._validate_args(args)
+    assert args.query_anchors == ["0:0", "3:0"], "canonicalized, order preserved"
+
+    # And it is only lifted by the flag.
+    with pytest.raises(ValueError, match="--min_views >= 4"):
+        train_cli._validate_args(
+            _validator_args(tmp_path, query_anchors=["0:0", "3:0"], min_views=2)
+        )
+
+
+def test_the_held_out_seating_check_stays_strict_under_adaptive(tmp_path):
+    """The val window is one fixed shape for the whole run, not a stream of
+    them, so an anchor it cannot seat is a typo rather than a step property --
+    and eval/*/metrics.json records the run's full spec as `query_anchors`, so
+    dropping one there would label the curve with supervision never applied."""
+
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["0:0", "0:12"],
+        val_scenes_file="val.json",
+        val_data_root="/held",
+        adaptive_query_anchors=True,
+    )
+    with pytest.raises(ValueError, match="held-out window"):
+        train_cli._validate_args(args)
+
+
 def test_the_anchor_spec_is_canonicalized_format_only_and_order_preserving(tmp_path):
     args = _validator_args(tmp_path, query_anchors=["01:02", "1:0", "0:0"])
     train_cli._validate_args(args)
@@ -1728,6 +1825,137 @@ def test_an_anchor_time_slot_a_planned_step_cannot_seat_is_refused_under_plan_on
     assert "0:1" in error_output and "'0001'" in error_output
 
 
+def _plan_only(monkeypatch, manifest, *extra):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_temporal_tracking.py",
+            "--manifest",
+            str(manifest),
+            "--plan_only",
+            *extra,
+        ],
+    )
+
+
+def test_adaptive_admits_a_time_slot_only_some_steps_can_seat(
+    tmp_path, monkeypatch, capsys
+):
+    """The same manifest the strict check refuses, and the point of the flag.
+
+    One short window vetoes the slot for every other step under the contract;
+    under the ceiling it costs that one step its second anchor and nothing else.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [
+        _record(step=0, seq_name="0000"),
+        # seq_len 2 at stride 2 seats exactly one time, so time slot 1 cannot.
+        _record(step=1, seq_name="0001", seq_len=2),
+    ]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    _plan_only(
+        monkeypatch,
+        manifest,
+        "--adaptive_query_anchors",
+        "--query_anchors",
+        "0:0",
+        "0:1",
+    )
+
+    train_cli.main()
+
+    assert "PASS planned 2 steps" in capsys.readouterr().out
+
+
+def test_a_slot_no_planned_step_can_seat_is_refused_under_adaptive(
+    tmp_path, monkeypatch, capsys
+):
+    """Adaptive drops what a step cannot seat, so a slot no step can seat would
+    otherwise be silently inert for the whole run. Still the typo guard the
+    strict check was, still GPU-free at submit time."""
+
+    from test_manifest_plan import _write_manifest
+
+    records = [_record(step=index, seq_name=f"{index:04d}") for index in range(2)]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    _plan_only(
+        monkeypatch,
+        manifest,
+        "--adaptive_query_anchors",
+        "--query_anchors",
+        "0:0",
+        "1:0",
+        # Every planned step seats 4 views x 12 times (budget 48 // 4), so this
+        # one is beyond the widest window the manifest can produce.
+        "0:20",
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        train_cli.main()
+
+    assert exit_info.value.code == 2
+    error_output = capsys.readouterr().err
+    # Names the slot that seats nowhere, and only that one: 1:0 seats fine.
+    assert "0:20" in error_output and "1:0" not in error_output
+
+
+def test_a_spec_with_no_always_seatable_slot_is_refused_under_adaptive(
+    tmp_path, monkeypatch, capsys
+):
+    """Every slot seating somewhere is not enough on its own.
+
+    With 1:0 dropped on the 1-view step and 0:1 dropped on the short-window
+    step, each slot seats somewhere and one step seats neither -- which resolves
+    to an empty anchor tuple and dies inside build_scene, mid-run. 0:0 always
+    seats, and the message says so.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [
+        _record(step=0, seq_name="0000"),
+        # One view and one time: seats neither 1:0 nor 0:1.
+        _record(step=1, seq_name="0001", views=[0], seq_len=2),
+    ]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    _plan_only(
+        monkeypatch,
+        manifest,
+        "--adaptive_query_anchors",
+        "--min_views",
+        "1",
+        "--query_anchors",
+        "1:0",
+        "0:1",
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        train_cli.main()
+
+    assert exit_info.value.code == 2
+    error_output = capsys.readouterr().err
+    assert "no --query_anchors slot seats on all 2 planned steps" in error_output
+    assert "0:0" in error_output
+
+    # Adding 0:0 is the fix the message names, and it is enough.
+    _plan_only(
+        monkeypatch,
+        manifest,
+        "--adaptive_query_anchors",
+        "--min_views",
+        "1",
+        "--query_anchors",
+        "1:0",
+        "0:1",
+        "0:0",
+    )
+    train_cli.main()
+    assert "PASS planned 2 steps" in capsys.readouterr().out
+
+
 def test_the_default_anchor_spec_plans_exactly_as_before(tmp_path, monkeypatch, capsys):
     """--plan_only with defaults passes and records the single-anchor spec."""
 
@@ -1772,6 +2000,29 @@ def test_the_anchor_spec_is_recorded_in_the_checkpoint_settings(tmp_path):
                 num_steps=4,
                 resume=str(tmp_path / "a" / "train_state.pt"),
                 query_anchors=["0:0", "1:0"],
+            ),
+            [],
+        )
+
+
+def test_flipping_the_adaptive_flag_on_resume_is_refused(tmp_path):
+    """Stream-defining on its own: the same slot strings supervise a different
+    set of observations depending on whether a step may drop from them, so a
+    "resumed" run would train a different stream under a continuing counter."""
+
+    train_cli._STOP_REQUESTED.clear()
+    _run(tmp_path / "a", _loop_args(tmp_path / "a", num_steps=4), [])
+    payload = read_trainer_state(tmp_path / "a" / "train_state.pt")
+    assert payload["settings"]["adaptive_query_anchors"] is False
+
+    with pytest.raises(RuntimeError, match="adaptive_query_anchors"):
+        _run(
+            tmp_path / "b",
+            _loop_args(
+                tmp_path / "b",
+                num_steps=4,
+                resume=str(tmp_path / "a" / "train_state.pt"),
+                adaptive_query_anchors=True,
             ),
             [],
         )
@@ -1848,6 +2099,114 @@ def test_steps_without_eligibility_reports_leave_the_totals_at_zero(tmp_path):
         "eligible_query_count": 0,
         "rejected": dict.fromkeys(train_cli.ELIGIBILITY_REJECTION_STAGES, 0),
     }
+    # Same rule for the anchor histogram, and the same reason: a step that
+    # reports no count must not be filed as a step that realized zero anchors.
+    assert result["realized_anchor_counts"] == {
+        "steps_counted": 0,
+        "seated": {},
+        "active": {},
+    }
+
+
+def test_the_realized_anchor_histogram_records_what_each_step_seated(tmp_path):
+    """Under --adaptive_query_anchors the spec is a ceiling, so it stops being
+    an answer to "what did this run supervise?" -- these counts are.
+
+    Seated and active are separate because they fail differently: a slot the
+    step's window could not seat is the clamp working, while a slot seated with
+    no supervised sample is an anchor that reached nothing. Inferring one from
+    the spec and the other from a loss curve is exactly what this replaces.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    counts = {0: (4, 4), 1: (2, 2), 2: (4, 3), 3: (2, 2)}
+
+    def step_fn(*, plan, learning_rates, step, **_):
+        seated, active = counts[step]
+        return train_cli.StepOutcome(
+            step=step,
+            seq_name=plan.seq_name,
+            loss=0.0,
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=list(learning_rates),
+            gradient_norms={},
+            anchor_count=seated,
+            active_anchor_count=active,
+        )
+
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    result = train_cli.run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, adaptive_query_anchors=True),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=step_fn,
+        output_dir=tmp_path,
+    )
+
+    assert result["realized_anchor_counts"] == {
+        "steps_counted": 4,
+        "seated": {2: 2, 4: 2},
+        "active": {2: 2, 3: 1, 4: 1},
+    }
+    # Sorted by count, so the histogram reads as a distribution rather than in
+    # whatever order the steps happened to arrive.
+    assert list(result["realized_anchor_counts"]["active"]) == [2, 3, 4]
+
+
+def test_a_skipped_scene_load_is_absent_from_the_anchor_histogram(tmp_path):
+    """steps_counted is the denominator, so it must count executed steps only."""
+
+    train_cli._STOP_REQUESTED.clear()
+    plans = _plans(4)
+    failing = plans[1].seq_name
+
+    def provider(plan):
+        if plan.seq_name == failing:
+            raise SceneProviderError("scene 'x' is not in the pool at '/p' (0 scenes)")
+        return SimpleNamespace(name=plan.seq_name)
+
+    def step_fn(*, plan, learning_rates, step, **_):
+        return train_cli.StepOutcome(
+            step=step,
+            seq_name=plan.seq_name,
+            loss=0.0,
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=list(learning_rates),
+            gradient_norms={},
+            anchor_count=3,
+            active_anchor_count=3,
+        )
+
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    result = train_cli.run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(
+            tmp_path,
+            num_steps=4,
+            adaptive_query_anchors=True,
+            max_scene_skip_fraction=1.0,
+        ),
+        scene_provider=provider,
+        step_fn=step_fn,
+        output_dir=tmp_path,
+    )
+
+    assert result["realized_anchor_counts"]["steps_counted"] == 3
+    assert result["realized_anchor_counts"]["seated"] == {3: 3}
 
 
 # ------------------------------- an unsupervisable held-out scene ---
