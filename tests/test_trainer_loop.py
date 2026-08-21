@@ -237,6 +237,17 @@ def _loop_args(tmp_path, **overrides):
         # Read by seed_time_index_embedding, which draws the orthogonal rows
         # from its own generator rather than the global stream.
         seed=0,
+        # Which objective the run descends. Both weights at 0 is the position-only
+        # contract every existing test assumes; _checkpoint_settings stores all
+        # three and check_resume_settings refuses a change, so every loop test
+        # needs them present. `confidence_alpha` is post-_validate_args here --
+        # a float or None, never the flag's "auto" string.
+        confidence_weight=0.0,
+        sync_weight=0.0,
+        confidence_alpha=None,
+        # The run's frozen alpha, which run_training pins after the first step
+        # and _checkpoint_settings carries. None until something resolves it.
+        resolved_confidence_alpha=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1091,6 +1102,9 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         precision="32",
         huber_delta_m=0.05,
         grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -1769,6 +1783,9 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
         precision="32",
         huber_delta_m=0.05,
         grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -1842,6 +1859,9 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
         precision="32",
         huber_delta_m=0.05,
         grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -1932,6 +1952,9 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
         precision="32",
         huber_delta_m=0.05,
         grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -2033,11 +2056,653 @@ def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
             precision="32",
             huber_delta_m=0.05,
             grad_clip=1.0,
+            confidence_weight=0.0,
+            confidence_alpha=None,
+            sync_weight=0.0,
             learning_rates=[1e-3],
             step=0,
         )
     assert "query_time_mismatch" in str(excinfo.value)
     assert not isinstance(excinfo.value, SceneProviderError)
+
+
+# ------------------------------------------- the confidence and sync terms ---
+
+
+def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
+    """One real train_step at the given weights, plus what it was handed.
+
+    Records every ``weighted_anchor_total`` and ``tracking_only`` call, which is
+    where the per-anchor shares are decided and where the retained fields are.
+    """
+
+    scene = scene or _step_scene(
+        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+    )
+    height, width = scene.views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    model = _FakeArc(scene.num_observations, height, width)
+
+    totals: list[dict] = []
+    kept: list[bool] = []
+    real_total = train_cli.weighted_anchor_total
+    real_tracking_only = train_cli.tracking_only
+
+    def recording_total(result, **kwargs):
+        totals.append(dict(kwargs))
+        return real_total(result, **kwargs)
+
+    def recording_tracking_only(raw, keep_confidence=False):
+        kept.append(keep_confidence)
+        return real_tracking_only(raw, keep_confidence=keep_confidence)
+
+    monkeypatch.setattr(train_cli, "weighted_anchor_total", recording_total)
+    monkeypatch.setattr(train_cli, "tracking_only", recording_tracking_only)
+
+    outcome = train_cli.train_step(
+        model=model,
+        scene=scene,
+        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        learning_rates=[1e-3],
+        step=0,
+        **weights,
+    )
+    return outcome, totals, kept, scene
+
+
+def test_both_weights_zero_leaves_the_step_exactly_position_only(
+    tmp_path, monkeypatch
+):
+    """The zeros control, which every archived comparison is against.
+
+    `compose_tracking_loss` omits a zero-weight term rather than multiplying by
+    it, so this must not merely be close: the anchor totals must carry the
+    position weight alone, nothing may retain the confidence field, and no
+    breakdown may be claimed for a step that has only one term to break down.
+    """
+
+    outcome, totals, kept, _ = _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+    )
+
+    assert outcome.loss_breakdown is None
+    assert outcome.confidence_alpha is None
+    # None, not a zeroed dict: a position-only step never looked, which is a
+    # different finding from a confidence step that looked and found nothing.
+    assert outcome.confidence_dropped is None
+    assert kept == [False, False], "conf_track_multi must not be retained"
+    for call in totals:
+        assert call["confidence_weight"] == 0.0
+        assert call["sync_weight"] == 0.0
+    # The position shares still sum to 1 over the step's own anchors.
+    assert sum(call["position_weight"] for call in totals) == pytest.approx(1.0)
+
+
+def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(
+    tmp_path, monkeypatch
+):
+    """The share is the CONFIDENCE sample share, not the position one.
+
+    The confidence term deliberately does not mask on visibility, so with an
+    invisible sample in the fixture the two masks differ and the two share
+    vectors differ with them. Reusing the position shares would be wrong by
+    exactly the ratio between the masks, and would pass a weaker assertion that
+    only checked the shares sum to the weight.
+    """
+
+    from arc.training import build_anchor_correspondences
+    from arc.training.runtime import anchor_confidence_counts, anchor_sample_counts
+
+    outcome, totals, kept, scene = _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.25,
+        confidence_alpha=3.0,
+        sync_weight=0.0,
+    )
+
+    # Load-bearing: runtime.tracking_only drops conf_track_multi by default and
+    # the term needs it. Missing this is a KeyError, not a wrong number.
+    assert kept == [True, True]
+
+    correspondences, _ = build_anchor_correspondences(scene)
+    position_counts = anchor_sample_counts(scene, correspondences, 2)
+    confidence_counts = anchor_confidence_counts(scene, correspondences, 2)
+    assert confidence_counts != position_counts, "the fixture must separate the masks"
+
+    expected = [0.25 * count / sum(confidence_counts) for count in confidence_counts]
+    assert [call["confidence_weight"] for call in totals] == pytest.approx(expected)
+    assert sum(call["confidence_weight"] for call in totals) == pytest.approx(0.25)
+    # And the position side is untouched by any of it.
+    assert [call["position_weight"] for call in totals] == pytest.approx(
+        [count / sum(position_counts) for count in position_counts]
+    )
+
+    assert set(outcome.loss_breakdown) == {"position", "confidence"}
+    # The breakdown is unweighted, so the position entry IS the reported loss.
+    assert outcome.loss_breakdown["position"] == pytest.approx(outcome.loss)
+    # Summed over the anchors by the real step, and zero on a clean fixture: the
+    # shares above are exact precisely while this stays zero.
+    assert outcome.confidence_dropped == {
+        "total": 0,
+        "target_nonfinite": 0,
+        "prediction_nonfinite": 0,
+        "confidence_nonfinite": 0,
+    }
+
+
+def test_the_sync_share_is_one_over_the_steps_own_active_anchor_count(
+    tmp_path, monkeypatch
+):
+    """What makes the term safe under --adaptive_query_anchors.
+
+    Every anchor's sync_loss is a mean over an identical element count -- P, H
+    and W come from the window, never from which anchor -- so the stacked-Q mean
+    is the plain mean of the per-anchor means and the share is a flat 1/N. The
+    property that matters across a stream whose N varies is that the shares sum
+    to the weight at every N, which is asserted at both 1 and 2 active anchors.
+    """
+
+    _, two_anchor, _, _ = _weighted_step(
+        tmp_path / "two",
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.5,
+    )
+    assert [call["sync_weight"] for call in two_anchor] == pytest.approx([0.25, 0.25])
+    assert sum(call["sync_weight"] for call in two_anchor) == pytest.approx(0.5)
+
+    single = _step_scene(tmp_path / "one", monkeypatch)
+    _, one_anchor, _, _ = _weighted_step(
+        tmp_path / "one",
+        monkeypatch,
+        scene=single,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.5,
+    )
+    assert [call["sync_weight"] for call in one_anchor] == pytest.approx([0.5])
+    # Same weight reaches the objective at either anchor count: that is the
+    # whole claim, and it is what the trainer's old comment doubted.
+    assert sum(call["sync_weight"] for call in one_anchor) == pytest.approx(0.5)
+
+
+def test_the_undivided_sync_weight_is_what_reaches_the_loss(tmp_path, monkeypatch):
+    """The gate and the share are different numbers and must not be conflated.
+
+    ``sparse_tracking_loss``'s ``sync_weight`` only decides whether the term is
+    BUILT; the total it composes is discarded by the multi-anchor path. Passing
+    the divided share there instead would still build the term, so no other
+    assertion in this file would notice -- until an anchor count of zero-ish
+    size made the share underflow the > 0.0 gate and the term silently vanished.
+    """
+
+    import arc.training as training_package
+
+    seen: list[float] = []
+    # train_step does `from arc.training import sparse_tracking_loss` inside the
+    # function, so the package namespace is the only interception point; patching
+    # arc.training.sparse_tracking would rebind a name nothing looks up again.
+    real_loss = training_package.sparse_tracking_loss
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["sync_weight"])
+        return real_loss(*args, **kwargs)
+
+    monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
+    _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.5,
+    )
+
+    assert seen == [0.5, 0.5], "the loss gets the undivided weight, not the share"
+
+
+def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
+    tmp_path, monkeypatch
+):
+    """`SparseTrackingLossResult.loss` stays the position-only Huber.
+
+    The run's curve and every archived comparison are that number, so it must
+    mean the same thing at every weight setting. Only the *total* being
+    descended may change.
+    """
+
+    baseline, base_totals, _, _ = _weighted_step(
+        tmp_path / "off",
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+    )
+    enabled, _, _, _ = _weighted_step(
+        tmp_path / "on",
+        monkeypatch,
+        confidence_weight=0.25,
+        confidence_alpha=3.0,
+        sync_weight=0.5,
+    )
+
+    assert enabled.loss == baseline.loss
+    assert enabled.sample_count == baseline.sample_count
+    assert set(enabled.loss_breakdown) == {"position", "sync", "confidence"}
+    assert enabled.loss_breakdown["position"] == pytest.approx(baseline.loss)
+    assert base_totals[0]["position_weight"] == pytest.approx(
+        base_totals[0]["position_weight"]
+    )
+
+
+def test_auto_alpha_is_resolved_once_and_then_reused(tmp_path, monkeypatch):
+    """A moving target is not one the optimizer can descend.
+
+    ``sparse_tracking_loss`` re-resolves alpha on every call it is handed None,
+    from that call's own confidence and error means -- so without pinning, each
+    anchor of each step would optimize toward a different conf*. The step must
+    resolve once and hand the resolved value to every later anchor.
+    """
+
+    import arc.training as training_package
+
+    seen: list[float | None] = []
+    real_loss = training_package.sparse_tracking_loss
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["confidence_alpha"])
+        return real_loss(*args, **kwargs)
+
+    monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
+    outcome, _, _, _ = _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.25,
+        confidence_alpha=None,
+        sync_weight=0.0,
+    )
+
+    assert seen[0] is None, "the first anchor is what resolves it"
+    assert seen[1] is not None and seen[1] == pytest.approx(outcome.confidence_alpha)
+    # Reported so the history file can be read without the checkpoint.
+    assert outcome.confidence_alpha > 0
+
+
+def test_an_explicit_alpha_is_never_re_resolved(tmp_path, monkeypatch):
+    import arc.training as training_package
+
+    seen: list[float | None] = []
+    real_loss = training_package.sparse_tracking_loss
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["confidence_alpha"])
+        return real_loss(*args, **kwargs)
+
+    monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
+    outcome, _, _, _ = _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.25,
+        confidence_alpha=7.5,
+        sync_weight=0.0,
+    )
+
+    assert seen == [7.5, 7.5]
+    assert outcome.confidence_alpha == pytest.approx(7.5)
+
+
+def test_the_loop_pins_the_first_steps_alpha_onto_the_run(tmp_path):
+    """Across steps, not only across anchors: the loop owns the pin.
+
+    Driven through an injected step function, because what is under test is the
+    loop's bookkeeping rather than the loss -- the real step needs a GPU-shaped
+    fixture per step and would say nothing more about this.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    handed: list[float | None] = []
+
+    def resolving_step(**kwargs):
+        handed.append(kwargs["confidence_alpha"])
+        loss = kwargs["model"](torch.ones(1, 3)).sum()
+        loss.backward()
+        kwargs["optimizer"].step()
+        kwargs["optimizer"].zero_grad(set_to_none=True)
+        return train_cli.StepOutcome(
+            step=kwargs["step"],
+            seq_name=kwargs["plan"].seq_name,
+            loss=float(loss.item()),
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=list(kwargs["learning_rates"]),
+            gradient_norms={},
+            # What a real step returns once its first anchor has resolved it.
+            confidence_alpha=4.25,
+        )
+
+    args = _loop_args(tmp_path, num_steps=3, confidence_weight=0.25)
+    model = _toy_model()
+    train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=args,
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=resolving_step,
+        output_dir=tmp_path,
+    )
+
+    assert handed == [None, 4.25, 4.25], "resolved once, then reused"
+    # And it reaches the checkpoint, which is how it survives a requeue.
+    assert train_cli._checkpoint_settings(args)["resolved_confidence_alpha"] == 4.25
+
+
+def test_a_resume_restores_the_pinned_alpha_rather_than_re_resolving_it(tmp_path):
+    stored = train_cli._checkpoint_settings(
+        _loop_args(tmp_path, confidence_weight=0.25, resolved_confidence_alpha=4.25)
+    )
+    assert stored["resolved_confidence_alpha"] == 4.25
+    # Deliberately in neither tier: an 'auto' run's request is None while its
+    # checkpoint carries a float, so comparing them would refuse every
+    # legitimate resume of exactly the runs that need the pin.
+    assert "resolved_confidence_alpha" not in train_cli._RESUME_SETTINGS_REFUSED
+    assert "resolved_confidence_alpha" not in train_cli._RESUME_SETTINGS_WARNED
+    train_cli.check_resume_settings(
+        stored, _loop_args(tmp_path, confidence_weight=0.25)
+    )
+
+
+def test_a_resume_that_changes_a_loss_weight_is_refused(tmp_path):
+    """A segment that changes the objective and keeps counting steps reports one
+    curve over two of them -- and the reported `loss` stays the position-only
+    Huber throughout, so nothing in the history would show the switch."""
+
+    for key, before, after in (
+        ("confidence_weight", 0.0, 0.25),
+        ("sync_weight", 0.0, 0.5),
+        ("confidence_alpha", None, 3.0),
+    ):
+        stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{key: before}))
+        with pytest.raises(RuntimeError, match=key):
+            train_cli.check_resume_settings(
+                stored, _loop_args(tmp_path, **{key: after})
+            )
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, **{key: before})
+        )
+
+
+def test_a_checkpoint_predating_the_loss_flags_still_resumes(tmp_path):
+    """The live-run case: a multi-day run resuming across eight-plus segments.
+
+    A checkpoint written before --confidence_weight and --sync_weight existed
+    could not have set them -- no other value was reachable -- so its run was
+    necessarily position-only. Refusing it strands the run, and the tier's
+    original premise ("only disposable smokes lack the newest key") stopped
+    being true the moment real runs started resuming.
+    """
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    # Exactly what a pre-change checkpoint carries: every other refused key
+    # present, these three simply not yet invented.
+    for key in ("confidence_weight", "sync_weight", "confidence_alpha"):
+        del stored[key]
+
+    # Position-only on both sides: the stream is the same one, so it continues.
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+
+def test_resuming_a_pre_flag_checkpoint_with_a_term_switched_on_is_refused(tmp_path):
+    """The fallback resolves the gap, it does not tolerate it.
+
+    Reading an absent key as 0 is only sound because 0 is what it must have
+    been. That value is then compared like any stored one, so turning a term on
+    against a position-only checkpoint is refused exactly as changing a stored
+    weight is -- otherwise the fallback would have opened the hole the tier
+    exists to close.
+    """
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    for key in ("confidence_weight", "sync_weight", "confidence_alpha"):
+        del stored[key]
+
+    for key, value in (
+        ("confidence_weight", 0.25),
+        ("sync_weight", 0.5),
+        ("confidence_alpha", 3.0),
+    ):
+        with pytest.raises(RuntimeError, match="predates"):
+            train_cli.check_resume_settings(
+                stored, _loop_args(tmp_path, **{key: value})
+            )
+
+
+def test_an_absent_key_whose_meaning_is_ambiguous_is_still_refused(tmp_path):
+    """The fallback is a named list, not a blanket tolerance.
+
+    val_cameras and the time-embedding pair each had a reachable non-default
+    value before they were recorded, so nothing can say which one an old
+    checkpoint used. Tolerating those would let a run resume under a different
+    held-out window, or a differently conditioned encoder, with nothing raising.
+    """
+
+    for key in ("val_cameras", "time_embedding_init", "query_anchors"):
+        assert key not in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS
+        stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+        del stored[key]
+        with pytest.raises(RuntimeError, match="does not resolve to a single value"):
+            train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+
+def test_every_absent_default_is_the_parsers_own_default(tmp_path):
+    """The mapping claims what a pre-flag run necessarily was, so it has to agree
+    with what the flag defaults to -- a drift between the two would silently
+    refuse, or silently admit, the wrong resumes."""
+
+    parser = train_cli.build_arg_parser()
+    defaults = parser.parse_args(["--manifest", "m.jsonl"])
+    train_cli._validate_args(defaults)
+
+    for key, implied in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS.items():
+        assert key in train_cli._RESUME_SETTINGS_REFUSED, key
+        assert getattr(defaults, key) == implied, key
+
+
+def test_the_loss_weights_are_recorded_in_the_plan_summary_settings(tmp_path):
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+    args = _validator_args(
+        tmp_path,
+        manifest="m.jsonl",
+        confidence_weight=0.25,
+        sync_weight=0.5,
+        confidence_alpha=3.0,
+        resolved_confidence_alpha=3.0,
+    )
+
+    settings = train_cli._plan_summary(tally, args)["settings"]
+
+    assert settings["confidence_weight"] == 0.25
+    assert settings["sync_weight"] == 0.5
+    assert settings["confidence_alpha"] == 3.0
+    assert settings["resolved_confidence_alpha"] == 3.0
+
+
+def test_unusable_loss_weights_are_refused_at_parse_time(tmp_path):
+    for bad in (-1e-9, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="--confidence_weight"):
+            train_cli._validate_args(_validator_args(tmp_path, confidence_weight=bad))
+        with pytest.raises(ValueError, match="--sync_weight"):
+            train_cli._validate_args(_validator_args(tmp_path, sync_weight=bad))
+    # Zero is the default and must stay admissible: it is the zeros control.
+    train_cli._validate_args(
+        _validator_args(tmp_path, confidence_weight=0.0, sync_weight=0.0)
+    )
+
+
+def test_the_confidence_alpha_flag_parses_auto_and_refuses_the_rest(tmp_path):
+    args = _validator_args(tmp_path, confidence_alpha="auto")
+    train_cli._validate_args(args)
+    assert args.confidence_alpha is None, "'auto' means resolve it later"
+    assert args.resolved_confidence_alpha is None
+
+    args = _validator_args(tmp_path, confidence_alpha="2.5")
+    train_cli._validate_args(args)
+    assert args.confidence_alpha == 2.5
+    # An explicit value is pinned from the start; nothing resolves over it.
+    assert args.resolved_confidence_alpha == 2.5
+
+    for bad in ("", "none", "AUTOMATIC", "0", "-1", "nan", "inf"):
+        with pytest.raises(ValueError, match="--confidence_alpha"):
+            train_cli._validate_args(_validator_args(tmp_path, confidence_alpha=bad))
+
+
+def test_the_sync_term_needs_a_window_that_can_hold_a_synchronized_pair(tmp_path):
+    """--min_views 1 admits a single-camera window, which has no slot pair
+    sharing a time index; synchronized_differences raises rather than returning
+    an empty mean, and that would kill the run mid-step as something the loop's
+    scene-skip policy cannot absorb."""
+
+    with pytest.raises(ValueError, match="--sync_weight needs --min_views >= 2"):
+        train_cli._validate_args(
+            _validator_args(tmp_path, sync_weight=0.5, min_views=1)
+        )
+    # Off, the same window is nobody's problem.
+    train_cli._validate_args(_validator_args(tmp_path, sync_weight=0.0, min_views=1))
+
+
+def test_dropped_confidence_samples_are_warned_once_and_totalled(tmp_path, capsys):
+    """The one signal that the per-anchor shares stopped matching the mask.
+
+    ``anchor_confidence_counts`` cannot see prediction- or confidence-finiteness,
+    so it is exact only while nothing goes non-finite -- and `expp1` is 1+exp(x),
+    which overflows in BF16. Warned once rather than per step: at 20k steps a
+    per-step warning buries the first occurrence, which is the one worth reading.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+
+    def dropping_step(**kw):
+        loss = kw["model"](torch.ones(1, 3)).sum()
+        loss.backward()
+        kw["optimizer"].step()
+        kw["optimizer"].zero_grad(set_to_none=True)
+        return train_cli.StepOutcome(
+            step=kw["step"],
+            seq_name=kw["plan"].seq_name,
+            loss=float(loss.item()),
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=list(kw["learning_rates"]),
+            gradient_norms={},
+            confidence_dropped={
+                "total": 3,
+                "target_nonfinite": 1,
+                "prediction_nonfinite": 1,
+                "confidence_nonfinite": 2,
+            },
+        )
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, confidence_weight=0.25),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=dropping_step,
+        output_dir=tmp_path,
+    )
+
+    errors = capsys.readouterr().err
+    assert errors.count("dropped from the confidence term") == 1, "warned once"
+    assert "step=0" in errors, "the FIRST occurrence is the one that gets named"
+    # Every step still counts toward the run total, warning or not.
+    assert result["confidence_dropped_totals"] == {
+        "total": 12,
+        "target_nonfinite": 4,
+        "prediction_nonfinite": 4,
+        "confidence_nonfinite": 8,
+    }
+    # And each step's own counts survive in the history file.
+    lines = [
+        json.loads(line)
+        for line in (tmp_path / "history.jsonl").read_text().strip().splitlines()
+    ]
+    assert all(entry["confidence_dropped"]["total"] == 3 for entry in lines)
+
+
+def test_a_run_that_drops_nothing_reports_an_empty_total_not_a_warning(
+    tmp_path, capsys
+):
+    """A position-only run never looked, which is not the same finding as a
+    confidence run that looked and found nothing wrong."""
+
+    train_cli._STOP_REQUESTED.clear()
+    recorded: list[_Recorded] = []
+    _, result = _run(tmp_path, _loop_args(tmp_path, num_steps=4), recorded)
+
+    assert result["confidence_dropped_totals"] == {}
+    assert "dropped from the confidence term" not in capsys.readouterr().err
+
+
+def test_the_eval_is_position_only_whatever_the_training_flags_say(
+    tmp_path, monkeypatch
+):
+    """The held-out curve must stay comparable to the zeros control and to every
+    other arm, so the eval never builds the extra terms -- and the shuffled arm
+    is a second full pass whose dense terms would be built and thrown away."""
+
+    import arc.training as training_package
+
+    seen: list[dict] = []
+    real_loss = training_package.sparse_tracking_loss
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs)
+        return real_loss(*args, **kwargs)
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
+
+    height, width = scene.views[0]["img"].shape[-2:]
+    train_cli.evaluate_held_out(
+        model=_FakeArc(scene.num_observations, height, width),
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=0,
+        output_dir=tmp_path,
+        query_anchors=["0:0"],
+    )
+
+    assert seen, "the eval must have scored something"
+    for call in seen:
+        assert "confidence_weight" not in call
+        assert "sync_weight" not in call
+        assert "confidence_alpha" not in call
 
 
 def test_a_malformed_anchor_pair_is_refused_at_parse_time():
@@ -2076,6 +2741,9 @@ def _validator_args(tmp_path, **overrides):
         # defaults to and the only value that skips the finite/positive check.
         "embedding_lr": None,
         "encoder_lr": None,
+        # _validate_args parses this one in place, so unlike _loop_args it starts
+        # as the parser's raw string.
+        "confidence_alpha": "auto",
     }
     merged.update(overrides)
     return _loop_args(tmp_path, **merged)

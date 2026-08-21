@@ -52,6 +52,7 @@ from arc.training.manifest_plan import (
 from arc.training.runtime import (
     TIME_EMBEDDING_KEY,
     accumulate_weighted,
+    anchor_confidence_counts,
     anchor_sample_counts,
     anchor_tracks,
     assert_frozen_gradients_absent,
@@ -83,7 +84,6 @@ from arc.training.trainer_state import (
     restore_rng_state,
     save_atomically,
 )
-
 
 # The committed first-run window: 4 cameras x 12 times at stride 2 = 48
 # observations. The budget is a measured memory ceiling -- peak ~= 2.55*N + 9.6
@@ -148,10 +148,6 @@ class StepOutcome:
     gradient_norms: dict
     peak_bytes: int = 0
     confidence: dict | None = None
-    # The step's eligibility split, compact: total/eligible counts and the
-    # per-stage rejected dict -- not the full report with its rule strings and
-    # per-anchor detail, which at 20k steps of history would bloat the summary.
-    # None from injected step functions that do not compute it.
     eligibility: dict | None = None
     # How many anchors this step realized, which under
     # --adaptive_query_anchors is a property of the step rather than of the
@@ -162,6 +158,25 @@ class StepOutcome:
     # injected step functions, like `eligibility`.
     anchor_count: int | None = None
     active_anchor_count: int | None = None
+    # The step's unweighted per-term values, share-combined across its anchors:
+    # what says whether the chosen weights actually balance the terms, since
+    # position and confidence differ by orders of magnitude at their natural
+    # scales. Unweighted so runs at different weights stay comparable, which is
+    # the same contract compose_tracking_loss's own breakdown keeps. None on a
+    # position-only step -- there is nothing to break down.
+    loss_breakdown: dict | None = None
+    # The alpha this step's confidence term actually used. Resolved once for the
+    # whole run, so after the first executed step this repeats; reported per step
+    # anyway, because a history file whose alpha is only in the checkpoint cannot
+    # be read on its own.
+    confidence_alpha: float | None = None
+    # Samples the confidence term dropped as non-finite, by cause, summed over the
+    # step's anchors. Non-fatal by design -- `expp1` is 1+exp(x) and overflows in
+    # BF16, which is a property of the released head -- but it is also the only
+    # thing that says the per-anchor confidence shares have stopped matching the
+    # mask the loss reduced over, since those shares cannot see either
+    # prediction-finiteness or confidence-finiteness. None when the term is off.
+    confidence_dropped: dict | None = None
 
 
 def compact_eligibility(eligibility: dict) -> dict:
@@ -371,6 +386,9 @@ def train_step(
     precision: str,
     huber_delta_m: float,
     grad_clip: float,
+    confidence_weight: float,
+    confidence_alpha: float | None,
+    sync_weight: float,
     learning_rates: list[float],
     step: int,
 ) -> StepOutcome:
@@ -434,6 +452,23 @@ def train_step(
         )
     anchor_weights = [count / total_samples for count in sample_counts]
     active_anchor_count = sum(1 for weight in anchor_weights if weight > 0)
+    # The confidence term reduces over a different (larger) set than the position
+    # term -- it deliberately does not mask on visibility -- so it needs its own
+    # shares; see anchor_confidence_counts. Computed from the scene alone, like
+    # sample_counts, so this costs no forward and cannot drift from the mask the
+    # loss applies. Skipped entirely when the term is off, so a position-only
+    # step does exactly the work it did before.
+    if confidence_weight > 0:
+        confidence_counts = anchor_confidence_counts(
+            scene, correspondences, anchor_count
+        )
+        total_confidence = sum(confidence_counts)
+        confidence_shares = [
+            count / total_confidence if total_confidence else 0.0
+            for count in confidence_counts
+        ]
+    else:
+        confidence_shares = [0.0] * anchor_count
 
     with autocast_context(precision):
         images, feats, recon = encode_and_reconstruct(model, scene.views)
@@ -457,6 +492,18 @@ def train_step(
     stats = None
     step_loss = None
     step_metric_error = None
+    step_sync_loss = None
+    step_confidence_loss = None
+    # Summed over the step's anchors, by cause. anchor_confidence_counts is exact
+    # only while nothing goes non-finite -- the two predicates it cannot see are
+    # prediction- and confidence-finiteness -- so a nonzero total here is the one
+    # signal that the shares above have stopped matching the mask the loss used.
+    step_confidence_dropped = None
+    # Alpha must not move underneath the optimizer, so it is resolved once and
+    # then reused: by every later anchor of this step, and -- through the
+    # outcome, which run_training pins -- by every later step of the run. None
+    # here only on the first executed step of an --confidence_alpha auto run.
+    step_alpha = confidence_alpha
     for anchor_index, anchor_weight in enumerate(anchor_weights):
         if anchor_weight == 0.0:
             continue
@@ -471,26 +518,46 @@ def train_step(
                 # supervised samples, and the log must not go silent for it.
                 stats = confidence_stats(raw)
             result = sparse_tracking_loss(
-                tracking_only(raw),
+                # conf_track_multi is dropped by default and the confidence term
+                # needs it; keeping it costs device memory, so it is kept only
+                # when something reads it. Sync needs only track_multi, which
+                # survives either way.
+                tracking_only(raw, keep_confidence=confidence_weight > 0),
                 scene,
                 per_anchor_correspondences[anchor_index],
                 alignment,
                 anchors[per_anchor_rows[anchor_index].to(anchors.device)],
                 huber_delta_m=huber_delta_m,
+                confidence_weight=confidence_weight,
+                confidence_alpha=step_alpha,
+                # UNDIVIDED here on purpose: this weight is only the gate that
+                # decides whether the term is built at all, and the total it
+                # composes is discarded by the multi-anchor path. The share
+                # belongs to weighted_anchor_total below.
+                sync_weight=sync_weight,
                 collect_diagnostics=False,
             )
-            # Position only, so the total is exactly anchor_weight * loss and
-            # the weights sum to 1 whatever this step's anchor count turned out
-            # to be. Worth knowing before sync is ever switched on here:
-            # weighted_anchor_total reduces the sync term by
-            # 1/active_anchor_count, so under --adaptive_query_anchors, where
-            # that count varies step to step, enabling it would silently reweight
-            # the objective between steps rather than across anchors.
+            # Whatever the first active anchor resolved, every later one reuses.
+            # Guarded rather than assigned: an anchor whose confidence mask came
+            # back empty reports None, and letting that overwrite a resolved
+            # alpha would silently unpin the run one anchor into a step.
+            if result.confidence_alpha is not None:
+                step_alpha = result.confidence_alpha
+            # Each term's share of the step, so backwarding per anchor equals one
+            # combined reduction="mean". Position and confidence are shares of
+            # their own supervised samples -- different masks, hence different
+            # counts. Sync is a share of the ACTIVE ANCHORS: every anchor's
+            # sync_loss is a mean over an identical 1*P*H*W*3 element count (P, H
+            # and W depend on the window, never on which anchor), so equal
+            # denominators make the stacked-Q mean the plain mean of the
+            # per-anchor means. All three sets of shares sum to 1 whatever this
+            # step's anchor count turned out to be, which is what keeps the terms'
+            # balance fixed under --adaptive_query_anchors.
             anchor_total = weighted_anchor_total(
                 result,
                 position_weight=anchor_weight,
-                confidence_weight=0.0,
-                sync_weight=0.0,
+                confidence_weight=confidence_weight * confidence_shares[anchor_index],
+                sync_weight=sync_weight / active_anchor_count,
             )
         # Backward per anchor, so this anchor's track-head graph is freed
         # before the next one allocates its own; the gradient lands on the cut
@@ -500,7 +567,35 @@ def train_step(
         step_metric_error = accumulate_weighted(
             step_metric_error, result.metric_error, anchor_weight
         )
+        # The same shares the objective used, so the reported figures are the
+        # step's own means rather than one anchor's. accumulate_weighted passes
+        # None through, so a disabled term needs no branch here.
+        step_sync_loss = accumulate_weighted(
+            step_sync_loss, result.sync_loss, 1.0 / active_anchor_count
+        )
+        step_confidence_loss = accumulate_weighted(
+            step_confidence_loss,
+            result.confidence_loss,
+            confidence_shares[anchor_index],
+        )
+        if result.confidence_dropped is not None:
+            if step_confidence_dropped is None:
+                step_confidence_dropped = dict(result.confidence_dropped)
+            else:
+                for cause, count in result.confidence_dropped.items():
+                    step_confidence_dropped[cause] += count
         del raw, result, anchor_total
+
+    # Unweighted, in the order sparse_tracking_loss composes its own terms, so
+    # this reads like the overfit's loss_breakdown. None when nothing but
+    # position ran: an all-None dict would claim a breakdown that has no terms.
+    loss_breakdown = {"position": step_loss}
+    if step_sync_loss is not None:
+        loss_breakdown["sync"] = step_sync_loss
+    if step_confidence_loss is not None:
+        loss_breakdown["confidence"] = step_confidence_loss
+    if len(loss_breakdown) == 1:
+        loss_breakdown = None
 
     backward_through_cut(cut_pairs)
     del cut_feats, cut_pairs, feats, recon, images
@@ -544,11 +639,16 @@ def train_step(
         alignment_residual_m=float(alignment_report["median_residual_metric"]),
         learning_rates=list(learning_rates),
         gradient_norms=norms,
-        peak_bytes=int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0,
+        peak_bytes=(
+            int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
+        ),
         confidence=stats,
         eligibility=compact_eligibility(eligibility),
         anchor_count=anchor_count,
         active_anchor_count=active_anchor_count,
+        loss_breakdown=loss_breakdown,
+        confidence_alpha=step_alpha,
+        confidence_dropped=step_confidence_dropped,
     )
 
 
@@ -679,7 +779,9 @@ def evaluate_held_out(
                     entry["position_loss_shuffled"] = None
 
                 if emit_predictions:
-                    arrays = _prediction_arrays(raw, scene, correspondences, alignment, anchors)
+                    arrays = _prediction_arrays(
+                        raw, scene, correspondences, alignment, anchors
+                    )
                     write_scene_predictions(
                         directory / "pred" / f"{plan.seq_name}.npz", arrays
                     )
@@ -753,7 +855,9 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     visible = visible.to(device)
     mask = mask.to(device)
 
-    displacement = gather_at_correspondences(raw["track_multi"], correspondences.to(device))
+    displacement = gather_at_correspondences(
+        raw["track_multi"], correspondences.to(device)
+    )
     predicted = (
         alignment.to(device=device, dtype=torch.float32).apply_points(
             torch.as_tensor(anchors, device=device, dtype=torch.float32)[:, None, :]
@@ -765,7 +869,9 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
 
     confidence = raw.get("conf_track_multi")
     weights = (
-        gather_at_correspondences(confidence, correspondences.to(device)).clamp_min(1e-6)
+        gather_at_correspondences(confidence, correspondences.to(device)).clamp_min(
+            1e-6
+        )
         if confidence is not None
         else torch.ones_like(mask, dtype=torch.float32)
     )
@@ -794,12 +900,18 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     query_times = [
         position_of_time[int(value)] for value in correspondences.query_times.tolist()
     ]
-    query_xyz = scene.trajectories_world.to(device)[
-        correspondences.query_times.to(device),
-        correspondences.trajectory_indices.to(device),
-    ] * metric
+    query_xyz = (
+        scene.trajectories_world.to(device)[
+            correspondences.query_times.to(device),
+            correspondences.trajectory_indices.to(device),
+        ]
+        * metric
+    )
     queries = torch.cat(
-        [torch.tensor(query_times, device=device, dtype=torch.float32)[:, None], query_xyz],
+        [
+            torch.tensor(query_times, device=device, dtype=torch.float32)[:, None],
+            query_xyz,
+        ],
         dim=1,
     )
 
@@ -1111,9 +1223,58 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     training.add_argument("--grad_clip", type=float, default=1.0)
     training.add_argument("--huber_delta_m", type=float, default=0.05)
+    training.add_argument(
+        "--sync_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the dense synchronized-pair consistency term: same-time "
+            "observation slots owe identical displacement fields at every pixel. "
+            "0 (the default) skips the term entirely, keeping archived runs "
+            "reproducible. The term builds a dense difference over every "
+            "synchronized pair per anchor, and that cost has never been measured "
+            "in THIS trainer -- the overfit measured anchors, not this field -- "
+            "against the committed run's 20 GiB of headroom (peak 119.5 GiB of "
+            "139.8 on its 5-view steps). A 6-step smoke at the committed window "
+            "is what settles it."
+        ),
+    )
+    training.add_argument(
+        "--confidence_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the DUSt3R-style confidence-weighted regression term. "
+            "0 (the default) trains positions only, exactly as before the term "
+            "existed, so archived runs stay reproducible. Note the two terms have "
+            "very different natural scales -- the confidence term carries an "
+            "alpha*log(conf) that is order hundreds when confidence is order "
+            "hundreds, against a position loss of order 0.03 -- so 1.0 is not "
+            "'equal weight'. Start small and read loss_breakdown in history.jsonl. "
+            "A nonzero weight also retains conf_track_multi per anchor, whose "
+            "marginal cost is unmeasured in THIS trainer against 20 GiB of "
+            "headroom; a 6-step smoke at the committed window settles it."
+        ),
+    )
+    training.add_argument(
+        "--confidence_alpha",
+        default="auto",
+        help=(
+            "Log-confidence regularizer weight. 'auto' (the default) resolves it to "
+            "mean(initial confidence) * mean(initial error), which puts the term's "
+            "optimum conf*=alpha/err at the released checkpoint's operating point so "
+            "confidence is re-ordered without being level-shifted. Downstream "
+            "occlusion thresholds confidence absolutely, so the level matters. "
+            "Resolved once, at the first active anchor of the first executed step, "
+            "and then frozen for the run and carried across --resume: a target that "
+            "moved every step would not be one the optimizer could descend."
+        ),
+    )
     training.add_argument("--freeze_mode", default="temporal_tracking_global_attention")
     training.add_argument("--late_global_blocks", type=int, default=None)
-    training.add_argument("--precision", choices=("32", "16-mixed", "bf16-mixed"), default="bf16-mixed")
+    training.add_argument(
+        "--precision", choices=("32", "16-mixed", "bf16-mixed"), default="bf16-mixed"
+    )
     training.add_argument("--seed", type=int, default=0)
     training.add_argument("--save_every", type=int, default=1000)
     training.add_argument(
@@ -1214,7 +1375,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "so the two curves overlay step for step (default: %(default)s)"
         ),
     )
-    evaluation.add_argument("--val_scenes_file", help="JSON list of held-out scene names")
+    evaluation.add_argument(
+        "--val_scenes_file", help="JSON list of held-out scene names"
+    )
     evaluation.add_argument(
         "--val_data_root",
         help=(
@@ -1237,6 +1400,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _parse_confidence_alpha(value) -> float | None:
+    """Return None for 'auto', otherwise the explicit positive float.
+
+    ``None`` maps to ``None`` so the parse is idempotent, like the anchor-spec
+    canonicalization it sits beside: ``_validate_args`` writes its result back
+    onto ``args``, and running the validator twice over one namespace must not
+    reject what the first pass produced.  Nothing reaches this from the CLI --
+    argparse hands over a string -- so accepting it costs no real coverage.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        return None
+    try:
+        alpha = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"--confidence_alpha must be 'auto' or a float, got {value!r}"
+        ) from None
+    if not math.isfinite(alpha) or alpha <= 0:
+        raise ValueError("--confidence_alpha must be finite and positive")
+    return alpha
 
 
 def _validate_args(args: argparse.Namespace) -> None:
@@ -1274,6 +1462,29 @@ def _validate_args(args: argparse.Namespace) -> None:
         not math.isfinite(args.encoder_lr) or args.encoder_lr <= 0
     ):
         raise ValueError("--encoder_lr must be finite and positive")
+    if not math.isfinite(args.confidence_weight) or args.confidence_weight < 0:
+        raise ValueError("--confidence_weight must be finite and non-negative")
+    if not math.isfinite(args.sync_weight) or args.sync_weight < 0:
+        raise ValueError("--sync_weight must be finite and non-negative")
+    # Parsed in place, like the anchor spec below: everything downstream --
+    # train_step, the checkpoint, the summary -- reads a float or None, never
+    # the flag's string.
+    args.confidence_alpha = _parse_confidence_alpha(args.confidence_alpha)
+    # The run's frozen alpha. Seeded from the request so an explicit value is
+    # already pinned; under 'auto' it stays None until the first executed step
+    # resolves it, and a resume restores it before that step runs.
+    args.resolved_confidence_alpha = args.confidence_alpha
+    # A window whose slots share no time index has no synchronized pair, and
+    # synchronized_differences raises rather than returning an empty mean. That
+    # would kill the run mid-step, and not as a SceneProviderError the loop's
+    # skip policy could absorb. Two cameras is the only thing that guarantees a
+    # pair, which is what --min_views already reasons about.
+    if args.sync_weight > 0 and args.min_views < 2:
+        raise ValueError(
+            "--sync_weight needs --min_views >= 2: the synchronized-consistency "
+            "term compares slots that share a time index, and a single-camera "
+            "window has no such pair for it to reduce over"
+        )
     # Refused HERE, at parse time, and not where the plans are built: that call
     # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
     # burn a full model load on a cluster node before reporting a missing flag --
@@ -1389,7 +1600,11 @@ def _plan_summary(tally, args) -> dict:
         "recorded_tracks_per_step": (
             None
             if not tracks
-            else {"min": min(tracks), "max": max(tracks), "mean": sum(tracks) / len(tracks)}
+            else {
+                "min": min(tracks),
+                "max": max(tracks),
+                "mean": sum(tracks) / len(tracks),
+            }
         ),
         # Non-zero is normal: the loader draws from overlapping pools. Reported so
         # a positional selection and a set-based one differ by a number here
@@ -1423,6 +1638,16 @@ def _plan_summary(tally, args) -> dict:
             # archived summary cannot say whether its readout was structural.
             "time_embedding_init": args.time_embedding_init,
             "time_embedding_init_scale": float(args.time_embedding_init_scale),
+            # Which objective the run descends. A summary that records only the
+            # position curve cannot say whether two runs optimized the same
+            # thing, and at zero weights these read as the zeros control.
+            "confidence_weight": float(args.confidence_weight),
+            "sync_weight": float(args.sync_weight),
+            "confidence_alpha": args.confidence_alpha,
+            # What alpha the run actually trained under, as opposed to what was
+            # asked for: None under 'auto' until a step resolves it, which is why
+            # this is reported next to the request rather than instead of it.
+            "resolved_confidence_alpha": args.resolved_confidence_alpha,
         },
     }
 
@@ -1445,7 +1670,9 @@ def _print_plan(tally, summary, *, limit: int = 20) -> None:
         print(f"... {len(tally.planned) - limit} more planned steps")
 
     for entry in tally.skipped[:limit]:
-        print(f"SKIP step={entry.step} scene={entry.seq_name} {entry.cause}: {entry.detail}")
+        print(
+            f"SKIP step={entry.step} scene={entry.seq_name} {entry.cause}: {entry.detail}"
+        )
     if len(tally.skipped) > limit:
         print(f"... {len(tally.skipped) - limit} more skipped records")
 
@@ -1545,6 +1772,16 @@ def run_training(
         # Before any state is restored: a refused resume must leave the model,
         # optimizer and RNG streams exactly as built.
         check_resume_settings(payload.get("settings") or {}, args)
+        # The run's frozen alpha, restored before the first resumed step so it
+        # is not re-resolved against a model that has since moved. Not a flag and
+        # so not in either resume tier: it is derived state the checkpoint
+        # carries, and a segment that re-derived it would descend toward a
+        # different optimum while the step counter continued.
+        restored_alpha = (payload.get("settings") or {}).get(
+            "resolved_confidence_alpha"
+        )
+        if restored_alpha is not None:
+            args.resolved_confidence_alpha = float(restored_alpha)
         # The weights, through the existing strict loader rather than a second
         # copy of the same overlay: it checks the key set against the model's own
         # trainable parameters, so a patch from a different freeze mode is refused
@@ -1603,7 +1840,10 @@ def run_training(
         val_correspondences, val_eligibility = build_anchor_correspondences(val_scene)
         if val_correspondences.count == 0:
             unsupervisable.append(
-                {"scene": plan.seq_name, "eligibility": compact_eligibility(val_eligibility)}
+                {
+                    "scene": plan.seq_name,
+                    "eligibility": compact_eligibility(val_eligibility),
+                }
             )
         del val_scene
     if val_plans:
@@ -1647,6 +1887,12 @@ def run_training(
     seated_anchor_counts: Counter = Counter()
     active_anchor_counts: Counter = Counter()
     anchor_count_steps = 0
+    # Summed over the run, and warned about ONCE. The overfit warns twice because
+    # it scores twice; a 20k-step trainer that warned per step would bury the
+    # first occurrence -- which is the one worth reading -- under thousands of
+    # repeats. Every step's own counts stay in history.jsonl regardless.
+    confidence_dropped_totals: Counter = Counter()
+    warned_about_dropped_confidence = False
     scene = None
     interrupted = None
     last_saved_step = None
@@ -1708,9 +1954,18 @@ def run_training(
                 precision=args.precision,
                 huber_delta_m=args.huber_delta_m,
                 grad_clip=args.grad_clip,
+                confidence_weight=args.confidence_weight,
+                confidence_alpha=args.resolved_confidence_alpha,
+                sync_weight=args.sync_weight,
                 learning_rates=learning_rates,
                 step=step,
             )
+            # Pin what the first executed step resolved, so every later step
+            # descends toward the same optimum. Written back onto args because
+            # that is what _checkpoint_settings reads, which is how the value
+            # survives a requeue. Once a float it never moves again.
+            if outcome.confidence_alpha is not None:
+                args.resolved_confidence_alpha = outcome.confidence_alpha
             check_device_headroom(
                 outcome.peak_bytes, step=step, max_fraction=args.max_device_fraction
             )
@@ -1727,13 +1982,45 @@ def run_training(
                     outcome.eligibility["eligible_query_count"]
                 )
                 for stage, count in outcome.eligibility["rejected"].items():
-                    eligibility_totals["rejected"][stage] = (
-                        eligibility_totals["rejected"].get(stage, 0) + int(count)
-                    )
+                    eligibility_totals["rejected"][stage] = eligibility_totals[
+                        "rejected"
+                    ].get(stage, 0) + int(count)
             if outcome.anchor_count is not None:
                 anchor_count_steps += 1
                 seated_anchor_counts[int(outcome.anchor_count)] += 1
                 active_anchor_counts[int(outcome.active_anchor_count)] += 1
+            if outcome.confidence_dropped:
+                confidence_dropped_totals.update(outcome.confidence_dropped)
+                if outcome.confidence_dropped.get("total", 0) and not (
+                    warned_about_dropped_confidence
+                ):
+                    warned_about_dropped_confidence = True
+                    dropped = outcome.confidence_dropped
+                    print(
+                        f"WARNING step={step}: {dropped['total']} sparse sample(s) "
+                        "were dropped from the confidence term as non-finite "
+                        f"(target={dropped['target_nonfinite']}, "
+                        f"prediction={dropped['prediction_nonfinite']}, "
+                        f"confidence={dropped['confidence_nonfinite']}). `expp1` is "
+                        "1+exp(x) and overflows in BF16, so the confidence figures "
+                        "from here on describe a subset -- and the per-anchor "
+                        "confidence shares, which cannot see finiteness, no longer "
+                        "match the mask the loss reduced over. Warned once; every "
+                        "step's counts are in history.jsonl and the run total is in "
+                        "run_summary.json.",
+                        file=sys.stderr,
+                    )
+            # Absent on a position-only step, so the line a zeros-control run
+            # prints is the one it printed before the terms existed.
+            breakdown_log = (
+                ""
+                if outcome.loss_breakdown is None
+                else " breakdown="
+                + ",".join(
+                    f"{name}={value:.6g}"
+                    for name, value in outcome.loss_breakdown.items()
+                )
+            )
             print(
                 f"step={step}/{args.num_steps} scene={outcome.seq_name} "
                 f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
@@ -1741,6 +2028,7 @@ def run_training(
                 f"align_residual_m={outcome.alignment_residual_m:.6f} "
                 f"samples={outcome.sample_count} "
                 f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
+                f"{breakdown_log}"
             )
 
         completed = step + 1
@@ -1764,20 +2052,36 @@ def run_training(
                 f"shuffled={metrics['position_loss_shuffled']}"
             )
         if args.save_every and completed % args.save_every == 0:
-            _write_checkpoint(model, optimizer, scaler, base_learning_rates,
-                              step=completed, output_dir=output_dir, args=args)
+            _write_checkpoint(
+                model,
+                optimizer,
+                scaler,
+                base_learning_rates,
+                step=completed,
+                output_dir=output_dir,
+                args=args,
+            )
             last_saved_step = completed
 
-    completed_steps = (step + 1) if history and interrupted is None else (
-        history[-1].step + 1 if history else start_step
+    completed_steps = (
+        (step + 1)
+        if history and interrupted is None
+        else (history[-1].step + 1 if history else start_step)
     )
     # A clean run whose last step lands on a --save_every boundary has already
     # written exactly this state. The rename is atomic and the content identical,
     # so repeating it is harmless -- but it is a multi-GB write to shared storage
     # at the end of every aligned run, for nothing.
     if last_saved_step != completed_steps:
-        _write_checkpoint(model, optimizer, scaler, base_learning_rates,
-                          step=completed_steps, output_dir=output_dir, args=args)
+        _write_checkpoint(
+            model,
+            optimizer,
+            scaler,
+            base_learning_rates,
+            step=completed_steps,
+            output_dir=output_dir,
+            args=args,
+        )
 
     return {
         "start_step": start_step,
@@ -1792,6 +2096,10 @@ def run_training(
             "seated": dict(sorted(seated_anchor_counts.items())),
             "active": dict(sorted(active_anchor_counts.items())),
         },
+        # Empty dict rather than None when the term ran and dropped nothing: that
+        # is a measurement ("the shares matched the mask all run"), and it reads
+        # differently from a position-only run that never looked.
+        "confidence_dropped_totals": dict(sorted(confidence_dropped_totals.items())),
         "history": history,
         "evaluations": evaluations,
     }
@@ -1831,6 +2139,17 @@ def _checkpoint_settings(args) -> dict:
         # equal to a freshly parsed one.
         "time_embedding_init": args.time_embedding_init,
         "time_embedding_init_scale": float(args.time_embedding_init_scale),
+        # Which objective the run descends. Coerced for the same round-trip
+        # reason as the pair above; confidence_alpha stays None under 'auto',
+        # which is a plain type torch.load returns unchanged.
+        "confidence_weight": float(args.confidence_weight),
+        "sync_weight": float(args.sync_weight),
+        "confidence_alpha": args.confidence_alpha,
+        # Derived state rather than a flag, and so deliberately in NEITHER resume
+        # tier: check_resume_settings iterates the two tuples only, so this rides
+        # along uncompared. Comparing it would refuse every legitimate resume of
+        # an 'auto' run, whose request is None while the stored value is a float.
+        "resolved_confidence_alpha": args.resolved_confidence_alpha,
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
         "min_lr_scale": args.min_lr_scale,
@@ -1838,7 +2157,9 @@ def _checkpoint_settings(args) -> dict:
     }
 
 
-def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, output_dir, args) -> Path:
+def _write_checkpoint(
+    model, optimizer, scaler, base_learning_rates, *, step, output_dir, args
+) -> Path:
     """The temporal patch plus everything a resume needs, in one atomic file."""
 
     from arc.training.checkpoint import save_temporal_tracking_checkpoint  # noqa: F401
@@ -1875,9 +2196,13 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # while the step counter continues), where the time-index table started
 # (time_embedding_init and its scale -- a different init is a different set of
 # per-index offsets, so the encoder is conditioned differently from step 0 and
-# every weight downstream of it descends from that), or the numerics under the
-# restored scaler state (precision): a changed value means the "resumed" run
-# trains a different stream while its step counter continues.
+# every weight downstream of it descends from that), which objective the run
+# descends at all (confidence_weight, sync_weight and confidence_alpha -- a
+# segment that changes a loss weight and keeps counting steps reports one curve
+# over two objectives, and the reported `loss` stays the position-only Huber
+# throughout, so nothing in the history would show the switch), or the numerics
+# under the restored scaler state (precision): a changed value means the
+# "resumed" run trains a different stream while its step counter continues.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
@@ -1885,6 +2210,17 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # The init pair is refused rather than warned even though seed_time_index_embedding
 # does not re-seed on a resume: precisely because it does not, this comparison is
 # the only thing left tying the restored table to the run that trained it.
+#
+# An absent refused key is NOT automatically fatal any more: see
+# _RESUME_SETTINGS_ABSENT_DEFAULTS below. The tier was written when the only
+# checkpoints lacking the newest key were disposable smokes; live runs now resume
+# across eight-plus segments, so a key added mid-project must say what its own
+# absence meant or it strands them.
+#
+# resolved_confidence_alpha is stored but in NEITHER tier. It is derived state,
+# not a flag: an 'auto' run's request is None while its checkpoint carries a
+# float, so comparing them would refuse every legitimate resume. run_training
+# restores it directly instead.
 _RESUME_SETTINGS_REFUSED = (
     "observation_budget",
     "stride",
@@ -1897,33 +2233,76 @@ _RESUME_SETTINGS_REFUSED = (
     "kubric_max_depth",
     "time_embedding_init",
     "time_embedding_init_scale",
+    "confidence_weight",
+    "sync_weight",
+    "confidence_alpha",
     "precision",
 )
 _RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
+
+# What the ABSENCE of a refused key means, for the keys whose absence has exactly
+# one possible reading. A checkpoint written before --confidence_weight and
+# --sync_weight existed could not have set them: no other value was reachable, so
+# the run it continues was necessarily position-only at weight 0, and
+# confidence_alpha is unused at that weight. Resolving the gap to that one value
+# is not tolerating it -- the comparison below still runs, so a segment that
+# turns a term ON against a position-only checkpoint is refused exactly as a
+# changed weight is.
+#
+# Deliberately NOT a blanket tolerance, which would gut the tier. A key stays
+# strictly refused when absent unless it is listed here, and the ones that are
+# not listed are the ones whose absence is genuinely ambiguous: val_cameras and
+# the time-embedding pair each had a reachable non-default value before they were
+# recorded, so nothing can say which one an old checkpoint used.
+#
+# This exists because the tier's original premise -- "only disposable smokes lack
+# the newest key" -- stopped being true once multi-day runs began resuming across
+# eight-plus segments. It will keep stopping being true every time a
+# stream-defining flag is added mid-project, so a new refused key should arrive
+# with an entry here whenever its absence resolves to one value.
+_RESUME_SETTINGS_ABSENT_DEFAULTS = {
+    "confidence_weight": 0.0,
+    "sync_weight": 0.0,
+    "confidence_alpha": None,
+}
 
 
 def check_resume_settings(stored: dict, args) -> None:
     """Compare a checkpoint's stored settings against this invocation's flags.
 
-    A refused-tier key **absent** from ``stored`` is itself refused: an
-    unverifiable stream is not a continuable one, and tolerating the gap would
-    let a checkpoint from before the key existed resume under a different
-    anchor spec -- or budget, or stride -- with nothing raising anywhere.  The
-    only checkpoints predating the newest key are disposable short smokes, so
-    nothing worth resuming is lost.  Warned-tier keys stay tolerant when
-    absent: they only reshape the remaining schedule.
+    A refused-tier key **absent** from ``stored`` is refused unless
+    ``_RESUME_SETTINGS_ABSENT_DEFAULTS`` says what its absence meant: an
+    unverifiable stream is not a continuable one, and tolerating an ambiguous
+    gap would let a checkpoint from before the key existed resume under a
+    different anchor spec -- or budget, or stride -- with nothing raising
+    anywhere.  Where absence *does* resolve to exactly one value, that value is
+    compared like any stored one, so nothing is tolerated; see the mapping's own
+    comment for why the two cases are not the same.  Warned-tier keys stay
+    tolerant when absent: they only reshape the remaining schedule.
     """
 
     current = _checkpoint_settings(args)
     for key in _RESUME_SETTINGS_REFUSED:
         if key not in stored:
-            raise RuntimeError(
-                f"--resume checkpoint carries no stored {key!r}, so this "
-                "invocation cannot verify the resumed run would continue the "
-                "same stream. Only checkpoints from before the key existed "
-                "lack it -- disposable smokes, not runs worth continuing; "
-                "start a fresh run without --resume"
-            )
+            if key not in _RESUME_SETTINGS_ABSENT_DEFAULTS:
+                raise RuntimeError(
+                    f"--resume checkpoint carries no stored {key!r}, and its "
+                    "absence does not resolve to a single value, so this "
+                    "invocation cannot verify the resumed run would continue "
+                    "the same stream; start a fresh run without --resume"
+                )
+            implied = _RESUME_SETTINGS_ABSENT_DEFAULTS[key]
+            if current[key] != implied:
+                raise RuntimeError(
+                    f"--resume checkpoint predates {key!r}, so the run it "
+                    f"continues was necessarily {key}={implied!r}, but this "
+                    f"invocation has {key}={current[key]!r}. Turning a loss "
+                    "term on mid-stream reports one curve over two objectives "
+                    "-- and the reported `loss` stays the position-only Huber "
+                    "either way, so nothing in the history would show it; "
+                    "start a fresh run without --resume"
+                )
+            continue
         if stored[key] != current[key]:
             raise RuntimeError(
                 f"--resume checkpoint carries {key}={stored[key]!r} but this "
@@ -2216,6 +2595,10 @@ def main() -> None:
         # supervised. They differ only under --adaptive_query_anchors, which is
         # exactly when the spec stops being a readable answer.
         "realized_anchor_counts": result["realized_anchor_counts"],
+        # Same scope again. Empty when the confidence term ran and dropped
+        # nothing, which is a measurement; empty ALSO when the term never ran,
+        # which settings.confidence_weight above is what disambiguates.
+        "confidence_dropped_totals": result["confidence_dropped_totals"],
         "evaluations": result["evaluations"],
         "trainable_tensor_count": report["tensor_count"],
         "trainable_parameter_count": report["parameter_count"],
@@ -2287,9 +2670,7 @@ def _val_time_count(args) -> int:
     archived smokes.
     """
 
-    return min(
-        args.observation_budget // len(args.val_cameras), args.max_time_indices
-    )
+    return min(args.observation_budget // len(args.val_cameras), args.max_time_indices)
 
 
 def _val_anchor_slots(args) -> tuple[tuple[int, int], ...]:

@@ -382,6 +382,36 @@ def anchor_sample_counts(scene, correspondences, anchor_count: int) -> list[int]
     return counts
 
 
+def anchor_confidence_counts(
+    scene,
+    correspondences,
+    anchor_count: int,
+) -> list[int]:
+    """Confidence-term sample count per anchor.
+
+    The confidence term deliberately does *not* mask on visibility -- occluded
+    samples are where the error is large, which is the signal it exists to learn
+    -- so it reduces over a strictly larger set than the position term and needs
+    its own weights.  Reusing the position weights here would make the combined
+    objective differ from the stacked-Q one by the ratio between the two masks.
+
+    The remaining predicates in that mask are prediction-dependent
+    (``predicted_finite``, ``confidence_finite``), so this is exact whenever
+    nothing goes non-finite.  When something does, the run says so loudly:
+    the drop is counted by cause in ``confidence_dropped`` and warned about.
+    """
+
+    counts = []
+    for anchor_index in range(anchor_count):
+        anchor = correspondences.select_query_slot(anchor_index)
+        if anchor.count == 0:
+            counts.append(0)
+            continue
+        _, _, finite, _ = sparse_targets(scene, anchor)
+        counts.append(int(finite.sum().item()))
+    return counts
+
+
 def weighted_anchor_total(
     result,
     *,

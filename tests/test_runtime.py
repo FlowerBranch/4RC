@@ -52,6 +52,7 @@ MOVED_TO_RUNTIME = {
     "_shuffled_index_views",
     "_tracking_only",
     "_accumulate",
+    "_anchor_confidence_counts",
     "_anchor_sample_counts",
     "_anchor_tracks",
     "_backward_through_cut",
@@ -120,6 +121,10 @@ def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():
     assert overfit_cli.EXPECTED_TRAINABLE_SETS is runtime.EXPECTED_TRAINABLE_SETS
     assert overfit_cli._cut_features is runtime.cut_features
     assert overfit_cli._weighted_anchor_total is runtime.weighted_anchor_total
+    # Moved when the trainer became its second consumer: the confidence term's
+    # per-anchor shares are the trainer's too, and a copy would let the two
+    # drivers weight the same objective differently.
+    assert overfit_cli._anchor_confidence_counts is runtime.anchor_confidence_counts
 
 
 # --------------------------------------------------------------- gradient norm ---

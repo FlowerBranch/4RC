@@ -26,7 +26,6 @@ from arc.training import (
     reconstruction_drift_report,
     reconstruction_shift_report,
     save_temporal_tracking_checkpoint,
-    sparse_targets,
     sparse_tracking_loss,
     synchronized_consistency_stats,
     temporal_injection_report,
@@ -46,6 +45,7 @@ from arc.training.runtime import (  # noqa: E402
     MAX_LATE_GLOBAL_BLOCKS,
     TIME_EMBEDDING_KEY,
     accumulate_weighted as _accumulate,
+    anchor_confidence_counts as _anchor_confidence_counts,
     anchor_sample_counts as _anchor_sample_counts,
     anchor_tracks as _anchor_tracks,
     assert_frozen_gradients_absent as _assert_frozen_gradients_absent,
@@ -514,36 +514,6 @@ def _build_optimizer(model, args) -> tuple[torch.optim.AdamW, dict[str, float], 
         embedding_lr=args.embedding_lr,
         encoder_lr=args.encoder_lr,
     )
-
-
-def _anchor_confidence_counts(
-    scene,
-    correspondences,
-    anchor_count: int,
-) -> list[int]:
-    """Confidence-term sample count per anchor.
-
-    The confidence term deliberately does *not* mask on visibility -- occluded
-    samples are where the error is large, which is the signal it exists to learn
-    -- so it reduces over a strictly larger set than the position term and needs
-    its own weights.  Reusing the position weights here would make the combined
-    objective differ from the stacked-Q one by the ratio between the two masks.
-
-    The remaining predicates in that mask are prediction-dependent
-    (``predicted_finite``, ``confidence_finite``), so this is exact whenever
-    nothing goes non-finite.  When something does, the run says so loudly:
-    the drop is counted by cause in ``confidence_dropped`` and warned about.
-    """
-
-    counts = []
-    for anchor_index in range(anchor_count):
-        anchor = correspondences.select_query_slot(anchor_index)
-        if anchor.count == 0:
-            counts.append(0)
-            continue
-        _, _, finite, _ = sparse_targets(scene, anchor)
-        counts.append(int(finite.sum().item()))
-    return counts
 
 
 def _breakdown_to_floats(breakdown) -> dict[str, float] | None:
