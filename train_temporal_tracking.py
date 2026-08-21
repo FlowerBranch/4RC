@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import signal
 import sys
 from collections import Counter
@@ -49,6 +50,7 @@ from arc.training.manifest_plan import (
     plan_manifest,
 )
 from arc.training.runtime import (
+    TIME_EMBEDDING_KEY,
     accumulate_weighted,
     anchor_sample_counts,
     anchor_tracks,
@@ -1067,6 +1069,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     training.add_argument("--lr", type=float, default=1e-5)
     training.add_argument("--embedding_lr", type=float, default=None)
     training.add_argument(
+        "--time_embedding_init",
+        choices=("zeros", "orthogonal"),
+        default="orthogonal",
+        help=(
+            "How to re-seed the time-index embedding after loading. 'orthogonal' "
+            "writes mutually orthogonal rows scaled to the checkpoint's time "
+            "token, so the indices are distinct from step 0; 'zeros' keeps the "
+            "constructor state, under which the table cannot grow into a signal "
+            "within a short run (AdamW moves each weight by about lr per step)."
+        ),
+    )
+    training.add_argument(
+        "--time_embedding_init_scale",
+        type=float,
+        default=0.3,
+        help=(
+            "Row norm of the orthogonal init as a fraction of ||time_token||. "
+            "The init-scale sweep settled the usable band at 0.2-0.4: neutrality "
+            "breaks between 0.7 and 1.0, and same-index cross-view disagreement "
+            "degrades at 0.5 and above (default: %(default)s)"
+        ),
+    )
+    training.add_argument(
         "--encoder_lr",
         type=float,
         default=None,
@@ -1220,6 +1245,23 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"--observation_budget {args.observation_budget} cannot seat even one "
             f"time at --min_views {args.min_views}"
         )
+    if (
+        not math.isfinite(args.time_embedding_init_scale)
+        or args.time_embedding_init_scale <= 0
+    ):
+        raise ValueError("--time_embedding_init_scale must be finite and positive")
+    # The rate the re-seeded table trains under. A zero or non-finite rate leaves
+    # it at its init or destroys it, and either way reproduces the structurally
+    # zero readout the init exists to prevent -- by a different route, and with
+    # nothing raising, since the gradient guard sees a live gradient regardless.
+    if args.embedding_lr is not None and (
+        not math.isfinite(args.embedding_lr) or args.embedding_lr <= 0
+    ):
+        raise ValueError("--embedding_lr must be finite and positive")
+    if args.encoder_lr is not None and (
+        not math.isfinite(args.encoder_lr) or args.encoder_lr <= 0
+    ):
+        raise ValueError("--encoder_lr must be finite and positive")
     # Refused HERE, at parse time, and not where the plans are built: that call
     # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
     # burn a full model load on a cluster node before reporting a missing flag --
@@ -1332,6 +1374,11 @@ def _plan_summary(tally, args) -> dict:
             "excluded_data_roots": list(args.exclude_data_root),
             "query_anchors": list(args.query_anchors),
             "adaptive_query_anchors": bool(args.adaptive_query_anchors),
+            # Recorded because an unseeded table makes --time_indices inert and
+            # the shuffled-index arm identical to the plain one: without this an
+            # archived summary cannot say whether its readout was structural.
+            "time_embedding_init": args.time_embedding_init,
+            "time_embedding_init_scale": float(args.time_embedding_init_scale),
         },
     }
 
@@ -1724,6 +1771,11 @@ def _checkpoint_settings(args) -> dict:
         # set of observations depending on whether a step may drop from them.
         "adaptive_query_anchors": bool(args.adaptive_query_anchors),
         "kubric_max_depth": float(args.kubric_max_depth),
+        # Where the time-index table started. Coerced like kubric_max_depth so a
+        # value round-tripped through torch.load(weights_only=True) compares
+        # equal to a freshly parsed one.
+        "time_embedding_init": args.time_embedding_init,
+        "time_embedding_init_scale": float(args.time_embedding_init_scale),
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
         "min_lr_scale": args.min_lr_scale,
@@ -1762,12 +1814,19 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # supervises and how the loss reduces over them (query_anchors, plus
 # adaptive_query_anchors, which decides whether those slots bind on every step
 # or only where they fit -- the same strings supervise a different set of
-# observations either way), or the numerics under the restored scaler state
-# (precision): a changed value means the "resumed" run trains a different stream
-# while its step counter continues.
+# observations either way), where the time-index table started
+# (time_embedding_init and its scale -- a different init is a different set of
+# per-index offsets, so the encoder is conditioned differently from step 0 and
+# every weight downstream of it descends from that), or the numerics under the
+# restored scaler state (precision): a changed value means the "resumed" run
+# trains a different stream while its step counter continues.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
+#
+# The init pair is refused rather than warned even though seed_time_index_embedding
+# does not re-seed on a resume: precisely because it does not, this comparison is
+# the only thing left tying the restored table to the run that trained it.
 _RESUME_SETTINGS_REFUSED = (
     "observation_budget",
     "stride",
@@ -1777,6 +1836,8 @@ _RESUME_SETTINGS_REFUSED = (
     "query_anchors",
     "adaptive_query_anchors",
     "kubric_max_depth",
+    "time_embedding_init",
+    "time_embedding_init_scale",
     "precision",
 )
 _RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
@@ -1822,6 +1883,55 @@ def check_resume_settings(stored: dict, args) -> None:
                 "remaining steps",
                 file=sys.stderr,
             )
+
+
+def seed_time_index_embedding(model, args) -> bool:
+    """Give the time indices distinct offsets before the optimizer sees them.
+
+    The constructor zero-fills the table (vision_transformer.py, where the
+    released checkpoint carries no key to overwrite it), and the lookup enters
+    the forward pass as ``time_tokens + time_index_embedding(time_indices)``.  An
+    unseeded run therefore adds zero for every index: --time_indices is inert and
+    the index-reversal readout measures only backward nondeterminism.  Nothing
+    downstream notices, because the gradient guard in train_step fires on a
+    disconnected graph rather than an uninformative table -- a zero row still
+    receives the time-token path's gradient.
+
+    Module level rather than inline in main(), which cannot run without a GPU:
+    this is the seam the CPU suite drives, and its absence is why an unseeded
+    trainer shipped.  It touches only ``consumed_legacy_missing_keys`` and
+    ``backbone.pretrained``, so a test needs no checkpoint and no CUDA.
+
+    Skipped under --resume, which restores a trained table from train_state.pt
+    inside run_training.  Re-seeding would discard that training, and the
+    invariant there -- a refused resume must leave the model, optimizer and RNG
+    streams exactly as built -- forbids mutating the model before
+    check_resume_settings has run at all.  The resumed invocation is still
+    checked, not trusted: time_embedding_init is in _RESUME_SETTINGS_REFUSED, so
+    it must declare the same init the stream was seeded under.
+
+    Returns whether the table was re-seeded, so the caller can report it without
+    restating the conditions above.
+    """
+
+    if args.time_embedding_init == "zeros" or args.resume:
+        return False
+    if TIME_EMBEDDING_KEY not in model.consumed_legacy_missing_keys:
+        raise RuntimeError(
+            "Refusing to reinitialize a time-index embedding that was loaded "
+            "from the checkpoint rather than zero-filled; pass "
+            "--time_embedding_init zeros to keep the loaded table"
+        )
+    # A fresh generator, never the global RNG: reinitialize_time_index_embedding
+    # is documented to consume nothing from the global stream, and the trainer's
+    # per-step determinism -- plus capture_rng_state/restore_rng_state across a
+    # resume -- depends on that holding.
+    model.backbone.pretrained.reinitialize_time_index_embedding(
+        args.time_embedding_init,
+        scale=args.time_embedding_init_scale,
+        generator=torch.Generator().manual_seed(args.seed),
+    )
+    return True
 
 
 def _gate_verdicts(summary: dict) -> dict:
@@ -1965,6 +2075,16 @@ def main() -> None:
     print(
         f"trainable={report['tensor_count']} tensors / "
         f"{report['parameter_count']} parameters ({args.freeze_mode})"
+    )
+
+    # Before build_optimizer, which splits the embedding into its own
+    # --embedding_lr group by module identity. Printed because "the table was
+    # never seeded" is otherwise invisible until an eval shows the shuffled arm
+    # matching the plain one, which is days in.
+    seeded = seed_time_index_embedding(model, args)
+    print(
+        f"time_embedding_init={args.time_embedding_init} "
+        f"scale={args.time_embedding_init_scale} applied={seeded}"
     )
 
     optimizer, learning_rates, _encoder = build_optimizer(

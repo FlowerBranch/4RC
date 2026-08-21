@@ -16,6 +16,7 @@ resumed segment, because the final value alone hides it.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import json
 import signal
@@ -224,6 +225,14 @@ def _loop_args(tmp_path, **overrides):
         # The spec's other half, stored alongside it: off is the per-run
         # contract every existing test assumes.
         adaptive_query_anchors=False,
+        # Where the time-index table started. _checkpoint_settings stores both
+        # and check_resume_settings refuses a change, so every loop test needs
+        # them present; these are the parser's defaults.
+        time_embedding_init="orthogonal",
+        time_embedding_init_scale=0.3,
+        # Read by seed_time_index_embedding, which draws the orthogonal rows
+        # from its own generator rather than the global stream.
+        seed=0,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -466,6 +475,287 @@ def test_a_resume_that_changes_the_anchor_spec_is_refused(tmp_path):
     train_cli.check_resume_settings(
         train_cli._checkpoint_settings(_loop_args(tmp_path, query_anchors=["0:0", "1:0"])),
         _loop_args(tmp_path, query_anchors=["0:0", "1:0"]),
+    )
+
+
+# ------------------------------------------------- time-index embedding seed ---
+#
+# The trainer trained a zero-filled table for a full run: the constructor
+# zero-fills it, the released checkpoint carries no key to overwrite it, and the
+# lookup is additive, so every index contributed nothing and the index-reversal
+# readout measured only backward nondeterminism.  main() is .to("cuda")-gated, so
+# these drive seed_time_index_embedding directly -- that seam existing is the
+# point, since an inline block in main() is what the CPU suite could not reach.
+
+
+def _seedable_model(*, zero_filled=True, max_time_indices=7):
+    """A duck-typed stand-in for a freshly built Arc, on CPU.
+
+    seed_time_index_embedding reads only ``consumed_legacy_missing_keys`` and
+    ``backbone.pretrained``, so the real encoder is needed but the rest of Arc is
+    not -- and neither is a checkpoint or a GPU.  ``zero_filled`` picks which
+    provenance the loader reported: True is the released checkpoint (the key was
+    missing and got zeros), False is a checkpoint that already carried a table.
+    """
+
+    from test_time_indexing import _configured_time_transformer
+
+    return SimpleNamespace(
+        backbone=SimpleNamespace(
+            pretrained=_configured_time_transformer(max_time_indices)
+        ),
+        consumed_legacy_missing_keys=(
+            frozenset({train_cli.TIME_EMBEDDING_KEY}) if zero_filled else frozenset()
+        ),
+    )
+
+
+def test_the_default_flags_seed_the_table_orthogonally_at_scale(tmp_path):
+    """An unflagged run must leave step 0 with distinguishable indices.
+
+    This is the regression: with the table at zeros the whole temporal mechanism
+    is a no-op that nothing downstream reports, because the gradient guard sees a
+    live gradient on a zero row just the same.
+    """
+
+    model = _seedable_model()
+    encoder = model.backbone.pretrained
+    assert torch.count_nonzero(encoder.time_index_embedding.weight) == 0
+
+    assert train_cli.seed_time_index_embedding(model, _loop_args(tmp_path)) is True
+
+    weight = encoder.time_index_embedding.weight
+    assert torch.count_nonzero(weight) > 0
+    # Calibrated to this checkpoint's own time token, not an absolute constant.
+    expected_row_norm = 0.3 * encoder.time_token.detach().float().norm()
+    torch.testing.assert_close(
+        weight.norm(dim=1),
+        expected_row_norm.expand(7),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    gram = weight @ weight.T
+    off_diagonal = gram - torch.diag(torch.diagonal(gram))
+    assert off_diagonal.abs().max() < 1e-4
+    assert weight.requires_grad
+
+
+def test_the_seed_is_reproducible_from_the_run_seed_alone(tmp_path):
+    """Two invocations at one --seed must place the same rows.
+
+    And the global stream must be untouched: the loop's per-step determinism and
+    the RNG capture/restore across a resume both assume this call consumes
+    nothing from it.
+    """
+
+    # Built first: constructing the encoder draws from the global stream, and
+    # the claim under test is about the seeding call alone.
+    first = _seedable_model()
+    torch.manual_seed(1234)
+    undisturbed = torch.rand(4)
+
+    torch.manual_seed(1234)
+    train_cli.seed_time_index_embedding(first, _loop_args(tmp_path, seed=7))
+    assert torch.equal(torch.rand(4), undisturbed)
+
+    second = _seedable_model()
+    with torch.no_grad():
+        second.backbone.pretrained.time_token.copy_(
+            first.backbone.pretrained.time_token
+        )
+    train_cli.seed_time_index_embedding(second, _loop_args(tmp_path, seed=7))
+    assert torch.equal(
+        second.backbone.pretrained.time_index_embedding.weight.detach(),
+        first.backbone.pretrained.time_index_embedding.weight.detach(),
+    )
+
+    third = _seedable_model()
+    with torch.no_grad():
+        third.backbone.pretrained.time_token.copy_(first.backbone.pretrained.time_token)
+    train_cli.seed_time_index_embedding(third, _loop_args(tmp_path, seed=8))
+    assert not torch.equal(
+        third.backbone.pretrained.time_index_embedding.weight.detach(),
+        first.backbone.pretrained.time_index_embedding.weight.detach(),
+    )
+
+
+def test_the_zeros_init_keeps_the_constructor_state(tmp_path):
+    """The escape hatch has to actually opt out, not merely rename the init."""
+
+    model = _seedable_model()
+    assert train_cli.seed_time_index_embedding(
+        model, _loop_args(tmp_path, time_embedding_init="zeros")
+    ) is False
+    assert torch.count_nonzero(
+        model.backbone.pretrained.time_index_embedding.weight
+    ) == 0
+
+
+def test_seeding_a_checkpoint_loaded_table_is_refused(tmp_path):
+    """Overwriting a trained table would discard a finetune without saying so.
+
+    The provenance comes from the loader, not from a flag: a table absent from
+    the checkpoint is recorded in consumed_legacy_missing_keys, and its absence
+    from that set means the weights came from the file.
+    """
+
+    model = _seedable_model(zero_filled=False)
+    with pytest.raises(RuntimeError, match="loaded from the checkpoint"):
+        train_cli.seed_time_index_embedding(model, _loop_args(tmp_path))
+
+    # Named in the message, because it is the only way to proceed.
+    train_cli.seed_time_index_embedding(
+        model, _loop_args(tmp_path, time_embedding_init="zeros")
+    )
+
+
+def test_a_resume_is_never_re_seeded(tmp_path):
+    """--resume restores a trained table; re-seeding it would discard the run.
+
+    Not merely harmless-because-overwritten: run_training refuses a mismatched
+    resume *before* restoring any state, on the promise that the model is still
+    exactly as built, so a seed applied here would survive a refusal it was
+    supposed to be rolled back by.
+    """
+
+    model = _seedable_model()
+    assert train_cli.seed_time_index_embedding(
+        model, _loop_args(tmp_path, resume=str(tmp_path / "train_state.pt"))
+    ) is False
+    assert torch.count_nonzero(
+        model.backbone.pretrained.time_index_embedding.weight
+    ) == 0
+
+    # The resume short-circuits before the provenance guard, so a resume whose
+    # table came from a checkpoint does not trip the loaded-table refusal either.
+    loaded = _seedable_model(zero_filled=False)
+    assert train_cli.seed_time_index_embedding(
+        loaded, _loop_args(tmp_path, resume=str(tmp_path / "train_state.pt"))
+    ) is False
+
+
+def test_a_resume_that_changes_the_time_embedding_init_is_refused(tmp_path):
+    """The only thing tying a restored table to the run that trained it.
+
+    seed_time_index_embedding deliberately does not re-seed on a resume, so
+    nothing else compares the init the stream started from against the one this
+    invocation declares.
+    """
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    assert stored["time_embedding_init"] == "orthogonal"
+    assert stored["time_embedding_init_scale"] == 0.3
+
+    with pytest.raises(RuntimeError) as excinfo:
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, time_embedding_init="zeros")
+        )
+    assert "'orthogonal'" in str(excinfo.value)
+    assert "'zeros'" in str(excinfo.value)
+
+    with pytest.raises(RuntimeError, match="time_embedding_init_scale"):
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, time_embedding_init_scale=0.2)
+        )
+
+    # Unchanged flags continue, which is what a requeue-resume runs with.
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    # And the refused tier still rejects a checkpoint that predates the key.
+    partial = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del partial["time_embedding_init"]
+    with pytest.raises(RuntimeError, match="time_embedding_init"):
+        train_cli.check_resume_settings(partial, _loop_args(tmp_path))
+
+
+def test_main_seeds_the_table_between_the_freeze_and_the_optimizer():
+    """Every test above passes on a main() that never calls the seeder.
+
+    Which is exactly what shipped: reinitialize_time_index_embedding existed and
+    was tested, and its only caller was the overfit harness, so the multi-scene
+    trainer ran a full job on a zero table. Inspected rather than executed
+    because main() cannot run without a GPU and a checkpoint -- the same reason
+    nothing covered the gap in the first place.
+    """
+
+    main_def = next(
+        node
+        for node in ast.walk(ast.parse(Path(train_cli.__file__).read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    ordered = ("set_freeze", "seed_time_index_embedding", "build_optimizer")
+    found = {name: [] for name in ordered}
+    for node in ast.walk(main_def):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name in found:
+            found[name].append(node.lineno)
+
+    for name in ordered:
+        assert len(found[name]) == 1, f"expected exactly one {name} call in main()"
+
+    # The order is the contract: after set_freeze so the table is the one the
+    # freeze mode will train, and before build_optimizer, which selects the
+    # embedding into its own --embedding_lr group.
+    assert [found[name][0] for name in ordered] == sorted(
+        found[name][0] for name in ordered
+    )
+
+
+def test_the_init_flags_default_to_the_swept_band_and_reach_the_artifacts():
+    """The default is deliberately 0.3, not the overfit harness's 0.1."""
+
+    args = train_cli.build_arg_parser().parse_args(["--manifest", "m.jsonl"])
+    assert args.time_embedding_init == "orthogonal"
+    assert args.time_embedding_init_scale == 0.3
+    assert isinstance(args.time_embedding_init_scale, float)
+
+    override = train_cli.build_arg_parser().parse_args(
+        ["--manifest", "m.jsonl", "--time_embedding_init", "zeros"]
+    )
+    assert override.time_embedding_init == "zeros"
+
+
+def test_the_init_is_recorded_in_the_plan_summary_settings(tmp_path):
+    """run_summary.json's settings come from _plan_summary, not the checkpoint.
+
+    Without this an archived summary cannot say whether its readout was
+    structural -- which is exactly the question job 19852617 left open.
+    """
+
+    args = _validator_args(tmp_path, manifest="m.jsonl")
+    tally = SimpleNamespace(planned=[], skipped=[], skip_counts={}, considered=0,
+                            threshold_skip_fraction=0.0)
+    settings = train_cli._plan_summary(tally, args)["settings"]
+
+    assert settings["time_embedding_init"] == "orthogonal"
+    assert settings["time_embedding_init_scale"] == 0.3
+
+
+def test_the_validator_rejects_an_unusable_init_scale_or_rate(tmp_path):
+    """Parse time, before a cluster node burns a full model load on the flag."""
+
+    for bad in (0, -0.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="time_embedding_init_scale"):
+            train_cli._validate_args(
+                _validator_args(tmp_path, time_embedding_init_scale=bad)
+            )
+
+    # --embedding_lr 0 reproduces the same structurally zero readout by a
+    # different route: the table stays at its init and nothing raises.
+    for bad in (0, -1e-5, float("nan")):
+        with pytest.raises(ValueError, match="embedding_lr"):
+            train_cli._validate_args(_validator_args(tmp_path, embedding_lr=bad))
+        with pytest.raises(ValueError, match="encoder_lr"):
+            train_cli._validate_args(_validator_args(tmp_path, encoder_lr=bad))
+
+    # None is the parser default and means "follow --lr"; it must stay allowed.
+    train_cli._validate_args(
+        _validator_args(tmp_path, embedding_lr=None, encoder_lr=None)
+    )
+    train_cli._validate_args(
+        _validator_args(tmp_path, embedding_lr=2e-5, encoder_lr=3e-6)
     )
 
 
@@ -1174,11 +1464,7 @@ def test_val_scenes_without_a_val_root_is_refused_at_parse_time(tmp_path, monkey
 def test_the_val_flag_pair_is_checked_by_the_argument_validator(tmp_path):
     """And the unit underneath, so the message itself is pinned."""
 
-    args = _loop_args(
-        tmp_path, val_scenes_file="val.json", val_data_root=None,
-        min_views=2, max_time_indices=32, max_unreplayable_fraction=0.02,
-        max_records=None, val_cameras=[0, 1, 2, 3],
-    )
+    args = _validator_args(tmp_path, val_scenes_file="val.json", val_data_root=None)
 
     with pytest.raises(ValueError, match="--val_scenes_file needs --val_data_root"):
         train_cli._validate_args(args)
@@ -1695,6 +1981,10 @@ def _validator_args(tmp_path, **overrides):
         "val_scenes_file": None,
         "val_data_root": None,
         "val_cameras": [0, 1, 2, 3],
+        # Optional rates: None means "follow --lr", which is what the parser
+        # defaults to and the only value that skips the finite/positive check.
+        "embedding_lr": None,
+        "encoder_lr": None,
     }
     merged.update(overrides)
     return _loop_args(tmp_path, **merged)
