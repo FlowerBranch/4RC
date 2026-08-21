@@ -566,10 +566,16 @@ def evaluate_held_out(
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
-    ``query_anchors`` is the run's canonical anchor spec (the ``VIEWSLOT:TIMESLOT``
-    strings), recorded in the metrics so an eval curve is never read against the
-    wrong supervision scheme; the scenes themselves already carry the resolved
-    anchors, because the same provider instance serves training and eval.
+    ``query_anchors`` is the spec the held-out window actually seats (the
+    canonical ``VIEWSLOT:TIMESLOT`` strings), recorded in the metrics so an eval
+    curve is never read against the wrong supervision scheme; the scenes
+    themselves already carry the resolved anchors, because the same provider
+    instance serves training and eval.  What SEATED, not what was asked for:
+    under ``--adaptive_query_anchors`` the run's spec is a ceiling sized for the
+    training stream's 2-6 views, and the fixed held-out window drops whatever it
+    cannot hold -- so recording the full spec here would label the curve with
+    supervision this eval never applied.  The two are identical whenever the
+    whole spec fits the window, which is every non-adaptive run.
 
     Two things are restored afterwards, and both matter. The **RNG streams**,
     because an eval that consumed randomness would shift every subsequent
@@ -1222,7 +1228,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         nargs="+",
         default=[0, 1, 2, 3],
-        help="Cameras for the held-out window; kubric-multiview-v3-views0123 (default: %(default)s)",
+        help=(
+            "Cameras for the held-out window; kubric-multiview-v3-views0123. "
+            "Under --adaptive_query_anchors this count also caps the eval's "
+            "anchors, because the window drops every slot it cannot seat, so a "
+            "resume that changes it is refused: it would move what the curve "
+            "measures while the step counter continues (default: %(default)s)"
+        ),
     )
     return parser
 
@@ -1300,26 +1312,48 @@ def _validate_args(args: argparse.Namespace) -> None:
         # The held-out window derives purely from flags, so its seating is
         # checkable here rather than at plan time.
         #
-        # Strict in BOTH modes, unlike the view-slot check above. That window is
-        # one fixed shape for the whole run rather than a stream of them, so an
-        # anchor it cannot seat is a typo and never a step property; and
-        # eval/*/metrics.json records the run's full spec as `query_anchors`, so
-        # dropping one silently would label the curve with supervision the eval
-        # never applied.
+        # Strict under a contract, adaptive under a ceiling -- the same split the
+        # flag makes everywhere else. Without --adaptive_query_anchors the window
+        # is one fixed shape the whole spec must fit, so an anchor it cannot seat
+        # is a typo and both messages below name it. With the flag the spec is
+        # deliberately wider than any single window -- the manifest's steps carry
+        # 2-6 views against a 4-camera held-out window -- so an unseatable val
+        # slot is expected rather than a typo, and _val_anchor_slots drops it
+        # exactly as resolve_query_anchors drops it for a 2-view training step.
+        # What is left to refuse is a spec that seats NOTHING: an eval that
+        # supervises nothing produces no curve, which mirrors the training-side
+        # rule that at least one slot must seat on every step.
+        #
+        # What used to make this strict in both modes was that
+        # eval/*/metrics.json recorded the run's full spec as `query_anchors`, so
+        # a dropped slot would label the curve with supervision the eval never
+        # applied. That is discharged rather than lifted: the eval now records
+        # _val_anchor_slots, which is what actually seated.
         val_times = _val_time_count(args)
-        for view_slot, time_slot in anchor_slots:
-            if view_slot >= len(args.val_cameras):
+        if args.adaptive_query_anchors:
+            if not _val_anchor_slots(args):
                 raise ValueError(
-                    f"--query_anchors view slot {view_slot} does not fit the "
-                    f"held-out window's {len(args.val_cameras)} cameras "
-                    "(--val_cameras)"
+                    "no --query_anchors slot fits the held-out window's "
+                    f"{len(args.val_cameras)} cameras (--val_cameras) x "
+                    f"{val_times} times (--observation_budget // "
+                    "len(--val_cameras), capped by --max_time_indices), so "
+                    "--adaptive_query_anchors would drop every one of them and "
+                    "the eval would supervise nothing"
                 )
-            if time_slot >= val_times:
-                raise ValueError(
-                    f"--query_anchors time slot {time_slot} does not fit the "
-                    f"held-out window's {val_times} times (--observation_budget "
-                    "// len(--val_cameras), capped by --max_time_indices)"
-                )
+        else:
+            for view_slot, time_slot in anchor_slots:
+                if view_slot >= len(args.val_cameras):
+                    raise ValueError(
+                        f"--query_anchors view slot {view_slot} does not fit the "
+                        f"held-out window's {len(args.val_cameras)} cameras "
+                        "(--val_cameras)"
+                    )
+                if time_slot >= val_times:
+                    raise ValueError(
+                        f"--query_anchors time slot {time_slot} does not fit the "
+                        f"held-out window's {val_times} times (--observation_budget "
+                        "// len(--val_cameras), capped by --max_time_indices)"
+                    )
     # Canonical form, recorded everywhere the spec is recorded: format-only
     # normalization ("01:00" becomes "1:0"), order preserved -- the order is
     # stream-defining (see parse_query_anchor_slots).
@@ -1374,6 +1408,16 @@ def _plan_summary(tally, args) -> dict:
             "excluded_data_roots": list(args.exclude_data_root),
             "query_anchors": list(args.query_anchors),
             "adaptive_query_anchors": bool(args.adaptive_query_anchors),
+            # What the held-out window seats out of the spec above, which under
+            # --adaptive_query_anchors is a subset: the spec is sized for the
+            # training stream's 2-6 views while the eval window is one fixed
+            # shape. Named so it cannot be read back as a flag. None rather than
+            # [] when there is no held-out set at all, because "no window to seat
+            # anything" and "a window that seats nothing" are different facts --
+            # and the second one cannot reach here, _validate_args refuses it.
+            "realized_val_query_anchors": (
+                _val_anchor_spec(args) if args.val_scenes_file else None
+            ),
             # Recorded because an unseeded table makes --time_indices inert and
             # the shuffled-index arm identical to the plain one: without this an
             # archived summary cannot say whether its readout was structural.
@@ -1548,6 +1592,11 @@ def run_training(
     # <=~260ms per scene against a load already costing seconds.
     from arc.training import build_anchor_correspondences
 
+    # What the held-out window actually seats, computed once: flags alone decide
+    # it and flags do not move mid-run. Under --adaptive_query_anchors this is a
+    # subset of args.query_anchors, and it is what the eval applies -- so it is
+    # what the refusal below names and what every metrics.json records.
+    val_anchors = _val_anchor_spec(args) if val_plans else []
     unsupervisable: list[dict] = []
     for plan in val_plans or []:
         val_scene = scene_provider(plan)
@@ -1561,7 +1610,7 @@ def run_training(
         if len(unsupervisable) == len(val_plans):
             raise RuntimeError(
                 f"None of the {len(val_plans)} held-out scenes can be supervised "
-                f"under --query_anchors {list(args.query_anchors)}, so the run "
+                f"under the anchors its window seats, {val_anchors}, so the run "
                 "would produce no held-out curve. The eligibility split for "
                 f"{unsupervisable[0]['scene']} says why: of "
                 f"{unsupervisable[0]['eligibility']['total_query_count']} queries, "
@@ -1704,7 +1753,7 @@ def run_training(
                 huber_delta_m=args.huber_delta_m,
                 step=completed,
                 output_dir=output_dir,
-                query_anchors=args.query_anchors,
+                query_anchors=val_anchors,
             )
             evaluations.append(metrics)
             print(
@@ -1770,6 +1819,12 @@ def _checkpoint_settings(args) -> dict:
         # Half of what the spec means: the same strings supervise a different
         # set of observations depending on whether a step may drop from them.
         "adaptive_query_anchors": bool(args.adaptive_query_anchors),
+        # The held-out window's shape, and under --adaptive_query_anchors also
+        # the eval's anchor count, since the window drops every slot it cannot
+        # seat. A list rather than a set: the order decides which camera is slot
+        # 0 and therefore owns the eval's Sim(3). Stored as a list for the same
+        # reason query_anchors is.
+        "val_cameras": list(args.val_cameras),
         "kubric_max_depth": float(args.kubric_max_depth),
         # Where the time-index table started. Coerced like kubric_max_depth so a
         # value round-tripped through torch.load(weights_only=True) compares
@@ -1814,7 +1869,10 @@ def _write_checkpoint(model, optimizer, scaler, base_learning_rates, *, step, ou
 # supervises and how the loss reduces over them (query_anchors, plus
 # adaptive_query_anchors, which decides whether those slots bind on every step
 # or only where they fit -- the same strings supervise a different set of
-# observations either way), where the time-index table started
+# observations either way), what the held-out curve measures (val_cameras: since
+# the window drops every slot it cannot seat, this count IS the eval's anchor
+# count under a ceiling, so changing it between segments moves the measurement
+# while the step counter continues), where the time-index table started
 # (time_embedding_init and its scale -- a different init is a different set of
 # per-index offsets, so the encoder is conditioned differently from step 0 and
 # every weight downstream of it descends from that), or the numerics under the
@@ -1835,6 +1893,7 @@ _RESUME_SETTINGS_REFUSED = (
     "excluded_data_roots",
     "query_anchors",
     "adaptive_query_anchors",
+    "val_cameras",
     "kubric_max_depth",
     "time_embedding_init",
     "time_embedding_init_scale",
@@ -2107,7 +2166,15 @@ def main() -> None:
     )
     val_plans = _val_plans(args)
     if val_plans:
-        print(f"held_out_scenes={len(val_plans)} at --eval_every {args.eval_every}")
+        # anchors=SEATED/ASKED, so a spec deliberately wider than the held-out
+        # window is readable from the log at step 0 rather than from an eval
+        # directory that does not exist until the first boundary.
+        realized = _val_anchor_spec(args)
+        print(
+            f"held_out_scenes={len(val_plans)} "
+            f"anchors={len(realized)}/{len(args.query_anchors)} "
+            f"at --eval_every {args.eval_every}"
+        )
 
     output_dir = Path(args.output_dir)
     result = run_training(
@@ -2223,6 +2290,40 @@ def _val_time_count(args) -> int:
     return min(
         args.observation_budget // len(args.val_cameras), args.max_time_indices
     )
+
+
+def _val_anchor_slots(args) -> tuple[tuple[int, int], ...]:
+    """The slots the held-out window actually seats, purely from flags.
+
+    Factored out beside :func:`_val_time_count` for the reason its docstring
+    gives: the parse-time check and the thing it vouches for must not drift.
+    This is ``resolve_query_anchors``'s adaptive branch expressed on the one
+    window ``_val_plans`` builds -- the same drop rule, decided by flags alone,
+    so it is answerable under ``--plan_only`` and before any scene loads.
+
+    Order is preserved, because it is stream-defining: the first surviving slot
+    is primary and owns the Sim(3).
+    """
+
+    val_times = _val_time_count(args)
+    return tuple(
+        (view_slot, time_slot)
+        for view_slot, time_slot in parse_query_anchor_slots(args.query_anchors)
+        if view_slot < len(args.val_cameras) and time_slot < val_times
+    )
+
+
+def _val_anchor_spec(args) -> list[str]:
+    """:func:`_val_anchor_slots` in the canonical ``VIEWSLOT:TIMESLOT`` strings.
+
+    The eval records these, the preflight's refusal names them and the plan
+    summary carries them; formatting them at each site is exactly the drift this
+    pair exists to prevent.
+    """
+
+    return [
+        f"{view_slot}:{time_slot}" for view_slot, time_slot in _val_anchor_slots(args)
+    ]
 
 
 def _val_plans(args) -> list[StepPlan]:

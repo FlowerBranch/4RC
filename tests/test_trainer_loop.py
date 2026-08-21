@@ -32,7 +32,7 @@ import torch.nn as nn
 
 import train_temporal_tracking as train_cli
 from arc.training.predictions import PREDICTION_KEYS
-from arc.training.scene_provider import SceneProviderError
+from arc.training.scene_provider import MVTrackerSceneProvider, SceneProviderError
 from arc.training.manifest_plan import StepPlan
 from arc.training.schedule import (
     apply_learning_rate,
@@ -225,6 +225,10 @@ def _loop_args(tmp_path, **overrides):
         # The spec's other half, stored alongside it: off is the per-run
         # contract every existing test assumes.
         adaptive_query_anchors=False,
+        # The held-out window's cameras, the parser's default. Stored and
+        # refused on resume like the spec, and run_training reads it to work out
+        # which slots that window seats; every loop test needs it present.
+        val_cameras=[0, 1, 2, 3],
         # Where the time-index table started. _checkpoint_settings stores both
         # and check_resume_settings refuses a change, so every loop test needs
         # them present; these are the parser's defaults.
@@ -476,6 +480,34 @@ def test_a_resume_that_changes_the_anchor_spec_is_refused(tmp_path):
         train_cli._checkpoint_settings(_loop_args(tmp_path, query_anchors=["0:0", "1:0"])),
         _loop_args(tmp_path, query_anchors=["0:0", "1:0"]),
     )
+
+
+def test_a_resume_that_changes_the_held_out_cameras_is_refused(tmp_path):
+    """--val_cameras stopped being only the window's shape.
+
+    Under --adaptive_query_anchors the window drops every slot it cannot seat,
+    so this count IS the eval's anchor count: a second segment run under fewer
+    cameras would keep extending one held-out curve while measuring something
+    narrower, with the step counter continuing and nothing saying so. Order is
+    refused too, because the first surviving slot owns the eval's Sim(3).
+    """
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    assert stored["val_cameras"] == [0, 1, 2, 3]
+
+    with pytest.raises(RuntimeError, match="val_cameras") as excinfo:
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, val_cameras=[0, 1])
+        )
+    assert "[0, 1, 2, 3]" in str(excinfo.value) and "[0, 1]" in str(excinfo.value)
+
+    with pytest.raises(RuntimeError, match="val_cameras"):
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, val_cameras=[3, 2, 1, 0])
+        )
+
+    # The same window continues.
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
 
 
 # ------------------------------------------------- time-index embedding seed ---
@@ -1578,7 +1610,10 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
         # The distinctive spec pins that the loop hands the eval THE RUN'S
         # spec rather than a constant: the eval records it verbatim, and the
         # scene's own anchors are the provider's business, so the mismatch
-        # with this test's single-anchor scenes is deliberate.
+        # with this test's single-anchor scenes is deliberate. 3:1 fits the
+        # held-out window whole (4 cameras x 12 times), so what seated equals
+        # what was asked for and this assertion is the same as before the
+        # window learned to drop.
         args=_loop_args(tmp_path, num_steps=4, eval_every=2, query_anchors=["3:1"]),
         scene_provider=provider,
         # The model here is a _FakeArc, for the real eval; the recording step_fn
@@ -1604,6 +1639,63 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
     assert written["query_anchors"] == ["3:1"], (
         "the loop must record the run's own spec, not a constant"
     )
+
+
+def test_the_eval_records_the_anchors_the_held_out_window_actually_seated(
+    tmp_path, monkeypatch
+):
+    """Reason (b), discharged where it lives.
+
+    Letting the held-out window drop a slot is only safe because the curve stops
+    being labelled with supervision the eval never applied. A 6-slot spec against
+    a 4-camera window must land in metrics.json as the four that seated -- and
+    the same run under a spec the window holds whole must record exactly what it
+    records today, which is the other half of the same guarantee.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    val = [plan_record(_record(seq_name="0000"), budget=48, stride=2)]
+    wide = ["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"]
+
+    def run(directory, **overrides):
+        model = _FakeArc(scene.num_observations, height, width)
+        train_cli.run_training(
+            model=model,
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=_plans(4),
+            args=_loop_args(directory, num_steps=4, eval_every=4, **overrides),
+            scene_provider=lambda _plan: scene,
+            step_fn=lambda *, step, plan, **_: train_cli.StepOutcome(
+                step=step, seq_name=plan.seq_name, loss=0.0, metric_error_m=0.0,
+                sample_count=1, alignment_scale=1.0, alignment_residual_m=0.0,
+                learning_rates=[1e-3], gradient_norms={},
+            ),
+            output_dir=directory,
+            val_plans=val,
+        )
+        return json.loads(
+            (directory / "eval" / "step-4" / "metrics.json").read_text()
+        )
+
+    written = run(
+        tmp_path / "wide", query_anchors=wide, adaptive_query_anchors=True
+    )
+    assert written["query_anchors"] == ["0:0", "1:0", "2:0", "3:0"], (
+        "the four the 4-camera window seated, not the six that were asked for"
+    )
+
+    # A spec the window holds whole records identically under both modes, which
+    # is what keeps every non-adaptive run's artifacts where they were.
+    fits = ["0:0", "1:0"]
+    for name, adaptive in (("strict", False), ("ceiling", True)):
+        written = run(
+            tmp_path / name, query_anchors=fits, adaptive_query_anchors=adaptive
+        )
+        assert written["query_anchors"] == fits, name
 
 
 # ----------------------------------------- multi-anchor query supervision ---
@@ -1980,7 +2072,6 @@ def _validator_args(tmp_path, **overrides):
         "max_records": None,
         "val_scenes_file": None,
         "val_data_root": None,
-        "val_cameras": [0, 1, 2, 3],
         # Optional rates: None means "follow --lr", which is what the parser
         # defaults to and the only value that skips the finite/positive check.
         "embedding_lr": None,
@@ -2027,20 +2118,106 @@ def test_adaptive_admits_a_view_slot_min_views_cannot_guarantee(tmp_path):
         )
 
 
-def test_the_held_out_seating_check_stays_strict_under_adaptive(tmp_path):
-    """The val window is one fixed shape for the whole run, not a stream of
-    them, so an anchor it cannot seat is a typo rather than a step property --
-    and eval/*/metrics.json records the run's full spec as `query_anchors`, so
-    dropping one there would label the curve with supervision never applied."""
+def test_adaptive_seats_what_the_held_out_window_holds_and_drops_the_rest(tmp_path):
+    """The case this whole change exists for, and the run job 19857965 died on.
 
+    Each step's camera count decides its anchor count, so the spec is as wide as
+    the manifest's widest step -- 6 views -- while the held-out window is a fixed
+    4 cameras. Under a ceiling an unseatable val slot is expected rather than a
+    typo, and the guard that used to refuse it rested on eval/*/metrics.json
+    recording the full spec; the eval now records what seated, so the reason is
+    gone.
+
+    The provider call is the substance here, not a garnish. resolve_query_anchors
+    is the single anchor-resolution path every plan goes through, training and
+    held-out alike, and asserting it against the flag-only helper is what proves
+    the two cannot drift -- which is the only thing making the parse-time verdict
+    trustworthy.
+    """
+
+    scenes = tmp_path / "val.json"
+    scenes.write_text(json.dumps(["0000"]))
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"],
+        min_views=2,
+        adaptive_query_anchors=True,
+        val_scenes_file=str(scenes),
+        val_data_root="/held",
+    )
+
+    train_cli._validate_args(args)
+    assert args.query_anchors == ["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"], (
+        "the spec is recorded whole; only what the window seats is narrowed"
+    )
+    assert train_cli._val_anchor_slots(args) == ((0, 0), (1, 0), (2, 0), (3, 0))
+
+    # The WINDOW is untouched -- 4 cameras x 12 times, exactly as before. This
+    # change moves which anchors resolve inside it, never the window itself.
+    plan = train_cli._val_plans(args)[0]
+    assert len(plan.cameras) == 4 and len(plan.times) == 12
+    provider = MVTrackerSceneProvider(
+        query_anchor_slots=train_cli.parse_query_anchor_slots(args.query_anchors),
+        adaptive_query_anchors=True,
+    )
+    assert provider.resolve_query_anchors(plan) == ((0, 0), (1, 0), (2, 0), (3, 0)), (
+        "the provider seats the same four the parse-time helper promised"
+    )
+
+    # The same drop rule on the time axis: 48 observations over 4 val cameras
+    # seat 12 times, so slot 12 does not exist and adaptive drops it too.
     args = _validator_args(
         tmp_path,
         query_anchors=["0:0", "0:12"],
+        adaptive_query_anchors=True,
+        val_scenes_file=str(scenes),
+        val_data_root="/held",
+    )
+    train_cli._validate_args(args)
+    assert train_cli._val_anchor_slots(args) == ((0, 0),)
+
+
+def test_a_held_out_window_that_seats_no_anchor_at_all_is_refused(tmp_path):
+    """Adaptive drops what the window cannot hold, but not down to nothing.
+
+    An eval that seats no anchor supervises nothing and writes a null loss at
+    every boundary, producing no curve -- the held-out mirror of the
+    training-side rule that at least one slot must seat on every planned step.
+    """
+
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["5:0"],
+        min_views=6,
+        adaptive_query_anchors=True,
         val_scenes_file="val.json",
         val_data_root="/held",
-        adaptive_query_anchors=True,
     )
-    with pytest.raises(ValueError, match="held-out window"):
+    with pytest.raises(ValueError, match="the eval would supervise nothing"):
+        train_cli._validate_args(args)
+
+
+def test_the_held_out_seating_check_stays_strict_without_the_flag(tmp_path):
+    """Job 19857965's exact refusal, still fatal under a contract.
+
+    Without --adaptive_query_anchors the spec is a promise about one fixed
+    window, so a slot that window cannot seat is a typo and nothing else --
+    --min_views is a per-step floor on the TRAINING stream and cannot speak for
+    the held-out one.
+    """
+
+    args = _validator_args(
+        tmp_path,
+        query_anchors=["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"],
+        # High enough that the --min_views check passes, so the val check is what
+        # fires rather than being masked by the earlier one.
+        min_views=6,
+        val_scenes_file="val.json",
+        val_data_root="/held",
+    )
+    with pytest.raises(
+        ValueError, match=r"view slot 4 does not fit the held-out window's 4 cameras"
+    ):
         train_cli._validate_args(args)
 
 
@@ -2270,7 +2447,65 @@ def test_the_default_anchor_spec_plans_exactly_as_before(tmp_path, monkeypatch, 
     train_cli.main()
 
     assert "PASS planned 2 steps" in capsys.readouterr().out
-    assert json.loads(out.read_text())["settings"]["query_anchors"] == ["0:0"]
+    settings = json.loads(out.read_text())["settings"]
+    assert settings["query_anchors"] == ["0:0"]
+    # No held-out set, so there is no window to seat anything -- distinct from a
+    # window that seats nothing, which _validate_args refuses outright.
+    assert settings["realized_val_query_anchors"] is None
+
+
+def test_a_wide_adaptive_spec_plans_against_a_narrower_held_out_window(
+    tmp_path, monkeypatch, capsys
+):
+    """The submit-time check the cluster run was blocked on, end to end.
+
+    The manifest's steps carry 2-6 views and the held-out window a fixed 4
+    cameras, so the spec is deliberately wider than that window. It must plan
+    GPU-free, and the summary must say both things: the six that were asked for,
+    and the four the eval will actually seat.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [
+        _record(step=0, seq_name="0000", views=[0, 1, 2, 3, 4, 5]),
+        _record(step=1, seq_name="0001", views=[0, 1]),
+    ]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    scenes = tmp_path / "val.json"
+    scenes.write_text(json.dumps(["9000", "9001"]))
+    out = tmp_path / "plan.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "train_temporal_tracking.py",
+            "--manifest",
+            str(manifest),
+            "--plan_only",
+            "--json_out",
+            str(out),
+            "--adaptive_query_anchors",
+            "--query_anchors",
+            "0:0",
+            "1:0",
+            "2:0",
+            "3:0",
+            "4:0",
+            "5:0",
+            "--val_scenes_file",
+            str(scenes),
+            "--val_data_root",
+            "/held",
+        ],
+    )
+
+    train_cli.main()
+
+    assert "PASS planned 2 steps" in capsys.readouterr().out
+    settings = json.loads(out.read_text())["settings"]
+    assert settings["query_anchors"] == ["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"]
+    assert settings["realized_val_query_anchors"] == ["0:0", "1:0", "2:0", "3:0"]
 
 
 def test_the_anchor_spec_is_recorded_in_the_checkpoint_settings(tmp_path):
