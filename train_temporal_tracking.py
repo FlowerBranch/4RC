@@ -149,15 +149,13 @@ class StepOutcome:
     peak_bytes: int = 0
     confidence: dict | None = None
     eligibility: dict | None = None
-    # How many anchors this step realized, which under
-    # --adaptive_query_anchors is a property of the step rather than of the
-    # spec. Two numbers, because they answer different questions: `anchor_count`
-    # is what the step's window seated, `active_anchor_count` is how many of
-    # those reached a supervised sample. A slot dropped for not fitting and one
-    # seated but empty are different findings with different remedies. None from
+    # Supervised samples per seated anchor, in spec order. Length is what the
+    # step's window seated -- a property of the step, not the spec, under
+    # --adaptive_query_anchors. A zero entry is an anchor that seated and won
+    # nothing, which best-fit assignment allows even at one shared anchor time
+    # (test_best_fitting_anchor_wins_over_an_earlier_worse_one). None from
     # injected step functions, like `eligibility`.
-    anchor_count: int | None = None
-    active_anchor_count: int | None = None
+    anchor_sample_counts: list[int] | None = None
     # The step's unweighted per-term values, share-combined across its anchors:
     # what says whether the chosen weights actually balance the terms, since
     # position and confidence differ by orders of magnitude at their natural
@@ -451,7 +449,12 @@ def train_step(
             "in another camera reaches queries occluded in the first."
         )
     anchor_weights = [count / total_samples for count in sample_counts]
-    active_anchor_count = sum(1 for weight in anchor_weights if weight > 0)
+    # The anchors this step runs, with their shares. A seated anchor with no
+    # supervised sample contributes no gradient, so it is out of the loop, the
+    # shares and the cut decision. Never empty: total_samples == 0 raised above.
+    active_anchors = [
+        (index, weight) for index, weight in enumerate(anchor_weights) if weight > 0
+    ]
     # The confidence term reduces over a different (larger) set than the position
     # term -- it deliberately does not mask on visibility -- so it needs its own
     # shares; see anchor_confidence_counts. Computed from the scene alone, like
@@ -479,7 +482,7 @@ def train_step(
         # query_slots are renumbered to 0 and would silently gather anchor 0's
         # pointmaps for every anchor.
         anchors = gather_query_anchor_points(recon, scene, correspondences)
-        if active_anchor_count == 1:
+        if len(active_anchors) == 1:
             # One anchor needs no cut: its backward is the only one and runs
             # straight through the encoder, exactly the pre-multi-anchor graph.
             # The cut is not free — it holds an accumulated .grad on every
@@ -504,9 +507,7 @@ def train_step(
     # outcome, which run_training pins -- by every later step of the run. None
     # here only on the first executed step of an --confidence_alpha auto run.
     step_alpha = confidence_alpha
-    for anchor_index, anchor_weight in enumerate(anchor_weights):
-        if anchor_weight == 0.0:
-            continue
+    for anchor_index, anchor_weight in active_anchors:
         with autocast_context(precision):
             raw = anchor_tracks(model, cut_feats, images, scene, anchor_index)
             if raw["track_multi"].shape[2] != scene.num_observations:
@@ -514,8 +515,8 @@ def train_step(
                     "Output observation axis does not match the scene's inputs"
                 )
             if stats is None:
-                # First *active* anchor: anchor 0 is skipped when it has no
-                # supervised samples, and the log must not go silent for it.
+                # The step's first anchor, not necessarily anchor 0:
+                # active_anchors drops one with no supervised samples.
                 stats = confidence_stats(raw)
             result = sparse_tracking_loss(
                 # conf_track_multi is dropped by default and the confidence term
@@ -557,7 +558,7 @@ def train_step(
                 result,
                 position_weight=anchor_weight,
                 confidence_weight=confidence_weight * confidence_shares[anchor_index],
-                sync_weight=sync_weight / active_anchor_count,
+                sync_weight=sync_weight / len(active_anchors),
             )
         # Backward per anchor, so this anchor's track-head graph is freed
         # before the next one allocates its own; the gradient lands on the cut
@@ -571,7 +572,7 @@ def train_step(
         # step's own means rather than one anchor's. accumulate_weighted passes
         # None through, so a disabled term needs no branch here.
         step_sync_loss = accumulate_weighted(
-            step_sync_loss, result.sync_loss, 1.0 / active_anchor_count
+            step_sync_loss, result.sync_loss, 1.0 / len(active_anchors)
         )
         step_confidence_loss = accumulate_weighted(
             step_confidence_loss,
@@ -644,8 +645,7 @@ def train_step(
         ),
         confidence=stats,
         eligibility=compact_eligibility(eligibility),
-        anchor_count=anchor_count,
-        active_anchor_count=active_anchor_count,
+        anchor_sample_counts=sample_counts,
         loss_breakdown=loss_breakdown,
         confidence_alpha=step_alpha,
         confidence_dropped=step_confidence_dropped,
@@ -1705,7 +1705,9 @@ def open_step_history(output_dir, *, start_step: int) -> Path:
 
     A killed segment leaves records for steps whose gradients were rolled back to
     the last checkpoint, so a resume truncates at its own start step rather than
-    appending a second, contradictory record for the same step.
+    appending a second, contradictory record for the same step. It reads only
+    ``step`` and rewrites survivors verbatim, so nothing here migrates an earlier
+    segment's rows -- hence the add-only column set in `append_step_history`.
     """
 
     path = Path(output_dir) / "history.jsonl"
@@ -1731,10 +1733,24 @@ def append_step_history(path: Path, outcome: StepOutcome) -> None:
     survives a `kill -9` at the wall clock, which a buffered handle held across
     the loop would not. One open per step is nothing against a step measured in
     seconds of GPU work.
+
+    `anchor_count` and `active_anchor_count` are derived here, not fields: they
+    were superseded by `anchor_sample_counts`, but a resume appends without
+    rewriting earlier rows, so dropping them mid-run splits one file into two
+    shapes. Delete them and their assertion in
+    `test_every_step_is_flushed_to_the_history_file` once no unfinished run has
+    rows from before this landed -- "will append again", not "running now": a
+    run stopped on SIGUSR1 still has thousands of steps to write.
     """
 
+    record = asdict(outcome)
+    counts = outcome.anchor_sample_counts
+    record["anchor_count"] = None if counts is None else len(counts)
+    record["active_anchor_count"] = (
+        None if counts is None else sum(1 for count in counts if count > 0)
+    )
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(asdict(outcome)) + "\n")
+        handle.write(json.dumps(record) + "\n")
 
 
 def run_training(
@@ -1883,9 +1899,10 @@ def run_training(
     # --adaptive_query_anchors the spec is a ceiling, so what a run supervised
     # is no longer readable off the spec -- these say it instead of leaving it
     # to be inferred. Same scope as eligibility_totals, and the same denominator
-    # rule: a step whose outcome carries no count contributes nothing.
+    # rule: a step whose outcome carries no counts contributes nothing. Seated
+    # only -- whether an anchor supervised nothing is per step, and history.jsonl
+    # already records it exactly, naming the anchor.
     seated_anchor_counts: Counter = Counter()
-    active_anchor_counts: Counter = Counter()
     anchor_count_steps = 0
     # Summed over the run, and warned about ONCE. The overfit warns twice because
     # it scores twice; a 20k-step trainer that warned per step would bury the
@@ -1985,10 +2002,9 @@ def run_training(
                     eligibility_totals["rejected"][stage] = eligibility_totals[
                         "rejected"
                     ].get(stage, 0) + int(count)
-            if outcome.anchor_count is not None:
+            if outcome.anchor_sample_counts is not None:
                 anchor_count_steps += 1
-                seated_anchor_counts[int(outcome.anchor_count)] += 1
-                active_anchor_counts[int(outcome.active_anchor_count)] += 1
+                seated_anchor_counts[len(outcome.anchor_sample_counts)] += 1
             if outcome.confidence_dropped:
                 confidence_dropped_totals.update(outcome.confidence_dropped)
                 if outcome.confidence_dropped.get("total", 0) and not (
@@ -2094,7 +2110,6 @@ def run_training(
         "realized_anchor_counts": {
             "steps_counted": anchor_count_steps,
             "seated": dict(sorted(seated_anchor_counts.items())),
-            "active": dict(sorted(active_anchor_counts.items())),
         },
         # Empty dict rather than None when the term ran and dropped nothing: that
         # is a measurement ("the shares matched the mask all run"), and it reads
@@ -2591,9 +2606,9 @@ def main() -> None:
         # resumed run's totals restart with it.
         "eligibility_totals": result["eligibility_totals"],
         # Same scope, and the companion to settings.query_anchors above: that
-        # says what was asked for, this says what the stream actually seated and
-        # supervised. They differ only under --adaptive_query_anchors, which is
-        # exactly when the spec stops being a readable answer.
+        # says what was asked for, this says what the stream actually seated.
+        # They differ only under --adaptive_query_anchors, which is exactly when
+        # the spec stops being a readable answer.
         "realized_anchor_counts": result["realized_anchor_counts"],
         # Same scope again. Empty when the confidence term ran and dropped
         # nothing, which is a measurement; empty ALSO when the term never ran,

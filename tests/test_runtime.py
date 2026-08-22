@@ -6,22 +6,18 @@ CUDA outright, which made those tests impossible to write at all. And they must
 stay reachable as module globals on the harness, because six tests monkeypatch
 them there by name.
 
-The source-equivalence pin is also here, and it is worth saying why it came back.
-It was retired when ``ef8bcff`` moved the harness out from under its ``95b521a``
-baseline -- correct observation, wrong conclusion. A pin does not need a
-*historical* baseline; it needs one that is stable **going forward**, so that a
-future edit to ``main`` fails a test. And it is now the only mechanical check
-there is: the cluster's ``run_summary.json`` equality diff turned out to be
-impossible, because the training backward is nondeterministic (``atomicAdd`` in
-the scatter and grid-sample backward kernels puts the same commit 6.7e-6 apart
-run to run). A source comparison cannot be touched by that.
+A source-equivalence pin on ``overfit_temporal_tracking.py`` used to live here
+too, comparing every top-level function against a pinned commit. Removed: it
+guarded the one-scene harness, which `4I4/docs/execution.md` records as exhausted
+as an instrument, while ``train_temporal_tracking.py`` -- the program that
+produces every current result -- was never pinned at all. It fired three times,
+each on a deliberate change, each resolved by moving the baseline, and caught
+nothing; meanwhile each extraction into ``arc/training/runtime.py`` shrank the
+surface it still covered. If a mechanical check comes back, it belongs on the
+trainer.
 """
 
 from __future__ import annotations
-
-import ast
-import subprocess
-from pathlib import Path
 
 import pytest
 import torch
@@ -31,10 +27,6 @@ import overfit_temporal_tracking as overfit_cli
 from arc.models.arc.arc import Arc
 from arc.training import runtime
 
-
-# The commit `main` is pinned against. Forward-looking: bump it deliberately when
-# a change to the harness is intended, and never to make a red test go green.
-HARNESS_BASELINE = "4697862"
 
 # The helpers the extractions moved out of ``overfit_temporal_tracking.py``. The
 # harness must still expose every one of them as a module global; see below.
@@ -60,47 +52,6 @@ MOVED_TO_RUNTIME = {
     "_encode_and_reconstruct",
     "_weighted_anchor_total",
 }
-
-
-def _top_level_sources(source: str) -> dict[str, str]:
-    tree = ast.parse(source)
-    return {
-        node.name: ast.get_source_segment(source, node)
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-    }
-
-
-def test_no_top_level_harness_function_changed_since_the_pinned_baseline():
-    """The only mechanical check that an edit to the harness was intended.
-
-    Every test in this suite would still pass if someone reordered a step-loop
-    guard, dropped a ``del``, or changed a printed format -- none of ``main``'s
-    guards has a test of its own, and the cluster diff that would have caught it
-    cannot run (see the module docstring). Comparing source segments catches
-    exactly that class, needs no GPU, and is immune to the nondeterminism.
-
-    A red result here is not necessarily a bug: it means the harness changed.
-    Read the diff, and if the change was intended, move ``HARNESS_BASELINE``
-    forward in the same commit that makes it.
-    """
-
-    result = subprocess.run(
-        ["git", "show", f"{HARNESS_BASELINE}:overfit_temporal_tracking.py"],
-        capture_output=True,
-        text=True,
-        cwd=Path(overfit_cli.__file__).parent,
-    )
-    if result.returncode != 0:
-        pytest.skip(f"cannot read {HARNESS_BASELINE} from git: {result.stderr.strip()}")
-
-    before = _top_level_sources(result.stdout)
-    after = _top_level_sources(Path(overfit_cli.__file__).read_text())
-
-    assert set(before) - set(after) == set(), "a harness function was removed"
-    assert set(after) - set(before) == set(), "a harness function was added"
-    changed = sorted(name for name in before if before[name] != after[name])
-    assert changed == [], f"changed since {HARNESS_BASELINE}: {changed}"
 
 
 def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():

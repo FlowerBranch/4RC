@@ -1866,10 +1866,10 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
         step=0,
     )
 
-    # Seated two, supervised one -- the distinction the histogram keeps, and the
-    # reason it carries both numbers rather than one.
-    assert outcome.anchor_count == 2
-    assert outcome.active_anchor_count == 1
+    # Seated two, supervised one, and the record says which: length is what the
+    # window seated, the zero entry is the anchor that reached nothing.
+    assert outcome.anchor_sample_counts == counts
+    assert len(counts) == 2 and counts[1] == 0
     # The denominator is this step's own supervised samples, not the spec's
     # anchor count: the empty anchor contributes to neither sum.
     assert outcome.sample_count == counts[0]
@@ -1971,7 +1971,9 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
     assert outcome.sample_count == sum(counts)
     # Reported by the real step, not just by the injected ones the histogram
     # tests drive: both anchors seated and both supervised something.
-    assert outcome.anchor_count == 2 and outcome.active_anchor_count == 2
+    assert len(outcome.anchor_sample_counts) == 2 and all(
+        outcome.anchor_sample_counts
+    )
     for group in ("time_embedding", "motion_decoder", "track_head"):
         assert outcome.gradient_norms[group] > 0, group
     assert eligibility["per_anchor"][1]["assigned"] >= 1, (
@@ -2200,7 +2202,7 @@ def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(
     }
 
 
-def test_the_sync_share_is_one_over_the_steps_own_active_anchor_count(
+def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(
     tmp_path, monkeypatch
 ):
     """What makes the term safe under --adaptive_query_anchors.
@@ -2209,7 +2211,10 @@ def test_the_sync_share_is_one_over_the_steps_own_active_anchor_count(
     and W come from the window, never from which anchor -- so the stacked-Q mean
     is the plain mean of the per-anchor means and the share is a flat 1/N. The
     property that matters across a stream whose N varies is that the shares sum
-    to the weight at every N, which is asserted at both 1 and 2 active anchors.
+    to the weight at every N, which is asserted at both 1 and 2 supervising
+    anchors. N is len(active_anchors), not the seated count: dividing by what
+    the window seated would undershoot the weight when an anchor seats and
+    supervises nothing.
     """
 
     _, two_anchor, _, _ = _weighted_step(
@@ -3293,29 +3298,26 @@ def test_steps_without_eligibility_reports_leave_the_totals_at_zero(tmp_path):
         "rejected": dict.fromkeys(train_cli.ELIGIBILITY_REJECTION_STAGES, 0),
     }
     # Same rule for the anchor histogram, and the same reason: a step that
-    # reports no count must not be filed as a step that realized zero anchors.
+    # reports no counts must not be filed as a step that realized zero anchors.
     assert result["realized_anchor_counts"] == {
         "steps_counted": 0,
         "seated": {},
-        "active": {},
     }
 
 
 def test_the_realized_anchor_histogram_records_what_each_step_seated(tmp_path):
     """Under --adaptive_query_anchors the spec is a ceiling, so it stops being
-    an answer to "what did this run supervise?" -- these counts are.
+    an answer to "how many anchors did this run realize?" -- this histogram is.
 
-    Seated and active are separate because they fail differently: a slot the
-    step's window could not seat is the clamp working, while a slot seated with
-    no supervised sample is an anchor that reached nothing. Inferring one from
-    the spec and the other from a loss curve is exactly what this replaces.
+    Seated only. Step 2 seats four anchors and one supervises nothing, and it
+    still files under 4: what a step did with them is per step, and
+    history.jsonl already records it as anchor_sample_counts.
     """
 
     train_cli._STOP_REQUESTED.clear()
-    counts = {0: (4, 4), 1: (2, 2), 2: (4, 3), 3: (2, 2)}
+    counts = {0: [5, 5, 5, 5], 1: [5, 5], 2: [5, 5, 0, 5], 3: [5, 5]}
 
     def step_fn(*, plan, learning_rates, step, **_):
-        seated, active = counts[step]
         return train_cli.StepOutcome(
             step=step,
             seq_name=plan.seq_name,
@@ -3326,8 +3328,7 @@ def test_the_realized_anchor_histogram_records_what_each_step_seated(tmp_path):
             alignment_residual_m=0.0,
             learning_rates=list(learning_rates),
             gradient_norms={},
-            anchor_count=seated,
-            active_anchor_count=active,
+            anchor_sample_counts=counts[step],
         )
 
     model = _toy_model()
@@ -3346,11 +3347,10 @@ def test_the_realized_anchor_histogram_records_what_each_step_seated(tmp_path):
     assert result["realized_anchor_counts"] == {
         "steps_counted": 4,
         "seated": {2: 2, 4: 2},
-        "active": {2: 2, 3: 1, 4: 1},
     }
     # Sorted by count, so the histogram reads as a distribution rather than in
     # whatever order the steps happened to arrive.
-    assert list(result["realized_anchor_counts"]["active"]) == [2, 3, 4]
+    assert list(result["realized_anchor_counts"]["seated"]) == [2, 4]
 
 
 def test_a_skipped_scene_load_is_absent_from_the_anchor_histogram(tmp_path):
@@ -3376,8 +3376,7 @@ def test_a_skipped_scene_load_is_absent_from_the_anchor_histogram(tmp_path):
             alignment_residual_m=0.0,
             learning_rates=list(learning_rates),
             gradient_norms={},
-            anchor_count=3,
-            active_anchor_count=3,
+            anchor_sample_counts=[7, 7, 7],
         )
 
     model = _toy_model()
@@ -3612,10 +3611,16 @@ def test_every_step_is_flushed_to_the_history_file(tmp_path, monkeypatch):
     records = _history(tmp_path)
     assert [record["step"] for record in records] == [0, 1, 2]
     # One record per StepOutcome field, under the dataclass's own names, so the
-    # file and the in-memory history cannot drift into two vocabularies.
+    # file and the in-memory history cannot drift into two vocabularies -- plus
+    # the two columns append_step_history derives for resuming runs that predate
+    # anchor_sample_counts. Delete both with that write; see its docstring.
     assert set(records[0]) == {
         field.name for field in dataclasses.fields(train_cli.StepOutcome)
-    }
+    } | {"anchor_count", "active_anchor_count"}
+    assert records[0]["anchor_count"] == len(records[0]["anchor_sample_counts"])
+    assert records[0]["active_anchor_count"] == sum(
+        1 for count in records[0]["anchor_sample_counts"] if count > 0
+    )
     # The two things that were being computed and thrown away.
     assert "clipped_total" in records[0]["gradient_norms"]
     assert records[0]["confidence"] is not None

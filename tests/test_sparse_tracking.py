@@ -4636,14 +4636,16 @@ def test_run_summary_includes_the_anchor_and_eligibility_fields():
         "query_anchors",
         "query_anchor_slots",
         "anchor_count",
-        "active_anchor_count",
         "anchor_sample_counts",
         "anchor_weights",
         "eligibility",
         "view_ids",
         "time_varying_depth",
     } <= written
-    # The pre-existing keys keep their meaning; the rule is still add-only.
+    # The pre-existing keys keep their meaning; add-only, with one exception:
+    # `active_anchor_count` went because a zero in `anchor_sample_counts` above
+    # says it and names the anchor. No script in any repo read the key.
+    assert "active_anchor_count" not in written
     assert _BASELINE_RUN_SUMMARY_FIELDS <= written
 
 

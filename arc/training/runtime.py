@@ -427,15 +427,13 @@ def weighted_anchor_total(
     that anchor's share of the supervised samples and the sync weight is its
     share of the anchors.
 
-    One scope limit on that equivalence.  The sync share is
-    ``1 / active_anchor_count``, not ``1 / anchor_count``, so the objective
-    reproduced is a stacked forward over the **active** anchors.  A declared
-    anchor that supervises nothing is skipped entirely, and against the
-    ``Q = anchor_count`` reference ``_evaluate`` computes, its dense field would
-    have contributed a sync term this does not include.  Weighting by the active
-    count is the defensible choice -- an anchor with no supervised query still
-    has a displacement field, but nothing here has any evidence about it -- but
-    it does mean the two numbers differ in that case.
+    One scope limit on that equivalence.  The sync share is one over the anchors
+    that actually run, not over the count the window seated, so the objective
+    reproduced is a stacked forward over the **supervising** anchors.  A declared
+    anchor that supervises nothing is skipped entirely, and against the reference
+    ``_evaluate`` computes over every seated anchor, its dense field would have
+    contributed a sync term this does not include -- defensibly, since nothing
+    here has evidence about that field, but the two objectives do differ then.
 
     Terms are inserted in the same order ``sparse_tracking_loss`` uses, because
     ``compose_tracking_loss`` sums in insertion order and float addition is not

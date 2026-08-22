@@ -1013,7 +1013,12 @@ def main() -> None:
     anchor_weights = [
         count / total_anchor_samples for count in anchor_sample_counts
     ]
-    active_anchor_count = sum(1 for weight in anchor_weights if weight > 0)
+    # The anchors each step runs, with their shares. A declared anchor with no
+    # supervised sample contributes no gradient, so it is out of the loop, the
+    # shares and the cut decision.
+    active_anchors = [
+        (index, weight) for index, weight in enumerate(anchor_weights) if weight > 0
+    ]
     # The confidence term reduces over a different (larger) set than the
     # position term, so it needs its own shares; see _anchor_confidence_counts.
     anchor_confidence_counts = _anchor_confidence_counts(
@@ -1029,7 +1034,7 @@ def main() -> None:
     print(
         "anchor_sample_counts="
         f"{anchor_sample_counts} (total {total_anchor_samples}); "
-        f"active_anchors={active_anchor_count}/{anchor_count}"
+        f"active_anchors={len(active_anchors)}/{anchor_count}"
     )
     initial_query_anchors = gather_query_anchor_points(
         baseline_raw,
@@ -1211,7 +1216,7 @@ def main() -> None:
                 scene,
                 correspondences,
             )
-            if active_anchor_count == 1:
+            if len(active_anchors) == 1:
                 # One anchor needs no cut: its backward is the only one, so it
                 # can run straight through the encoder as it did before. The cut
                 # is not free -- it holds an accumulated .grad on every backbone
@@ -1227,9 +1232,7 @@ def main() -> None:
         step_metric_error = None
         step_confidence_loss = None
         step_sync_loss = None
-        for anchor_index, anchor_weight in enumerate(anchor_weights):
-            if anchor_weight == 0.0:
-                continue
+        for anchor_index, anchor_weight in active_anchors:
             anchor_correspondences = per_anchor_correspondences[anchor_index]
             with _autocast_context(args.precision):
                 raw = _anchor_tracks(model, cut_feats, images, scene, anchor_index)
@@ -1266,7 +1269,7 @@ def main() -> None:
                         args.confidence_weight
                         * anchor_confidence_weights[anchor_index]
                     ),
-                    sync_weight=args.sync_weight / active_anchor_count,
+                    sync_weight=args.sync_weight / len(active_anchors),
                 )
 
             # Backward per anchor, so this anchor's track-head graph is freed
@@ -1287,7 +1290,7 @@ def main() -> None:
             step_sync_loss = _accumulate(
                 step_sync_loss,
                 result.sync_loss,
-                1.0 / active_anchor_count,
+                1.0 / len(active_anchors),
             )
             del raw, result, anchor_total
 
@@ -1365,7 +1368,7 @@ def main() -> None:
             else f" grad_encoder={last_gradient_norms['encoder_blocks']:.6g}"
         )
         anchor_log = (
-            "" if active_anchor_count == 1 else f" anchors={active_anchor_count}"
+            "" if len(active_anchors) == 1 else f" anchors={len(active_anchors)}"
         )
         # The per-step drift watch: the alignment is refit each step anyway,
         # so its scale and residual are free, and a trending scale or residual
@@ -1569,9 +1572,9 @@ def main() -> None:
         "query_anchors": [list(pair) for pair in scene.query_anchors],
         "query_anchor_slots": list(scene.anchor_observation_slots),
         "anchor_count": anchor_count,
-        "active_anchor_count": active_anchor_count,
         # Each anchor's share of the supervised samples: the weights that make
-        # per-anchor backward equal one combined mean.
+        # per-anchor backward equal one combined mean. A zero entry is a declared
+        # anchor that supervised nothing, which retired active_anchor_count.
         "anchor_sample_counts": anchor_sample_counts,
         "anchor_weights": anchor_weights,
         # The confidence term does not mask on visibility, so it reduces over a
