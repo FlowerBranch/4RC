@@ -21,6 +21,7 @@ from arc.models.arc.arc import Arc
 from arc.training import (
     DetachedSim3,
     SparseCorrespondences,
+    adjacent_pair_indices,
     SparseTrackingLossResult,
     build_anchor_correspondences,
     fit_scene_sim3,
@@ -41,6 +42,7 @@ from arc.training import (
     ELIGIBILITY_ROLLUP_RULE,
     sparse_targets,
 )
+from arc.training.runtime import anchor_velocity_counts
 from arc.training.dumped_kubric import compute_image_transform
 
 
@@ -3048,6 +3050,98 @@ def test_sparse_loss_sync_term_composes_and_defaults_off(dumped_scene):
     assert set(with_sync.loss_breakdown) == {"position", "sync"}
 
 
+def test_sparse_loss_velocity_term_composes_and_defaults_off(dumped_scene):
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    _, raw = _shared_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    base = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+    )
+    with_velocity = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        velocity_weight=0.5,
+    )
+
+    # Default path untouched: no velocity graph is built at weight 0.
+    assert base.velocity_loss is None
+    assert base.velocity_pair_count is None
+    assert base.total_loss is base.loss
+
+    assert with_velocity.velocity_loss is not None
+    assert with_velocity.velocity_loss.item() > 0
+    assert with_velocity.velocity_pair_count > 0
+    torch.testing.assert_close(with_velocity.loss, base.loss)
+    torch.testing.assert_close(
+        with_velocity.total_loss,
+        with_velocity.loss + 0.5 * with_velocity.velocity_loss,
+    )
+    assert set(with_velocity.loss_breakdown) == {"position", "velocity"}
+
+
+def test_the_velocity_residual_is_reported_at_weight_zero(dumped_scene):
+    """The whole point of putting it before the fast path.
+
+    --confidence_weight was trained with no observable that could see it. A term
+    measurable without being trained lets a weight-0 run record the baseline, so
+    turning the term on can be judged rather than hoped about.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    _, raw = _shared_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    off = sparse_tracking_loss(
+        raw, dumped_scene, correspondences, _identity_alignment(), anchors
+    )
+    assert off.velocity_loss is None, "not trained"
+    assert off.velocity_stats is not None, "but measured"
+    assert off.velocity_stats["mean_m"] >= 0.0
+    # 2 cameras x 4 times, paired within each camera: 2 * (4 - 1).
+    assert off.velocity_stats["pair_count"] == 6
+
+    # And skipped entirely when the caller says it is not reading diagnostics --
+    # which is what every training step says.
+    stepwise = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        collect_diagnostics=False,
+    )
+    assert stepwise.velocity_stats is None
+
+
+def test_velocity_pairs_never_span_two_cameras(dumped_scene):
+    """Eq. 8 is monocular, and an ungrouped pair would smuggle sync in.
+
+    A cross-camera pair equals the same-camera velocity plus the
+    synchronized-consistency residual at the later time. The scene here is
+    camera-major 2x4, so grouping is the difference between 6 pairs -- (T-1)*V --
+    and 12 -- (T-1)*V**2. At the committed 4x12 window it is 44 against 176, i.e.
+    three quarters of the pairs would be measuring the other term's quantity.
+    """
+
+    times = dumped_scene.slot_time_indices.reshape(-1)
+    cameras = dumped_scene.slot_cameras.reshape(-1)
+
+    grouped_first, grouped_second, _ = adjacent_pair_indices(times, cameras)
+    assert len(grouped_first) == 6
+    for earlier, later in zip(grouped_first, grouped_second):
+        assert cameras[earlier] == cameras[later]
+
+    assert len(adjacent_pair_indices(times)[0]) == 12
+
+
 def test_sparse_loss_sync_term_is_zero_for_view_consistent_fields(
     dumped_scene,
 ):
@@ -3688,6 +3782,7 @@ def test_new_training_flags_default_to_the_archived_behaviour():
 
     assert args.freeze_mode == "temporal_tracking"
     assert args.sync_weight == 0.0
+    assert args.velocity_weight == 0.0
     assert args.time_embedding_init == "orthogonal"
     assert args.time_embedding_init_scale == 0.1
     assert args.embedding_lr is None
@@ -3698,6 +3793,7 @@ def test_new_training_flags_default_to_the_archived_behaviour():
     for flag, bad in (
         ("--time_embedding_init_scale", "0"),
         ("--sync_weight", "-1"),
+        ("--velocity_weight", "-1"),
         ("--min_index_advantage", "1.0"),
         ("--embedding_lr", "nan"),
         ("--encoder_lr", "0"),
@@ -3910,6 +4006,12 @@ def test_run_summary_includes_the_baseline_and_control_fields():
         "baseline_sync_consistency",
         "initial_sync_consistency",
         "final_sync_consistency",
+        "velocity_weight",
+        "baseline_velocity_consistency",
+        "initial_velocity_consistency",
+        "final_velocity_consistency",
+        "anchor_velocity_sample_counts",
+        "anchor_velocity_weights",
         "temporal_injection",
         "reconstruction_shift",
         "baseline_reconstruction_drift",
@@ -4725,6 +4827,7 @@ def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
             position_weight=weight,
             confidence_weight=0.0,
             sync_weight=0.0,
+            velocity_weight=0.0,
         ).backward()
         accumulated = overfit_cli._accumulate(accumulated, result.loss, weight)
 
@@ -4822,6 +4925,7 @@ def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
             position_weight=position_weights[anchor_index],
             confidence_weight=confidence_weights[anchor_index],
             sync_weight=0.0,
+            velocity_weight=0.0,
         ).backward()
         accumulated = overfit_cli._accumulate(
             accumulated,
@@ -4981,6 +5085,7 @@ def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
             position_weight=0.0,
             confidence_weight=0.0,
             sync_weight=1.0 / anchor_count,
+            velocity_weight=0.0,
         ).backward()
         accumulated = overfit_cli._accumulate(
             accumulated,
@@ -4994,12 +5099,111 @@ def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
     )
 
 
+def test_per_anchor_velocity_weighting_equals_one_combined_loss(tmp_path):
+    """The claim the sample-share rests on, pinned on values and gradients.
+
+    ``velocity_consistency_loss`` reduces with ``reduction="mean"`` over its
+    own masked pair selection, so a stacked forward divides by the TOTAL pair
+    count while a per-anchor one divides by that anchor's. Weighting each
+    anchor by its share of the pairs is what makes the two equal --
+    sum_a (K_a/K) * (S_a/K_a) = (sum_a S_a)/K. Sync's flat 1/A would not:
+    the fixture's invisible samples make the per-anchor pair counts differ.
+    """
+
+    _write_scene(
+        tmp_path,
+        depth_sidecar=True,
+        invisible=[(1, 2, 0), (0, 0, 1)],
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    anchor_slots = scene.anchor_observation_slots
+    anchor_count = len(anchor_slots)
+    anchors = _anchors_for(scene, correspondences)
+    alignment = _identity_alignment()
+
+    counts = anchor_velocity_counts(scene, correspondences, anchor_count)
+    assert min(counts) > 0 and len(set(counts)) > 1, (
+        "the fixture must give the anchors different pair counts, or the "
+        "flat share would pass too"
+    )
+    shares = [count / sum(counts) for count in counts]
+
+    generator = torch.Generator().manual_seed(13)
+    field = torch.randn(
+        1, anchor_count, scene.num_observations, 56, 56, 3, generator=generator
+    ) * 0.05
+
+    def score(track, corr, query_idx, anchor_points):
+        return sparse_tracking_loss(
+            {"track_multi": track, "track_query_idx": query_idx},
+            scene,
+            corr,
+            alignment,
+            anchor_points,
+            velocity_weight=1.0,
+        )
+
+    combined_field = field.clone().requires_grad_(True)
+    combined = score(
+        combined_field,
+        correspondences,
+        scene.track_query_observation_slots,
+        anchors,
+    )
+    assert combined.velocity_loss is not None
+    assert combined.velocity_pair_count == sum(counts)
+    combined.velocity_loss.backward()
+
+    split_field = field.clone().requires_grad_(True)
+    accumulated = None
+    for anchor_index, slot in enumerate(anchor_slots):
+        rows = correspondences.anchor_rows(anchor_index)
+        result = score(
+            split_field[:, anchor_index : anchor_index + 1],
+            correspondences.select_query_slot(anchor_index),
+            torch.tensor([slot]),
+            anchors[rows],
+        )
+        # The counts computed from the scene alone must be exactly what the
+        # loss reduced over -- nothing in them reads a prediction.
+        assert result.velocity_pair_count == counts[anchor_index]
+        overfit_cli._weighted_anchor_total(
+            result,
+            position_weight=0.0,
+            confidence_weight=0.0,
+            sync_weight=0.0,
+            velocity_weight=shares[anchor_index],
+        ).backward()
+        accumulated = overfit_cli._accumulate(
+            accumulated,
+            result.velocity_loss,
+            shares[anchor_index],
+        )
+
+    assert accumulated == pytest.approx(
+        float(combined.velocity_loss.detach()), rel=1e-6
+    )
+    torch.testing.assert_close(
+        split_field.grad, combined_field.grad, rtol=1e-5, atol=1e-8
+    )
+
+
 @pytest.mark.parametrize("confidence_weight", [0.0, 0.75])
 @pytest.mark.parametrize("sync_weight", [0.0, 0.5])
+@pytest.mark.parametrize("velocity_weight", [0.0, 0.25])
 def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
     tmp_path,
     confidence_weight,
     sync_weight,
+    velocity_weight,
 ):
     """A single-anchor step must be the pre-change path, exactly.
 
@@ -5032,6 +5236,7 @@ def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
         confidence_weight=confidence_weight,
         confidence_alpha=3.0,
         sync_weight=sync_weight,
+        velocity_weight=velocity_weight,
     )
 
     combined = overfit_cli._weighted_anchor_total(
@@ -5039,6 +5244,7 @@ def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
         position_weight=1.0,
         confidence_weight=confidence_weight,
         sync_weight=sync_weight,
+        velocity_weight=velocity_weight,
     )
 
     assert torch.equal(combined, result.total_loss)
@@ -5128,16 +5334,18 @@ def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
         confidence_weight=0.75,
         confidence_alpha=3.0,
         sync_weight=0.5,
+        velocity_weight=0.25,
     )
     overfit_cli._weighted_anchor_total(
         result,
         position_weight=1.0,
         confidence_weight=0.75,
         sync_weight=0.5,
+        velocity_weight=0.25,
     )
 
     loss_order, anchor_order = seen
-    assert loss_order == ["position", "sync", "confidence"]
+    assert loss_order == ["position", "sync", "velocity", "confidence"]
     assert anchor_order == loss_order
 
 

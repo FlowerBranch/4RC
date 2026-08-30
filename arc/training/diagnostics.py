@@ -32,8 +32,10 @@ from collections.abc import Sequence
 import torch
 
 from arc.training.losses import (
+    adjacent_pair_indices,
     synchronized_differences,
     synchronized_pair_indices,
+    temporal_differences,
 )
 
 # Spans the observed track-confidence range: `expp1` output is `1 + exp(x)`, and
@@ -267,6 +269,63 @@ def synchronized_consistency_stats(
         norms = torch.linalg.vector_norm(difference, dim=-1).flatten()
         return {
             "pair_count": len(first),
+            "mean_m": float(norms.mean().item()),
+            "median_m": float(norms.median().item()),
+            "p90_m": float(torch.quantile(norms, 0.9).item()),
+        }
+
+
+def temporal_velocity_stats(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    slot_time_indices: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    slot_groups: torch.Tensor | None = None,
+) -> dict | None:
+    """Velocity residual against ground truth, in metres per index step.
+
+    The read-only companion to
+    :func:`arc.training.losses.velocity_consistency_loss`, reported whether or
+    not the term is trained -- the same disposition
+    :func:`synchronized_consistency_stats` has, and for the same reason: a term
+    switched on with no observable that can see it cannot be evaluated, only
+    hoped about.  Recorded at weight 0 it is the baseline a weighted run is read
+    against.
+
+    ``mean_m`` and friends are **per index step**, so they are comparable across
+    windows but *not* across ``--stride``: one index step is ``stride`` frames of
+    real time, and the gap divisor normalises spacing within a window only.
+
+    Returns ``None`` when no group holds two distinct time indices, or when no
+    pair survives ``mask``.
+    """
+
+    first, second, _ = adjacent_pair_indices(slot_time_indices, slot_groups)
+    if not first:
+        return None
+
+    with torch.no_grad():
+        first_index = torch.tensor(first, device=mask.device, dtype=torch.long)
+        second_index = torch.tensor(second, device=mask.device, dtype=torch.long)
+        pair_mask = mask.index_select(1, first_index) & mask.index_select(
+            1, second_index
+        )
+        if not pair_mask.any():
+            return None
+        residual = temporal_differences(
+            predicted.detach().float(),
+            slot_time_indices,
+            slot_groups=slot_groups,
+        ) - temporal_differences(
+            target.detach().float(),
+            slot_time_indices,
+            slot_groups=slot_groups,
+        )
+        norms = torch.linalg.vector_norm(residual, dim=-1)[pair_mask]
+        return {
+            "pair_count": len(first),
+            "sample_count": int(pair_mask.sum().item()),
             "mean_m": float(norms.mean().item()),
             "median_m": float(norms.median().item()),
             "p90_m": float(torch.quantile(norms, 0.9).item()),

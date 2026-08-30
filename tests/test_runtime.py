@@ -47,6 +47,7 @@ MOVED_TO_RUNTIME = {
     "_anchor_confidence_counts",
     "_anchor_sample_counts",
     "_anchor_tracks",
+    "_anchor_velocity_counts",
     "_backward_through_cut",
     "_cut_features",
     "_encode_and_reconstruct",
@@ -76,6 +77,10 @@ def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():
     # per-anchor shares are the trainer's too, and a copy would let the two
     # drivers weight the same objective differently.
     assert overfit_cli._anchor_confidence_counts is runtime.anchor_confidence_counts
+    # Same reason, one term later: the velocity term's shares are a third
+    # reduction over the same targets, and a copy in either driver would let
+    # them weight one objective two ways.
+    assert overfit_cli._anchor_velocity_counts is runtime.anchor_velocity_counts
 
 
 # --------------------------------------------------------------- gradient norm ---

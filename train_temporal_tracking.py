@@ -56,6 +56,7 @@ from arc.training.runtime import (
     anchor_confidence_counts,
     anchor_sample_counts,
     anchor_tracks,
+    anchor_velocity_counts,
     assert_frozen_gradients_absent,
     assert_trainable_gradients_finite,
     assert_trainable_parameter_set,
@@ -176,6 +177,13 @@ class StepOutcome:
     # mask the loss reduced over, since those shares cannot see either
     # prediction-finiteness or confidence-finiteness. None when the term is off.
     confidence_dropped: dict | None = None
+    # Velocity-term pair samples per seated anchor, in spec order -- the same
+    # shape as anchor_sample_counts and the same derivation, over pairs rather
+    # than slots. None when --velocity_weight is 0, which is what distinguishes
+    # "the term was off" from a summed 0, i.e. "the term was on and this step's
+    # window offered it no pair". The latter is normal on a narrow window and is
+    # what run_summary's velocity_term_totals counts.
+    anchor_velocity_counts: list[int] | None = None
 
 
 def compact_eligibility(eligibility: dict) -> dict:
@@ -388,6 +396,7 @@ def train_step(
     confidence_weight: float,
     confidence_alpha: float | None,
     sync_weight: float,
+    velocity_weight: float,
     learning_rates: list[float],
     step: int,
 ) -> StepOutcome:
@@ -473,6 +482,22 @@ def train_step(
         ]
     else:
         confidence_shares = [0.0] * anchor_count
+    # The velocity term reduces over PAIRS of slots, so its denominator is
+    # neither of the two above: a correspondence contributes a pair only where
+    # both endpoints pass the visibility mask. Same scene-only derivation, same
+    # weight>0 gate -- which is load-bearing beyond cost here, since the CUDA
+    # peak counter was reset above and an unconditional pass would move
+    # `peak_bytes` on a position-only step.
+    if velocity_weight > 0:
+        velocity_counts = anchor_velocity_counts(scene, correspondences, anchor_count)
+        total_velocity = sum(velocity_counts)
+        velocity_shares = [
+            count / total_velocity if total_velocity else 0.0
+            for count in velocity_counts
+        ]
+    else:
+        velocity_counts = None
+        velocity_shares = [0.0] * anchor_count
 
     with autocast_context(precision):
         images, feats, recon = encode_and_reconstruct(model, scene.views)
@@ -497,6 +522,7 @@ def train_step(
     step_loss = None
     step_metric_error = None
     step_sync_loss = None
+    step_velocity_loss = None
     step_confidence_loss = None
     # Summed over the step's anchors, by cause. anchor_confidence_counts is exact
     # only while nothing goes non-finite -- the two predicates it cannot see are
@@ -537,6 +563,7 @@ def train_step(
                 # composes is discarded by the multi-anchor path. The share
                 # belongs to weighted_anchor_total below.
                 sync_weight=sync_weight,
+                velocity_weight=velocity_weight,
                 collect_diagnostics=False,
             )
             # Whatever the first active anchor resolved, every later one reuses.
@@ -546,9 +573,11 @@ def train_step(
             if result.confidence_alpha is not None:
                 step_alpha = result.confidence_alpha
             # Each term's share of the step, so backwarding per anchor equals one
-            # combined reduction="mean". Position and confidence are shares of
-            # their own supervised samples -- different masks, hence different
-            # counts. Sync is a share of the ACTIVE ANCHORS: every anchor's
+            # combined reduction="mean". Position, confidence and velocity are
+            # shares of their own supervised samples -- three different masks,
+            # hence three different counts; velocity's is a reduction over PAIRS
+            # of slots, so it is not proportional to the position count either.
+            # Sync is a share of the ACTIVE ANCHORS: every anchor's
             # sync_loss is a mean over an identical 1*P*H*W*3 element count (P, H
             # and W depend on the window, never on which anchor), so equal
             # denominators make the stacked-Q mean the plain mean of the
@@ -560,6 +589,7 @@ def train_step(
                 position_weight=anchor_weight,
                 confidence_weight=confidence_weight * confidence_shares[anchor_index],
                 sync_weight=sync_weight / len(active_anchors),
+                velocity_weight=velocity_weight * velocity_shares[anchor_index],
             )
         # Backward per anchor, so this anchor's track-head graph is freed
         # before the next one allocates its own; the gradient lands on the cut
@@ -574,6 +604,9 @@ def train_step(
         # None through, so a disabled term needs no branch here.
         step_sync_loss = accumulate_weighted(
             step_sync_loss, result.sync_loss, 1.0 / len(active_anchors)
+        )
+        step_velocity_loss = accumulate_weighted(
+            step_velocity_loss, result.velocity_loss, velocity_shares[anchor_index]
         )
         step_confidence_loss = accumulate_weighted(
             step_confidence_loss,
@@ -594,6 +627,8 @@ def train_step(
     loss_breakdown = {"position": step_loss}
     if step_sync_loss is not None:
         loss_breakdown["sync"] = step_sync_loss
+    if step_velocity_loss is not None:
+        loss_breakdown["velocity"] = step_velocity_loss
     if step_confidence_loss is not None:
         loss_breakdown["confidence"] = step_confidence_loss
     if len(loss_breakdown) == 1:
@@ -650,6 +685,7 @@ def train_step(
         loss_breakdown=loss_breakdown,
         confidence_alpha=step_alpha,
         confidence_dropped=step_confidence_dropped,
+        anchor_velocity_counts=velocity_counts,
     )
 
 
@@ -772,6 +808,11 @@ def evaluate_held_out(
                     "sample_count": int(result.sample_count),
                     "alignment_scale": float(alignment_report["scale"]),
                     "confidence": confidence_stats(raw),
+                    # Reported whatever --velocity_weight is, which is the point:
+                    # at weight 0 this is the baseline a weighted run is read
+                    # against. Metres per INDEX step, so it is comparable across
+                    # this run's windows but not against a different --stride.
+                    "velocity_consistency": result.velocity_stats,
                 }
 
                 # The index-advantage arm: the same model scored with one camera's
@@ -789,9 +830,23 @@ def evaluate_held_out(
                         huber_delta_m=huber_delta_m,
                     )
                     entry["position_loss_shuffled"] = float(shuffled_result.loss.item())
+                    # The sharpest read there is on whether the velocity term
+                    # taught temporal ORDER rather than mere smoothness.
+                    # `shuffled_index_views` reverses every non-primary camera's
+                    # time CONDITIONING and leaves `slot_time_indices` alone, so
+                    # the pairs and their gaps are identical to the line above
+                    # and the two numbers are directly comparable; within a
+                    # reversed camera the mapping t -> T-1-t preserves adjacency
+                    # and flips its direction, which is exactly the structure
+                    # this term supervises. The untouched primary camera is the
+                    # within-scene control.
+                    entry["velocity_consistency_shuffled"] = (
+                        shuffled_result.velocity_stats
+                    )
                     del shuffled_raw, shuffled_result
                 else:
                     entry["position_loss_shuffled"] = None
+                    entry["velocity_consistency_shuffled"] = None
 
                 if emit_predictions:
                     arrays = _prediction_arrays(
@@ -827,6 +882,16 @@ def evaluate_held_out(
         for entry in per_scene
         if entry["position_loss_shuffled"] is not None
     ]
+    velocity_errors = [
+        entry["velocity_consistency"]["mean_m"]
+        for entry in per_scene
+        if entry["velocity_consistency"] is not None
+    ]
+    velocity_errors_shuffled = [
+        entry["velocity_consistency_shuffled"]["mean_m"]
+        for entry in per_scene
+        if entry["velocity_consistency_shuffled"] is not None
+    ]
     metrics = {
         "step": step,
         "query_anchors": list(query_anchors),
@@ -838,6 +903,21 @@ def evaluate_held_out(
         # an absence of one.
         "position_loss_shuffled": (
             sum(shuffled_losses) / len(shuffled_losses) if shuffled_losses else None
+        ),
+        # The velocity term's own residual, in metres per index step, reported
+        # whether or not the term is trained -- at --velocity_weight 0 this is the
+        # baseline a later weighted run is read against. The shuffled figure is
+        # scored over the identical pair set (reversal moves the conditioning, not
+        # slot_time_indices), so the pair says whether the model's velocities
+        # depend on time ORDER or are merely smooth. None, not 0, when no scene
+        # offered a pair, on the same convention as the line above.
+        "velocity_error_m": (
+            sum(velocity_errors) / len(velocity_errors) if velocity_errors else None
+        ),
+        "velocity_error_shuffled_m": (
+            sum(velocity_errors_shuffled) / len(velocity_errors_shuffled)
+            if velocity_errors_shuffled
+            else None
         ),
         # The operating point every bundle of this step was written at, so an eval
         # curve can be read without opening a single .npz. Both None on a run that
@@ -1302,6 +1382,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument(
+        "--velocity_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the supervised velocity term -- the second half of the "
+            "paper's Eq. 8, the first temporal derivative of the displacement "
+            "field. Differenced along ONE CAMERA's own sequence (Eq. 8 is a "
+            "monocular objective, and cross-camera pairs would fold the "
+            "synchronized-consistency residual in, making this weight "
+            "unreadable against --sync_weight). 0 (the default) skips the term "
+            "entirely, keeping archived runs reproducible. Costs no new model "
+            "output: the base geometry cancels in the difference, so it reads "
+            "the same sparse positions the Huber does. Note the quantity is "
+            "metres PER INDEX STEP, so at --stride 2 it is a two-frame "
+            "displacement and is not comparable with a stride-1 run's. Its "
+            "residual is reported in the held-out eval whatever this is set to, "
+            "so read velocity_error_m at weight 0 first."
+        ),
+    )
+    training.add_argument(
         "--confidence_weight",
         type=float,
         default=0.0,
@@ -1528,6 +1628,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--confidence_weight must be finite and non-negative")
     if not math.isfinite(args.sync_weight) or args.sync_weight < 0:
         raise ValueError("--sync_weight must be finite and non-negative")
+    if not math.isfinite(args.velocity_weight) or args.velocity_weight < 0:
+        raise ValueError("--velocity_weight must be finite and non-negative")
     # Parsed in place, like the anchor spec below: everything downstream --
     # train_step, the checkpoint, the summary -- reads a float or None, never
     # the flag's string.
@@ -1640,6 +1742,10 @@ def _plan_summary(tally, args) -> dict:
     bounds = Counter(plan.time_bound for plan in tally.planned)
     observations = Counter(plan.observation_count for plan in tally.planned)
     views = Counter(len(plan.cameras) for plan in tally.planned)
+    # `len(plan.times)` IS the distinct count: the scene builder assigns
+    # `semantic_time_index = slot % len(times)`, so a window's indices are
+    # 0..T-1 with every camera carrying every one of them.
+    distinct_times = Counter(len(plan.times) for plan in tally.planned)
     duplicates = [plan.duplicate_track_count for plan in tally.planned]
     tracks = [len(plan.track_indices) for plan in tally.planned]
     transformed = sum(1 for plan in tally.planned if plan.scene_transform)
@@ -1653,6 +1759,17 @@ def _plan_summary(tally, args) -> dict:
         "distinct_scenes": len({plan.seq_name for plan in tally.planned}),
         "views_per_step": dict(sorted(views.items())),
         "observations_per_step": dict(sorted(observations.items())),
+        # What --velocity_weight can exercise, answerable without a GPU: the term
+        # differences adjacent times, so a step whose slots all carry one index
+        # contributes nothing to it. Named `planned_steps_...` because it
+        # describes the MANIFEST, not the run -- the loop replays
+        # plans[step % len(plans)], so a shorter run executes a prefix and a
+        # resume a shifted slice. run_summary's velocity_term_totals is the
+        # run-scoped answer.
+        "distinct_time_indices_per_step": dict(sorted(distinct_times.items())),
+        "planned_steps_without_a_velocity_pair": sum(
+            count for times, count in distinct_times.items() if times < 2
+        ),
         "time_bound": dict(bounds),
         "stride": dict(strides),
         # The RECORDED draw's size, not what a step supervises: with
@@ -1705,6 +1822,7 @@ def _plan_summary(tally, args) -> dict:
             # thing, and at zero weights these read as the zeros control.
             "confidence_weight": float(args.confidence_weight),
             "sync_weight": float(args.sync_weight),
+            "velocity_weight": float(args.velocity_weight),
             "confidence_alpha": args.confidence_alpha,
             # What alpha the run actually trained under, as opposed to what was
             # asked for: None under 'auto' until a step resolves it, which is why
@@ -1745,6 +1863,8 @@ def _print_plan(tally, summary, *, limit: int = 20) -> None:
         "distinct_scenes",
         "views_per_step",
         "observations_per_step",
+        "distinct_time_indices_per_step",
+        "planned_steps_without_a_velocity_pair",
         "time_bound",
         "recorded_tracks_per_step",
         "duplicate_track_ids",
@@ -1971,6 +2091,12 @@ def run_training(
     # first occurrence -- which is the one worth reading -- under thousands of
     # repeats. Every step's own counts stay in history.jsonl regardless.
     confidence_dropped_totals: Counter = Counter()
+    # Steps the velocity term ran on, split by whether the window offered it a
+    # pair. Both stay 0 on a run that never enabled it, which
+    # settings.velocity_weight above is what disambiguates -- the same
+    # convention confidence_dropped_totals keeps.
+    velocity_steps_supervised = 0
+    velocity_steps_without_a_pair = 0
     warned_about_dropped_confidence = False
     scene = None
     interrupted = None
@@ -2036,6 +2162,7 @@ def run_training(
                 confidence_weight=args.confidence_weight,
                 confidence_alpha=args.resolved_confidence_alpha,
                 sync_weight=args.sync_weight,
+                velocity_weight=args.velocity_weight,
                 learning_rates=learning_rates,
                 step=step,
             )
@@ -2088,6 +2215,14 @@ def run_training(
                         "run_summary.json.",
                         file=sys.stderr,
                     )
+            # None means the term was off for the run; a summed 0 means it was on
+            # and this step's window carried no adjacent-time pair, which is a
+            # narrow window rather than a fault.
+            if outcome.anchor_velocity_counts is not None:
+                if sum(outcome.anchor_velocity_counts) > 0:
+                    velocity_steps_supervised += 1
+                else:
+                    velocity_steps_without_a_pair += 1
             # Absent on a position-only step, so the line a zeros-control run
             # prints is the one it printed before the terms existed.
             breakdown_log = (
@@ -2185,6 +2320,10 @@ def run_training(
         # is a measurement ("the shares matched the mask all run"), and it reads
         # differently from a position-only run that never looked.
         "confidence_dropped_totals": dict(sorted(confidence_dropped_totals.items())),
+        "velocity_term_totals": {
+            "steps_supervised": velocity_steps_supervised,
+            "steps_without_a_pair": velocity_steps_without_a_pair,
+        },
         "history": history,
         "evaluations": evaluations,
     }
@@ -2229,6 +2368,7 @@ def _checkpoint_settings(args) -> dict:
         # which is a plain type torch.load returns unchanged.
         "confidence_weight": float(args.confidence_weight),
         "sync_weight": float(args.sync_weight),
+        "velocity_weight": float(args.velocity_weight),
         "confidence_alpha": args.confidence_alpha,
         # Derived state rather than a flag, and so deliberately in NEITHER resume
         # tier: check_resume_settings iterates the two tuples only, so this rides
@@ -2282,10 +2422,11 @@ def _write_checkpoint(
 # (time_embedding_init and its scale -- a different init is a different set of
 # per-index offsets, so the encoder is conditioned differently from step 0 and
 # every weight downstream of it descends from that), which objective the run
-# descends at all (confidence_weight, sync_weight and confidence_alpha -- a
-# segment that changes a loss weight and keeps counting steps reports one curve
-# over two objectives, and the reported `loss` stays the position-only Huber
-# throughout, so nothing in the history would show the switch), or the numerics
+# descends at all (confidence_weight, sync_weight, velocity_weight and
+# confidence_alpha -- a segment that changes a loss weight and keeps counting
+# steps reports one curve over two objectives, and the reported `loss` stays
+# the position-only Huber throughout, so nothing in the history would show
+# the switch), or the numerics
 # under the restored scaler state (precision): a changed value means the
 # "resumed" run trains a different stream while its step counter continues.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
@@ -2320,15 +2461,17 @@ _RESUME_SETTINGS_REFUSED = (
     "time_embedding_init_scale",
     "confidence_weight",
     "sync_weight",
+    "velocity_weight",
     "confidence_alpha",
     "precision",
 )
 _RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
 
 # What the ABSENCE of a refused key means, for the keys whose absence has exactly
-# one possible reading. A checkpoint written before --confidence_weight and
-# --sync_weight existed could not have set them: no other value was reachable, so
-# the run it continues was necessarily position-only at weight 0, and
+# one possible reading. A checkpoint written before --confidence_weight,
+# --sync_weight and --velocity_weight existed could not have set them: no other
+# value was reachable, so the run it continues was necessarily position-only at
+# weight 0, and
 # confidence_alpha is unused at that weight. Resolving the gap to that one value
 # is not tolerating it -- the comparison below still runs, so a segment that
 # turns a term ON against a position-only checkpoint is refused exactly as a
@@ -2348,6 +2491,7 @@ _RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
 _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     "confidence_weight": 0.0,
     "sync_weight": 0.0,
+    "velocity_weight": 0.0,
     "confidence_alpha": None,
 }
 
@@ -2546,6 +2690,24 @@ def main() -> None:
         print("FAIL no record produced a replayable step", file=sys.stderr)
         raise SystemExit(1)
 
+    # Here rather than in _validate_args, and before the --plan_only return: T is
+    # decided per record, not by a flag, so this is the earliest point the answer
+    # exists -- and it is still GPU-free, like every other plan defect. The term
+    # tolerates a single-time step by sitting it out, which is right per step and
+    # wrong for a whole stream: a weight nothing can ever exercise is a config
+    # error, not a quiet no-op that costs a node-day to notice.
+    unpaired = summary["planned_steps_without_a_velocity_pair"]
+    if args.velocity_weight > 0 and unpaired == len(tally.planned):
+        parser.error(
+            f"--velocity_weight {args.velocity_weight} was given, but none of "
+            f"the {len(tally.planned)} planned steps carries two distinct time "
+            "indices, so the velocity term can never be built. The term "
+            "differences adjacent times within one camera; T per step is "
+            "min(--observation_budget // views, --max_time_indices, the clip's "
+            "own length at --stride). Raise the budget or the window, or drop "
+            "the flag."
+        )
+
     # Before the --plan_only return, deliberately: an anchor spec the planned
     # stream cannot seat should fail at submit time, GPU-free, like every other
     # plan defect.
@@ -2684,6 +2846,10 @@ def main() -> None:
         # nothing, which is a measurement; empty ALSO when the term never ran,
         # which settings.confidence_weight above is what disambiguates.
         "confidence_dropped_totals": result["confidence_dropped_totals"],
+        # Same scope again, and the run-scoped companion to the plan-side
+        # distinct_time_indices_per_step above: that says what the MANIFEST
+        # offers, this says what the executed steps actually found.
+        "velocity_term_totals": result["velocity_term_totals"],
         "evaluations": result["evaluations"],
         "trainable_tensor_count": report["tensor_count"],
         "trainable_parameter_count": report["parameter_count"],

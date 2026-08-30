@@ -285,6 +285,216 @@ def synchronized_consistency_loss(
     return loss
 
 
+def adjacent_pair_indices(
+    slot_time_indices: torch.Tensor,
+    slot_groups: torch.Tensor | None = None,
+) -> tuple[list[int], list[int], list[int]]:
+    """Slot pairs at adjacent semantic times, within one group, plus their gaps.
+
+    Adjacency is over the sorted set of **distinct** indices present in a group,
+    not over the integers: windows are built at a stride under an observation
+    budget, so nothing guarantees the indices present are contiguous.
+
+    ``slot_groups`` defaults to ``None``, which puts every slot in one group.
+    Passing the scene's ``slot_cameras`` restricts pairs to one camera's own
+    sequence, which is what the paper's ``grad_t`` is -- Eq. 8 is a monocular
+    objective and has no second camera.  A cross-camera pair would be
+    ``[dP_A^{i+1} - dP_A^{i}] + [dP_B^{i+1} - dP_A^{i+1}]``: a velocity plus the
+    synchronized-consistency residual, which is
+    :func:`synchronized_consistency_loss`'s quantity and not this one's.
+
+    **The ordering deliberately departs from**
+    :func:`synchronized_pair_indices`, which emits ``(a, b)`` with ``a < b`` in
+    *slot* order.  Disagreement is direction-free, so slot order costs that
+    function nothing; a velocity is directional in meaning even where the
+    symmetric Huber below cannot see it.  So each pair is emitted with the
+    **earlier-time slot first** and ``gap = t[second] - t[first] >= 1``.  A
+    signed divisor would cancel today and be a silent trap for anything
+    direction-sensitive later -- asymmetric weighting, a second-order term, a
+    diagnostic reporting signed velocity error.
+
+    Returns ``([], [], [])`` when no group holds two distinct indices.  That is a
+    narrow window, not an error; see :func:`velocity_consistency_loss`.
+    """
+
+    slot_time_indices = torch.as_tensor(slot_time_indices)
+    if slot_time_indices.ndim != 1:
+        raise ValueError(
+            "slot_time_indices must be one-dimensional, got shape "
+            f"{tuple(slot_time_indices.shape)}"
+        )
+    values = [int(value) for value in slot_time_indices.tolist()]
+    if slot_groups is None:
+        groups = [0] * len(values)
+    else:
+        slot_groups = torch.as_tensor(slot_groups)
+        if slot_groups.ndim != 1:
+            raise ValueError(
+                "slot_groups must be one-dimensional, got shape "
+                f"{tuple(slot_groups.shape)}"
+            )
+        if slot_groups.numel() != len(values):
+            raise ValueError(
+                f"slot_groups must have one entry per observation slot "
+                f"({len(values)}), got {slot_groups.numel()}"
+            )
+        groups = [int(value) for value in slot_groups.tolist()]
+
+    first: list[int] = []
+    second: list[int] = []
+    gap: list[int] = []
+    for group in sorted(set(groups)):
+        members = [slot for slot, value in enumerate(groups) if value == group]
+        present = sorted({values[slot] for slot in members})
+        for earlier_time, later_time in zip(present, present[1:]):
+            for earlier in [slot for slot in members if values[slot] == earlier_time]:
+                for later in [slot for slot in members if values[slot] == later_time]:
+                    first.append(earlier)
+                    second.append(later)
+                    gap.append(later_time - earlier_time)
+    return first, second, gap
+
+
+def temporal_differences(
+    values: torch.Tensor,
+    slot_time_indices: torch.Tensor,
+    *,
+    slot_groups: torch.Tensor | None = None,
+    metric_scale: float = 1.0,
+) -> torch.Tensor | None:
+    """Per-index-step differences over adjacent-time slot pairs.
+
+    ``values`` is the sparse ``(M,S,3)`` selection the position term consumes;
+    the result stacks one difference per adjacent-time pair along dim 1, giving
+    ``(M,P,3)``.  Each difference is divided by its own pair's index gap, so the
+    quantity is a velocity **per index step** and windows whose present indices
+    are spaced differently stay comparable.  ``metric_scale`` lifts raw
+    differences into metres exactly as in :func:`synchronized_differences`;
+    callers passing already-metric positions leave it at 1.
+
+    **Comparable across windows, not across ``--stride``.**  The semantic index
+    is ``slot % len(times)``, so the distinct set is contiguous whatever stride
+    selected the frames, and one index step is ``stride`` frames of real time: a
+    stride-2 run's velocity is a two-frame displacement, a stride-1 run's a
+    one-frame one.  The gap divisor normalises index spacing *within* a window;
+    it does not normalise stride *across* runs, and two runs at different strides
+    report different physical quantities under this name.
+
+    ``None`` when no group holds two distinct time indices.
+    """
+
+    if values.ndim != 3 or values.shape[-1] != 3:
+        raise ValueError(
+            f"values must have shape (M,S,3), got {tuple(values.shape)}"
+        )
+    if torch.as_tensor(slot_time_indices).numel() != values.shape[1]:
+        raise ValueError(
+            f"slot_time_indices must have one entry per observation slot "
+            f"({values.shape[1]}), got {torch.as_tensor(slot_time_indices).numel()}"
+        )
+    if not math.isfinite(metric_scale) or metric_scale <= 0:
+        raise ValueError("metric_scale must be finite and positive")
+
+    first, second, gap = adjacent_pair_indices(slot_time_indices, slot_groups)
+    if not first:
+        return None
+    device = values.device
+    first_index = torch.tensor(first, device=device, dtype=torch.long)
+    second_index = torch.tensor(second, device=device, dtype=torch.long)
+    # Shaped (1,P,1) so one gap divides its own pair's 3-vector across every
+    # correspondence.
+    step = torch.tensor(gap, device=device, dtype=values.dtype).reshape(1, -1, 1)
+    difference = values.index_select(1, second_index) - values.index_select(
+        1, first_index
+    )
+    return difference * float(metric_scale) / step
+
+
+def velocity_consistency_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    slot_time_indices: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    huber_delta: float,
+    slot_groups: torch.Tensor | None = None,
+    metric_scale: float = 1.0,
+) -> torch.Tensor | None:
+    """Huber on the first temporal derivative -- the second half of Eq. 8.
+
+    The paper's motion objective constrains ``dP`` and ``grad_t dP``; this repo
+    supervised only the value.  The factorization makes the derivative free of
+    new plumbing: ``P^{t->tau} = P_base^t + dP^{t->tau}``, so for two target
+    times from one source time the base geometry cancels and
+    ``P^{t->tau2} - P^{t->tau1} = dP^{t->tau2} - dP^{t->tau1}``.  The term
+    therefore reads the same sparse positions :func:`track_position_loss` does
+    and is insensitive to base-geometry error by construction.
+
+    A pair contributes only where **both** endpoints are valid under ``mask``.
+    ``huber_delta`` is the position term's metric threshold reused: the quantity
+    is still metres, per index step, so a separate knee would be a second
+    unmeasured constant rather than a fix for the first.
+
+    Returns ``None`` -- it does not raise -- when the window holds fewer than two
+    distinct time indices in any group, or when no pair survives the mask.  Both
+    are normal properties of a narrow window: ``T`` is decided per step by the
+    observation budget, the embedding table and the clip length, so raising would
+    end a run on a window the stream is entitled to produce.  This is the only
+    function here that signals a degenerate input with ``None``; the callers that
+    would otherwise have to pre-check it are the two drivers and the eval.
+    """
+
+    if predicted.shape != target.shape:
+        raise ValueError(
+            "predicted and target must have equal shape, got "
+            f"{tuple(predicted.shape)} and {tuple(target.shape)}"
+        )
+    if predicted.shape[-1] != 3:
+        raise ValueError(
+            f"predicted must have a trailing 3-vector axis, got {tuple(predicted.shape)}"
+        )
+    if mask.shape != predicted.shape[:-1]:
+        raise ValueError(
+            f"mask must have shape {tuple(predicted.shape[:-1])}, got {tuple(mask.shape)}"
+        )
+    if mask.dtype != torch.bool:
+        raise ValueError(f"mask must be a boolean tensor, got {mask.dtype}")
+    if not math.isfinite(huber_delta) or huber_delta <= 0:
+        raise ValueError("huber_delta must be finite and positive")
+
+    predicted_difference = temporal_differences(
+        predicted,
+        slot_time_indices,
+        slot_groups=slot_groups,
+        metric_scale=metric_scale,
+    )
+    if predicted_difference is None:
+        return None
+    target_difference = temporal_differences(
+        target,
+        slot_time_indices,
+        slot_groups=slot_groups,
+        metric_scale=metric_scale,
+    )
+
+    first, second, _ = adjacent_pair_indices(slot_time_indices, slot_groups)
+    first_index = torch.tensor(first, device=mask.device, dtype=torch.long)
+    second_index = torch.tensor(second, device=mask.device, dtype=torch.long)
+    pair_mask = mask.index_select(1, first_index) & mask.index_select(1, second_index)
+    if not pair_mask.any():
+        return None
+
+    loss = F.huber_loss(
+        predicted_difference[pair_mask],
+        target_difference[pair_mask],
+        reduction="mean",
+        delta=huber_delta,
+    )
+    if not torch.isfinite(loss):
+        raise FloatingPointError("Velocity consistency loss produced NaN or Inf")
+    return loss
+
+
 def resolve_confidence_alpha(
     mean_confidence: float,
     mean_position_error: float,

@@ -27,7 +27,7 @@ from contextlib import nullcontext
 
 import torch
 
-from arc.training.losses import compose_tracking_loss
+from arc.training.losses import adjacent_pair_indices, compose_tracking_loss
 from arc.training.sparse_tracking import sparse_targets
 
 
@@ -412,19 +412,57 @@ def anchor_confidence_counts(
     return counts
 
 
+def anchor_velocity_counts(scene, correspondences, anchor_count: int) -> list[int]:
+    """Velocity-term sample count per anchor.
+
+    The velocity term reduces over **pairs** of slots, not slots, so its
+    denominator is neither the position term's nor the confidence term's: a
+    correspondence contributes a pair only where both endpoints pass the
+    visibility mask, and the ratio between that and ``mask.sum()`` varies by
+    anchor.  Weighting with :func:`anchor_sample_counts` would therefore make the
+    combined objective differ from the stacked-Q one, and sync's flat
+    ``1/anchors`` would too -- sync gets away with it only because every anchor's
+    dense field has the identical element count.
+
+    Unlike :func:`anchor_confidence_counts` this is **exact**, not approximate.
+    Every predicate in it comes from ``sparse_targets``, which reads no
+    prediction, so there is no finiteness term it cannot see.
+
+    Pairs come from the scene's own ``slot_time_indices`` and ``slot_cameras``
+    rather than from arguments, like the counts above -- a caller-supplied copy
+    is the drift these helpers exist to prevent.
+    """
+
+    first, second, _ = adjacent_pair_indices(
+        scene.slot_time_indices.reshape(-1),
+        scene.slot_cameras.reshape(-1),
+    )
+    counts = []
+    for anchor_index in range(anchor_count):
+        anchor = correspondences.select_query_slot(anchor_index)
+        if anchor.count == 0:
+            counts.append(0)
+            continue
+        _, _, _, mask = sparse_targets(scene, anchor)
+        counts.append(int((mask[:, first] & mask[:, second]).sum().item()))
+    return counts
+
+
 def weighted_anchor_total(
     result,
     *,
     position_weight: float,
     confidence_weight: float,
     sync_weight: float,
+    velocity_weight: float,
 ) -> torch.Tensor:
     """One anchor's contribution to the combined objective.
 
     ``compose_tracking_loss`` is linear in its terms, so backwarding each
     anchor's weighted total in turn accumulates exactly the gradient of the sum
-    -- which is the combined loss, given the position and confidence weights are
-    that anchor's share of the supervised samples and the sync weight is its
+    -- which is the combined loss, given the position, confidence and velocity
+    weights are that anchor's share of their own supervised samples (three
+    different masks, hence three different counts) and the sync weight is its
     share of the anchors.
 
     One scope limit on that equivalence.  The sync share is one over the anchors
@@ -446,6 +484,9 @@ def weighted_anchor_total(
     if result.sync_loss is not None:
         terms["sync"] = result.sync_loss
         weights["sync"] = sync_weight
+    if result.velocity_loss is not None:
+        terms["velocity"] = result.velocity_loss
+        weights["velocity"] = velocity_weight
     if result.confidence_loss is not None:
         terms["confidence"] = result.confidence_loss
         weights["confidence"] = confidence_weight

@@ -13,6 +13,7 @@ from .diagnostics import (
     reconstruction_shift_report,
     synchronized_consistency_stats,
     temporal_injection_report,
+    temporal_velocity_stats,
 )
 from .dumped_kubric import (
     DEPTH_SIDECAR_FLAG,
@@ -59,14 +60,17 @@ from .manifest_plan import (
     select_times,
 )
 from .losses import (
+    adjacent_pair_indices,
     compose_tracking_loss,
     per_sample_huber_error,
     resolve_confidence_alpha,
     synchronized_consistency_loss,
     synchronized_pair_indices,
+    temporal_differences,
     track_confidence_loss,
     track_metric_error,
     track_position_loss,
+    velocity_consistency_loss,
 )
 from .sparse_tracking import (
     ELIGIBILITY_ASSIGNMENT_RULE,
@@ -95,6 +99,10 @@ __all__ = [
     "ELIGIBILITY_REJECTION_STAGES",
     "ELIGIBILITY_ROLLUP_RULE",
     "DetachedSim3",
+    "adjacent_pair_indices",
+    "temporal_differences",
+    "temporal_velocity_stats",
+    "velocity_consistency_loss",
     "DumpedKubricScene",
     "ImageTransform",
     "Observation",

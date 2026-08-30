@@ -24,9 +24,13 @@ from arc.models.arc.utils.transform import (
     pose_encoding_to_extri_intri,
     unproject_depth,
 )
-from arc.training.diagnostics import confidence_occlusion_diagnostics
+from arc.training.diagnostics import (
+    confidence_occlusion_diagnostics,
+    temporal_velocity_stats,
+)
 from arc.training.dumped_kubric import DumpedKubricScene
 from arc.training.losses import (
+    adjacent_pair_indices,
     compose_tracking_loss,
     per_sample_huber_error,
     resolve_confidence_alpha,
@@ -35,6 +39,7 @@ from arc.training.losses import (
     track_confidence_loss,
     track_metric_error,
     track_position_loss,
+    velocity_consistency_loss,
 )
 from eval.track.track_eval_util import estimate_sim3
 
@@ -217,6 +222,12 @@ class SparseTrackingLossResult:
     confidence_alpha: float | None = None
     sync_loss: torch.Tensor | None = None
     sync_pair_count: int | None = None
+    velocity_loss: torch.Tensor | None = None
+    velocity_pair_count: int | None = None
+    # Reported whether or not the term is trained, so a weight-0 run records the
+    # baseline a weighted one is read against. Gated on ``collect_diagnostics``,
+    # not on the weight, and so present on the zero-weight fast path too.
+    velocity_stats: dict | None = None
     loss_breakdown: dict | None = None
     diagnostics: dict | None = None
 
@@ -1282,6 +1293,7 @@ def sparse_tracking_loss(
     confidence_weight: float = 0.0,
     confidence_alpha: float | None = None,
     sync_weight: float = 0.0,
+    velocity_weight: float = 0.0,
     collect_diagnostics: bool = True,
 ) -> SparseTrackingLossResult:
     """Huber-supervise postprocess-equivalent absolute track positions.
@@ -1298,6 +1310,15 @@ def sparse_tracking_loss(
     observation slots owe identical displacement fields, at every pixel and
     regardless of visibility.  Also 0 by default, also never built when off.
 
+    ``velocity_weight`` weights the supervised velocity term
+    (:func:`arc.training.losses.velocity_consistency_loss`), the second half of
+    the paper's Eq. 8: the first temporal derivative of the displacement field,
+    differenced along **one camera's own sequence** and read off the same sparse
+    positions the position term consumes.  Also 0 by default, also never built
+    when off.  Its read-only counterpart in ``velocity_stats`` is produced
+    regardless, gated on ``collect_diagnostics`` alone, so a zero-weight run
+    records the baseline a weighted one is compared against.
+
     ``confidence_alpha=None`` with a nonzero weight auto-calibrates alpha from this
     call's own sparse statistics.  Resolving it here rather than in the caller is
     what keeps the two inputs commensurate: both the mean confidence and the mean
@@ -1305,9 +1326,10 @@ def sparse_tracking_loss(
     than one step should resolve it once and pass the value back in, so the target
     does not move underneath the optimizer.
 
-    ``collect_diagnostics=False`` skips the occlusion report.  It costs a device
-    sync per reported figure, and a training step throws the report away -- only
-    the initial and final evaluations are ever written to ``run_summary.json``.
+    ``collect_diagnostics=False`` skips the occlusion report and the velocity
+    residual.  Both cost a device sync per reported figure, and a training step
+    throws them away -- only the initial and final evaluations are ever written
+    to ``run_summary.json``.
     """
 
     if huber_delta_m <= 0 or not np.isfinite(huber_delta_m):
@@ -1316,6 +1338,8 @@ def sparse_tracking_loss(
         raise ValueError("confidence_weight must be finite and non-negative")
     if sync_weight < 0 or not np.isfinite(sync_weight):
         raise ValueError("sync_weight must be finite and non-negative")
+    if velocity_weight < 0 or not np.isfinite(velocity_weight):
+        raise ValueError("velocity_weight must be finite and non-negative")
     if correspondences.count == 0:
         raise ValueError("No eligible sparse correspondences")
     if "track_multi" not in raw_predictions:
@@ -1415,12 +1439,33 @@ def sparse_tracking_loss(
     )
     metric_error = track_metric_error(predicted_metric, target_metric, target_mask)
 
-    if confidence_weight == 0.0 and sync_weight == 0.0:
+    # Before the fast path, and gated on the reporting flag rather than on the
+    # weight: a run that does not train the term still needs its residual, or
+    # turning the term on later has nothing to be read against. The training
+    # steps pass collect_diagnostics=False, so no step pays for this.
+    velocity_stats = (
+        temporal_velocity_stats(
+            predicted_metric,
+            target_metric,
+            # CPU copies on purpose: adjacent_pair_indices reads them through
+            # `.tolist()` and builds its index tensors on the value tensor's own
+            # device, so moving these first would buy a host sync and nothing
+            # else. Same reasoning as the sync pair count below.
+            scene.slot_time_indices.reshape(-1),
+            target_mask,
+            slot_groups=scene.slot_cameras.reshape(-1),
+        )
+        if collect_diagnostics
+        else None
+    )
+
+    if confidence_weight == 0.0 and sync_weight == 0.0 and velocity_weight == 0.0:
         return SparseTrackingLossResult(
             loss=loss,
             metric_error=metric_error,
             sample_count=int(target_mask.sum().item()),
             target_mask=target_mask,
+            velocity_stats=velocity_stats,
         )
 
     terms: dict = {"position": loss}
@@ -1441,6 +1486,45 @@ def sparse_tracking_loss(
         sync_pair_count = len(synchronized_pair_indices(slot_time_indices)[0])
         terms["sync"] = sync_loss
         weights["sync"] = sync_weight
+
+    velocity_loss = None
+    velocity_pair_count = None
+    if velocity_weight > 0.0:
+        # CPU, for the reason given at the diagnostic above.
+        velocity_time_indices = scene.slot_time_indices.reshape(-1)
+        # One camera's own sequence: Eq. 8 is a monocular objective, and pairing
+        # across cameras would add the synchronized-consistency residual to every
+        # difference -- three quarters of the pairs at the committed window --
+        # making this weight unreadable against sync_weight.
+        velocity_groups = scene.slot_cameras.reshape(-1)
+        # Counted whether or not the term survives, so 0 says "built and found
+        # nothing" while None says "never built". An empty pair list indexes to
+        # an (M,0) selection summing to 0, which is the same answer.
+        first, second, _ = adjacent_pair_indices(
+            velocity_time_indices,
+            velocity_groups,
+        )
+        velocity_pair_count = int(
+            (target_mask[:, first] & target_mask[:, second]).sum().item()
+        )
+        velocity_loss = velocity_consistency_loss(
+            predicted_metric,
+            target_metric,
+            velocity_time_indices,
+            target_mask,
+            # Still metres, per index step: the same physical knee, not a second
+            # unmeasured constant.
+            huber_delta=huber_delta_m,
+            slot_groups=velocity_groups,
+            # Both tensors are already metric here, unlike the sync term's raw
+            # dP grid, so there is nothing left to lift.
+        )
+        # None on a narrow window -- fewer than two distinct time indices, or no
+        # pair through the mask. Normal, not fatal; the term simply sits this
+        # step out and the count above says so.
+        if velocity_loss is not None:
+            terms["velocity"] = velocity_loss
+            weights["velocity"] = velocity_weight
 
     confidence_loss = None
     confidence_mask = None
@@ -1522,6 +1606,9 @@ def sparse_tracking_loss(
         ),
         sync_loss=sync_loss,
         sync_pair_count=sync_pair_count,
+        velocity_loss=velocity_loss,
+        velocity_pair_count=velocity_pair_count,
+        velocity_stats=velocity_stats,
         loss_breakdown=breakdown,
         diagnostics=diagnostics,
     )

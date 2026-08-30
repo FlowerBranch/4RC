@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from arc.training import (
     CONFIDENCE_DIAGNOSTICS_VERSION,
+    adjacent_pair_indices,
     DEFAULT_CONFIDENCE_TAU_MULTIPLES,
     DEFAULT_CONFIDENCE_TAUS,
     compose_tracking_loss,
@@ -17,6 +18,9 @@ from arc.training import (
     synchronized_consistency_loss,
     synchronized_consistency_stats,
     synchronized_pair_indices,
+    temporal_differences,
+    temporal_velocity_stats,
+    velocity_consistency_loss,
     track_confidence_loss,
     track_metric_error,
     track_position_loss,
@@ -709,3 +713,246 @@ def test_sync_stats_report_metric_disagreement_and_skip_unpaired_windows():
     assert synchronized_consistency_stats(
         fields, torch.tensor([0, 1, 2, 3])
     ) is None
+
+
+# ------------------------------------------------------- velocity (Eq. 8) ---
+# A 2-camera x 4-time camera-major window, the layout the scene builder emits:
+# `semantic_time_index = slot % len(times)`, so both cameras carry 0..3.
+_CAMERA_MAJOR_TIMES = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+_CAMERA_MAJOR_CAMERAS = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+
+
+def _exact_positions(slots=8, count=4, seed=0):
+    """Half-integer positions, so a constant offset adds without rounding.
+
+    The offset-invariance claim below is that the velocity residual is *exactly*
+    zero, not zero to a tolerance. That is only checkable when the arithmetic is
+    exact, which half-integers in float32 are.
+    """
+
+    generator = torch.Generator().manual_seed(seed)
+    return torch.randint(
+        -8, 9, (count, slots, 3), generator=generator, dtype=torch.float32
+    ) / 2.0
+
+
+def test_adjacent_pairs_are_within_one_camera_and_ordered_earlier_time_first():
+    """Grouping is what keeps the term from being a second sync term.
+
+    An ungrouped pair spanning two cameras equals the same-camera velocity plus
+    the synchronized-consistency residual at the later time, so three quarters of
+    a camera-major window's adjacent-time pairs would be measuring the other
+    term's quantity.
+    """
+
+    first, second, gap = adjacent_pair_indices(
+        _CAMERA_MAJOR_TIMES, _CAMERA_MAJOR_CAMERAS
+    )
+    assert list(zip(first, second, gap)) == [
+        (0, 1, 1),
+        (1, 2, 1),
+        (2, 3, 1),
+        (4, 5, 1),
+        (5, 6, 1),
+        (6, 7, 1),
+    ]
+    # Ungrouped, every camera pairs with every other: (T-1) * V**2.
+    assert len(adjacent_pair_indices(_CAMERA_MAJOR_TIMES)[0]) == 3 * 2**2
+
+    # Adjacency is over the DISTINCT indices present, not over the integers, and
+    # the gap is what says how far apart they were.
+    assert adjacent_pair_indices(torch.tensor([0, 2, 4])) == (
+        [0, 1],
+        [1, 2],
+        [2, 2],
+    )
+    # A single instant has no derivative. Empty, not an exception.
+    assert adjacent_pair_indices(torch.tensor([0, 0, 0])) == ([], [], [])
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        adjacent_pair_indices(torch.zeros(2, 2))
+    with pytest.raises(ValueError, match="one entry per observation slot"):
+        adjacent_pair_indices(_CAMERA_MAJOR_TIMES, torch.tensor([0, 1]))
+
+
+def test_velocity_loss_is_zero_under_a_constant_offset_while_position_is_not():
+    """The claim the whole term rests on: it measures velocity, not position.
+
+    A prediction displaced by a constant has exactly the right motion and exactly
+    the wrong place. The velocity residual must vanish -- which is also what says
+    the base geometry cancels, since an anchor error is precisely a constant
+    offset across the slot axis.
+    """
+
+    target = _exact_positions()
+    predicted = target + 0.5
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+
+    velocity = velocity_consistency_loss(
+        predicted,
+        target,
+        _CAMERA_MAJOR_TIMES,
+        mask,
+        huber_delta=0.05,
+        slot_groups=_CAMERA_MAJOR_CAMERAS,
+    )
+    assert velocity.item() == 0.0
+    assert track_position_loss(predicted, target, mask, huber_delta=0.05).item() > 0.0
+
+
+def test_velocity_loss_normalises_by_the_gap_between_present_indices():
+    """[0,2,4] and [0,1,2] at one velocity are the same measurement.
+
+    Windows are built at a stride under an observation budget, so what indices a
+    window carries is not a property of the term. Dividing by the pair's own gap
+    is what keeps two such windows commensurable -- within a run. Across
+    ``--stride`` values they are not, because one index step is `stride` frames.
+    """
+
+    def loss_for(indices, true_velocity, predicted_velocity):
+        times = torch.tensor(indices)
+        # Position at index t is t * velocity, so consecutive differences over a
+        # gap of g are exactly g * velocity and normalise back to `velocity`.
+        steps = times.reshape(1, -1, 1).float().repeat(1, 1, 3)
+        target = steps * true_velocity
+        predicted = steps * predicted_velocity
+        mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+        return velocity_consistency_loss(
+            predicted, target, times, mask, huber_delta=0.05
+        ).item()
+
+    spread = loss_for([0, 2, 4], 0.02, 0.05)
+    dense = loss_for([0, 1, 2], 0.02, 0.05)
+    assert spread == pytest.approx(dense, rel=1e-6)
+    assert spread > 0.0
+
+
+def test_velocity_loss_grows_as_predicted_motion_leaves_the_target():
+    target = _exact_positions()
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+
+    def loss_at(scale):
+        return velocity_consistency_loss(
+            target * scale,
+            target,
+            _CAMERA_MAJOR_TIMES,
+            mask,
+            huber_delta=0.05,
+            slot_groups=_CAMERA_MAJOR_CAMERAS,
+        ).item()
+
+    assert loss_at(1.0) == 0.0
+    assert loss_at(1.05) < loss_at(1.2) < loss_at(2.0)
+
+
+def test_a_window_with_one_time_index_omits_the_term_rather_than_raising():
+    """A narrow window is a property of the stream, not a fault.
+
+    ``T`` is decided per step by the observation budget, the embedding table and
+    the clip's own length, so a single-time window is reachable and raising would
+    end a run on something the loop's scene-skip policy cannot absorb. This is
+    the one function in the module that answers ``None``.
+    """
+
+    target = _exact_positions(slots=3)
+    predicted = target * 1.5
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+    single_time = torch.tensor([0, 0, 0])
+
+    assert (
+        velocity_consistency_loss(
+            predicted, target, single_time, mask, huber_delta=0.05
+        )
+        is None
+    )
+    assert temporal_differences(target, single_time) is None
+    assert temporal_velocity_stats(predicted, target, single_time, mask) is None
+
+
+def test_a_pair_needs_both_endpoints_and_vanishes_with_the_whole_mask():
+    """Both endpoints, because a difference has two of them."""
+
+    target = _exact_positions()
+    predicted = target * 1.5
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+
+    full = velocity_consistency_loss(
+        predicted, target, _CAMERA_MAJOR_TIMES, mask, huber_delta=0.05,
+        slot_groups=_CAMERA_MAJOR_CAMERAS,
+    )
+    # Drop one endpoint of correspondence 0's camera-0 pairs (0,1) and (1,2).
+    dropped = mask.clone()
+    dropped[0, 1] = False
+    partial = velocity_consistency_loss(
+        predicted, target, _CAMERA_MAJOR_TIMES, dropped, huber_delta=0.05,
+        slot_groups=_CAMERA_MAJOR_CAMERAS,
+    )
+    stats = temporal_velocity_stats(
+        predicted, target, _CAMERA_MAJOR_TIMES, dropped,
+        slot_groups=_CAMERA_MAJOR_CAMERAS,
+    )
+    # 4 correspondences x 6 pairs, less the two pairs slot 1 was an endpoint of.
+    assert stats["sample_count"] == 4 * 6 - 2
+    assert partial.item() != full.item()
+
+    # Nothing left to reduce over is the same answer as no pair at all.
+    assert (
+        velocity_consistency_loss(
+            predicted,
+            target,
+            _CAMERA_MAJOR_TIMES,
+            torch.zeros_like(mask),
+            huber_delta=0.05,
+            slot_groups=_CAMERA_MAJOR_CAMERAS,
+        )
+        is None
+    )
+
+
+def test_velocity_loss_validates_inputs():
+    target = _exact_positions()
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="equal shape"):
+        velocity_consistency_loss(
+            target[:, :3], target, _CAMERA_MAJOR_TIMES, mask, huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="mask must have shape"):
+        velocity_consistency_loss(
+            target, target, _CAMERA_MAJOR_TIMES, mask[:, :3], huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="boolean tensor"):
+        velocity_consistency_loss(
+            target, target, _CAMERA_MAJOR_TIMES, mask.float(), huber_delta=0.05
+        )
+    with pytest.raises(ValueError, match="huber_delta"):
+        velocity_consistency_loss(
+            target, target, _CAMERA_MAJOR_TIMES, mask, huber_delta=0.0
+        )
+    with pytest.raises(ValueError, match=r"\(M,S,3\)"):
+        temporal_differences(target[0], _CAMERA_MAJOR_TIMES)
+    with pytest.raises(ValueError, match="one entry per observation slot"):
+        temporal_differences(target, _CAMERA_MAJOR_TIMES[:3])
+    with pytest.raises(ValueError, match="metric_scale"):
+        temporal_differences(target, _CAMERA_MAJOR_TIMES, metric_scale=0.0)
+
+
+def test_velocity_stats_report_the_residual_in_metres():
+    """A uniform per-step velocity error of 1 cm on every axis.
+
+    Reported unweighted and undivided by anything but the gap, so the number is
+    directly readable as "how far off, per index step".
+    """
+
+    steps = _CAMERA_MAJOR_TIMES.reshape(1, -1, 1).float().repeat(1, 1, 3)
+    target = steps * 0.02
+    predicted = steps * 0.03
+    mask = torch.ones(target.shape[:-1], dtype=torch.bool)
+
+    stats = temporal_velocity_stats(
+        predicted, target, _CAMERA_MAJOR_TIMES, mask,
+        slot_groups=_CAMERA_MAJOR_CAMERAS,
+    )
+    assert stats["pair_count"] == 6
+    assert stats["mean_m"] == pytest.approx((3 * 0.01**2) ** 0.5, rel=1e-5)
+    assert stats["p90_m"] >= stats["median_m"] >= 0.0

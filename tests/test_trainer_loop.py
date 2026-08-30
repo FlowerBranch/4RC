@@ -248,13 +248,15 @@ def _loop_args(tmp_path, **overrides):
         # Read by seed_time_index_embedding, which draws the orthogonal rows
         # from its own generator rather than the global stream.
         seed=0,
-        # Which objective the run descends. Both weights at 0 is the position-only
-        # contract every existing test assumes; _checkpoint_settings stores all
-        # three and check_resume_settings refuses a change, so every loop test
-        # needs them present. `confidence_alpha` is post-_validate_args here --
-        # a float or None, never the flag's "auto" string.
+        # Which objective the run descends. Every weight at 0 is the
+        # position-only contract every existing test assumes;
+        # _checkpoint_settings stores all four and check_resume_settings refuses
+        # a change, so every loop test needs them present. `confidence_alpha` is
+        # post-_validate_args here -- a float or None, never the flag's "auto"
+        # string.
         confidence_weight=0.0,
         sync_weight=0.0,
+        velocity_weight=0.0,
         confidence_alpha=None,
         # The run's frozen alpha, which run_training pins after the first step
         # and _checkpoint_settings carries. None until something resolves it.
@@ -1139,6 +1141,7 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         confidence_weight=0.0,
         confidence_alpha=None,
         sync_weight=0.0,
+        velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -1977,6 +1980,7 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
         confidence_weight=0.0,
         confidence_alpha=None,
         sync_weight=0.0,
+        velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -2053,6 +2057,7 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
         confidence_weight=0.0,
         confidence_alpha=None,
         sync_weight=0.0,
+        velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -2146,6 +2151,7 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
         confidence_weight=0.0,
         confidence_alpha=None,
         sync_weight=0.0,
+        velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
     )
@@ -2253,6 +2259,7 @@ def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
             confidence_weight=0.0,
             confidence_alpha=None,
             sync_weight=0.0,
+            velocity_weight=0.0,
             learning_rates=[1e-3],
             step=0,
         )
@@ -2268,7 +2275,12 @@ def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
 
     Records every ``weighted_anchor_total`` and ``tracking_only`` call, which is
     where the per-anchor shares are decided and where the retained fields are.
+
+    A weight the caller does not name defaults to 0, so a test about one term
+    names only that one and every other stays at the position-only contract.
     """
+
+    weights.setdefault("velocity_weight", 0.0)
 
     scene = scene or _step_scene(
         tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
@@ -2309,7 +2321,7 @@ def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
     return outcome, totals, kept, scene
 
 
-def test_both_weights_zero_leaves_the_step_exactly_position_only(
+def test_every_weight_zero_leaves_the_step_exactly_position_only(
     tmp_path, monkeypatch
 ):
     """The zeros control, which every archived comparison is against.
@@ -2333,10 +2345,14 @@ def test_both_weights_zero_leaves_the_step_exactly_position_only(
     # None, not a zeroed dict: a position-only step never looked, which is a
     # different finding from a confidence step that looked and found nothing.
     assert outcome.confidence_dropped is None
+    # Same distinction one term over: None means the run never enabled the
+    # velocity term, where a summed 0 would mean it was on and found no pair.
+    assert outcome.anchor_velocity_counts is None
     assert kept == [False, False], "conf_track_multi must not be retained"
     for call in totals:
         assert call["confidence_weight"] == 0.0
         assert call["sync_weight"] == 0.0
+        assert call["velocity_weight"] == 0.0
     # The position shares still sum to 1 over the step's own anchors.
     assert sum(call["position_weight"] for call in totals) == pytest.approx(1.0)
 
@@ -2468,6 +2484,86 @@ def test_the_undivided_sync_weight_is_what_reaches_the_loss(tmp_path, monkeypatc
     assert seen == [0.5, 0.5], "the loss gets the undivided weight, not the share"
 
 
+def test_the_velocity_share_is_the_pair_sample_share_not_the_position_one(
+    tmp_path, monkeypatch
+):
+    """A third mask, and a third set of shares.
+
+    The velocity term reduces over PAIRS of slots -- both endpoints visible --
+    so its per-anchor denominator is neither the position count nor the
+    confidence one, and the fixture's invisible sample makes the three differ.
+    Reusing the position shares would be wrong by exactly the ratio between the
+    masks; reusing sync's flat 1/anchors would be wrong by more, since that one
+    is flat only because every anchor's dense field is the same size.
+    """
+
+    from arc.training import build_anchor_correspondences
+    from arc.training.runtime import anchor_sample_counts, anchor_velocity_counts
+
+    outcome, totals, _, scene = _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+        velocity_weight=0.25,
+    )
+
+    correspondences, _ = build_anchor_correspondences(scene)
+    position_counts = anchor_sample_counts(scene, correspondences, 2)
+    velocity_counts = anchor_velocity_counts(scene, correspondences, 2)
+    assert velocity_counts != position_counts, "the fixture must separate the masks"
+
+    expected = [0.25 * count / sum(velocity_counts) for count in velocity_counts]
+    assert [call["velocity_weight"] for call in totals] == pytest.approx(expected)
+    # Sums to the weight at any anchor count, which is what keeps the terms'
+    # balance fixed under --adaptive_query_anchors.
+    assert sum(call["velocity_weight"] for call in totals) == pytest.approx(0.25)
+    # Not the flat share sync would have used.
+    assert [call["velocity_weight"] for call in totals] != pytest.approx(
+        [0.25 / len(totals)] * len(totals)
+    )
+
+    assert set(outcome.loss_breakdown) == {"position", "velocity"}
+    assert outcome.loss_breakdown["position"] == pytest.approx(outcome.loss)
+    # Counted per seated anchor, like anchor_sample_counts, and nonzero here.
+    assert outcome.anchor_velocity_counts == velocity_counts
+    assert sum(outcome.anchor_velocity_counts) > 0
+
+
+def test_the_undivided_velocity_weight_is_what_reaches_the_loss(
+    tmp_path, monkeypatch
+):
+    """Gate and share are different numbers here too.
+
+    ``sparse_tracking_loss``'s ``velocity_weight`` only decides whether the term
+    is BUILT. Passing the divided share would still build it, so nothing else in
+    this file would notice until an anchor count large enough to underflow the
+    > 0.0 gate made the term silently vanish.
+    """
+
+    import arc.training as training_package
+
+    seen: list[float] = []
+    real_loss = training_package.sparse_tracking_loss
+
+    def recording(*args, **kwargs):
+        seen.append(kwargs["velocity_weight"])
+        return real_loss(*args, **kwargs)
+
+    monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
+    _weighted_step(
+        tmp_path,
+        monkeypatch,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+        velocity_weight=0.5,
+    )
+
+    assert seen == [0.5, 0.5], "the loss gets the undivided weight, not the share"
+
+
 def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
     tmp_path, monkeypatch
 ):
@@ -2491,11 +2587,17 @@ def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
         confidence_weight=0.25,
         confidence_alpha=3.0,
         sync_weight=0.5,
+        velocity_weight=0.75,
     )
 
     assert enabled.loss == baseline.loss
     assert enabled.sample_count == baseline.sample_count
-    assert set(enabled.loss_breakdown) == {"position", "sync", "confidence"}
+    assert set(enabled.loss_breakdown) == {
+        "position",
+        "sync",
+        "velocity",
+        "confidence",
+    }
     assert enabled.loss_breakdown["position"] == pytest.approx(baseline.loss)
     assert base_totals[0]["position_weight"] == pytest.approx(
         base_totals[0]["position_weight"]
@@ -2630,6 +2732,7 @@ def test_a_resume_that_changes_a_loss_weight_is_refused(tmp_path):
     for key, before, after in (
         ("confidence_weight", 0.0, 0.25),
         ("sync_weight", 0.0, 0.5),
+        ("velocity_weight", 0.0, 0.25),
         ("confidence_alpha", None, 3.0),
     ):
         stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{key: before}))
@@ -2731,6 +2834,7 @@ def test_the_loss_weights_are_recorded_in_the_plan_summary_settings(tmp_path):
         manifest="m.jsonl",
         confidence_weight=0.25,
         sync_weight=0.5,
+        velocity_weight=0.75,
         confidence_alpha=3.0,
         resolved_confidence_alpha=3.0,
     )
@@ -2739,6 +2843,7 @@ def test_the_loss_weights_are_recorded_in_the_plan_summary_settings(tmp_path):
 
     assert settings["confidence_weight"] == 0.25
     assert settings["sync_weight"] == 0.5
+    assert settings["velocity_weight"] == 0.75
     assert settings["confidence_alpha"] == 3.0
     assert settings["resolved_confidence_alpha"] == 3.0
 
@@ -2749,9 +2854,13 @@ def test_unusable_loss_weights_are_refused_at_parse_time(tmp_path):
             train_cli._validate_args(_validator_args(tmp_path, confidence_weight=bad))
         with pytest.raises(ValueError, match="--sync_weight"):
             train_cli._validate_args(_validator_args(tmp_path, sync_weight=bad))
+        with pytest.raises(ValueError, match="--velocity_weight"):
+            train_cli._validate_args(_validator_args(tmp_path, velocity_weight=bad))
     # Zero is the default and must stay admissible: it is the zeros control.
     train_cli._validate_args(
-        _validator_args(tmp_path, confidence_weight=0.0, sync_weight=0.0)
+        _validator_args(
+            tmp_path, confidence_weight=0.0, sync_weight=0.0, velocity_weight=0.0
+        )
     )
 
 
@@ -2901,6 +3010,10 @@ def test_the_eval_is_position_only_whatever_the_training_flags_say(
         assert "confidence_weight" not in call
         assert "sync_weight" not in call
         assert "confidence_alpha" not in call
+        # The velocity term is no different: its residual reaches the eval
+        # as a no_grad diagnostic, never as a weight, so position_loss stays
+        # comparable across arms.
+        assert "velocity_weight" not in call
 
 
 def test_a_malformed_anchor_pair_is_refused_at_parse_time():
@@ -3890,3 +4003,233 @@ def test_a_resume_rewrites_the_history_from_its_restart_step(tmp_path):
     # nothing to contradict.
     train_cli.open_step_history(tmp_path, start_step=0)
     assert [record["step"] for record in _history(tmp_path)] == [0, 1]
+
+
+# --------------------------------------------------------- velocity tally ---
+def test_the_plan_reports_how_many_steps_can_exercise_the_velocity_term(
+    tmp_path, monkeypatch, capsys
+):
+    """Answerable before a GPU is allocated, which is the whole point.
+
+    The term differences adjacent times, so a step whose slots all carry one
+    index contributes nothing to it. `len(plan.times)` IS the distinct count --
+    the scene builder assigns `slot % len(times)` -- so the histogram is exact
+    without loading a scene.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [
+        _record(step=0, seq_name="0000"),
+        # seq_len 2 at stride 2 holds exactly one time: no adjacent pair.
+        _record(step=1, seq_name="0001", seq_len=2),
+    ]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    out = tmp_path / "plan.json"
+    _plan_only(monkeypatch, manifest, "--json_out", str(out))
+
+    train_cli.main()
+
+    summary = json.loads(out.read_text())
+    # 4 views at budget 48 gives 12 times for the full window, 1 for the short.
+    assert summary["distinct_time_indices_per_step"] == {"1": 1, "12": 1}
+    assert summary["planned_steps_without_a_velocity_pair"] == 1
+    # And printed, not just written: --plan_only is read on a terminal.
+    assert "distinct_time_indices_per_step" in capsys.readouterr().out
+
+
+def test_a_velocity_weight_no_planned_step_can_exercise_is_refused(
+    tmp_path, monkeypatch
+):
+    """A weight nothing can ever build is a config error, not a quiet no-op.
+
+    Per step the term tolerates a one-time window by sitting it out, which is
+    right there and wrong for a whole stream -- the run would descend the
+    position loss alone for a node-day while `settings.velocity_weight` claimed
+    otherwise. Refused GPU-free, like every other plan defect, and only when NO
+    step qualifies: a mixed stream is legitimate.
+    """
+
+    from test_manifest_plan import _write_manifest
+
+    records = [_record(step=index, seq_name=f"{index:04d}", seq_len=2) for index in range(2)]
+    manifest = _write_manifest(tmp_path / "manifest.jsonl", records)
+    _plan_only(monkeypatch, manifest, "--velocity_weight", "0.5")
+
+    with pytest.raises(SystemExit):
+        train_cli.main()
+
+    # The same manifest is nobody's problem with the term off.
+    _plan_only(monkeypatch, manifest)
+    train_cli.main()
+
+    # And one qualifying step is enough: the term is allowed to sit steps out.
+    mixed = _write_manifest(
+        tmp_path / "mixed.jsonl",
+        [_record(step=0, seq_name="0000"), _record(step=1, seq_name="0001", seq_len=2)],
+    )
+    _plan_only(monkeypatch, mixed, "--velocity_weight", "0.5")
+    train_cli.main()
+
+
+def test_a_step_whose_window_holds_one_time_omits_the_term_and_is_counted(
+    tmp_path, monkeypatch
+):
+    """A narrow window sits the term out; the run says so rather than raising."""
+
+    train_cli._STOP_REQUESTED.clear()
+
+    def step_fn(*, model, plan, optimizer, learning_rates, step, **_):
+        loss = model(torch.ones(1, 3)).sum()
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        return train_cli.StepOutcome(
+            step=step,
+            seq_name=plan.seq_name,
+            loss=float(loss.item()),
+            metric_error_m=0.0,
+            sample_count=1,
+            alignment_scale=1.0,
+            alignment_residual_m=0.0,
+            learning_rates=list(learning_rates),
+            gradient_norms={},
+            # Seated two anchors, neither of which found a pair.
+            anchor_velocity_counts=[0, 0] if step % 2 else [7, 3],
+        )
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, velocity_weight=0.25),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=step_fn,
+        output_dir=tmp_path,
+    )
+
+    assert result["velocity_term_totals"] == {
+        "steps_supervised": 2,
+        "steps_without_a_pair": 2,
+    }
+
+
+def test_a_position_only_run_leaves_the_velocity_totals_at_zero(tmp_path):
+    """Zero-and-zero, disambiguated by settings.velocity_weight above.
+
+    The same convention confidence_dropped_totals keeps: a run that never looked
+    reads differently from one that looked and found nothing, and the flag is
+    what tells them apart.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=_recording_step([]),
+        output_dir=tmp_path,
+    )
+
+    assert result["velocity_term_totals"] == {
+        "steps_supervised": 0,
+        "steps_without_a_pair": 0,
+    }
+
+
+def test_the_eval_reports_the_velocity_residual_at_weight_zero(
+    tmp_path, monkeypatch
+):
+    """Measured without being trained -- and measured again under reversal.
+
+    The shuffled arm reverses every non-primary camera's time CONDITIONING and
+    leaves `slot_time_indices` alone, so both figures are scored over the
+    identical pair set and are directly comparable. That pair is the run's only
+    read on whether the model's velocities depend on time order rather than being
+    merely smooth; nothing else in the eval can see the quantity at all.
+    """
+
+    scene = _step_scene(
+        tmp_path,
+        monkeypatch,
+        query_anchors=((0, 0), (1, 0)),
+        invisible=((0, 0, 2),),
+    )
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=0,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0", "1:0"],
+        confidence_alpha=_EVAL_ALPHA,
+    )
+
+    entry = metrics["per_scene"][0]
+    assert entry["velocity_consistency"]["mean_m"] >= 0.0
+    assert entry["velocity_consistency_shuffled"] is not None
+    # Identical pair set: reversal moves the conditioning, not the indices.
+    assert (
+        entry["velocity_consistency_shuffled"]["pair_count"]
+        == entry["velocity_consistency"]["pair_count"]
+    )
+    assert metrics["velocity_error_m"] == pytest.approx(
+        entry["velocity_consistency"]["mean_m"]
+    )
+    assert metrics["velocity_error_shuffled_m"] == pytest.approx(
+        entry["velocity_consistency_shuffled"]["mean_m"]
+    )
+    # Written, not just returned: an eval curve is read from these files.
+    written = json.loads(
+        (tmp_path / "out" / "eval" / "step-0" / "metrics.json").read_text()
+    )
+    assert written["velocity_error_m"] == metrics["velocity_error_m"]
+
+
+def test_a_window_with_nothing_to_shuffle_reports_none_not_zero(
+    tmp_path, monkeypatch
+):
+    """`None`, not 0, on the same convention position_loss_shuffled already keeps.
+
+    A zero would read as "reversal costs nothing", which is a finding rather than
+    the absence of one.
+    """
+
+    import arc.training.runtime as runtime_module
+
+    scene = _step_scene(tmp_path, monkeypatch)
+    # evaluate_held_out imports the helper inside the function, so the
+    # runtime module is the only interception point.
+    monkeypatch.setattr(runtime_module, "shuffled_index_views", lambda _s: None)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=0,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
+    )
+
+    entry = metrics["per_scene"][0]
+    assert entry["position_loss_shuffled"] is None
+    assert entry["velocity_consistency_shuffled"] is None
+    assert metrics["velocity_error_shuffled_m"] is None
+    # The unshuffled figure is unaffected by any of that.
+    assert metrics["velocity_error_m"] is not None

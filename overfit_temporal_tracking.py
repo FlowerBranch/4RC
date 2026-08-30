@@ -48,6 +48,7 @@ from arc.training.runtime import (  # noqa: E402
     anchor_confidence_counts as _anchor_confidence_counts,
     anchor_sample_counts as _anchor_sample_counts,
     anchor_tracks as _anchor_tracks,
+    anchor_velocity_counts as _anchor_velocity_counts,
     assert_frozen_gradients_absent as _assert_frozen_gradients_absent,
     assert_trainable_gradients_finite as _assert_trainable_gradients_finite,
     assert_trainable_parameter_set,
@@ -169,6 +170,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "observation slots owe identical displacement fields at every pixel. "
             "0 (the default) skips the term entirely, keeping archived runs "
             "reproducible."
+        ),
+    )
+    parser.add_argument(
+        "--velocity_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the supervised velocity term -- the second half of the "
+            "paper's Eq. 8, differenced along one camera's own sequence. "
+            "0 (the default) skips the term entirely, keeping archived runs "
+            "reproducible. The quantity is metres per index step, so it is not "
+            "comparable across --times spacings."
         ),
     )
     parser.add_argument(
@@ -368,6 +381,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         )
     if not math.isfinite(args.sync_weight) or args.sync_weight < 0:
         raise ValueError("--sync_weight must be finite and non-negative")
+    if not math.isfinite(args.velocity_weight) or args.velocity_weight < 0:
+        raise ValueError("--velocity_weight must be finite and non-negative")
     if (
         not math.isfinite(args.min_index_advantage)
         or not 0 <= args.min_index_advantage < 1
@@ -670,6 +685,7 @@ def _evaluate(
     confidence_alpha=None,
     *,
     sync_weight=0.0,
+    velocity_weight=0.0,
     sync_metric_scale,
     shuffled_views,
 ):
@@ -717,6 +733,7 @@ def _evaluate(
             confidence_weight=confidence_weight,
             confidence_alpha=confidence_alpha,
             sync_weight=sync_weight,
+            velocity_weight=velocity_weight,
         )
         like_for_like = sparse_tracking_loss(
             raw,
@@ -728,6 +745,7 @@ def _evaluate(
             confidence_weight=confidence_weight,
             confidence_alpha=confidence_alpha,
             sync_weight=sync_weight,
+            velocity_weight=velocity_weight,
         )
         shuffled_loss = None
         shuffled_error = None
@@ -748,6 +766,10 @@ def _evaluate(
         "loss_shuffled": shuffled_loss,
         "metric_error_shuffled_m": shuffled_error,
         "sync_consistency": sync_stats,
+        # The velocity term's own residual, in metres per index step. Produced
+        # whatever --velocity_weight is, so a run that does not train the term
+        # still records the baseline a later weighted one is read against.
+        "velocity_consistency": like_for_like.velocity_stats,
         "reconstruction_drift": drift,
         "loss_refit": float(refit.loss.item()),
         "metric_error_refit_m": float(refit.metric_error.item()),
@@ -1031,6 +1053,21 @@ def main() -> None:
         count / total_confidence_samples if total_confidence_samples else 0.0
         for count in anchor_confidence_counts
     ]
+    # And the velocity term over a third set again -- PAIRS of slots, both
+    # endpoints visible -- so it needs its own shares too. Not the sync term's
+    # flat 1/anchors: that one is flat only because every anchor's dense field
+    # has the identical element count, which is exactly what a sparse pair
+    # reduction does not.
+    anchor_velocity_counts = _anchor_velocity_counts(
+        scene,
+        correspondences,
+        anchor_count,
+    )
+    total_velocity_samples = sum(anchor_velocity_counts)
+    anchor_velocity_weights = [
+        count / total_velocity_samples if total_velocity_samples else 0.0
+        for count in anchor_velocity_counts
+    ]
     print(
         "anchor_sample_counts="
         f"{anchor_sample_counts} (total {total_anchor_samples}); "
@@ -1056,6 +1093,7 @@ def main() -> None:
         confidence_weight=args.confidence_weight,
         confidence_alpha=requested_alpha,
         sync_weight=args.sync_weight,
+        velocity_weight=args.velocity_weight,
     )
     baseline_confidence = _confidence_stats(baseline_raw)
     baseline_loss = float(baseline_result.loss.item())
@@ -1149,6 +1187,7 @@ def main() -> None:
         confidence_weight=args.confidence_weight,
         confidence_alpha=confidence_alpha,
         sync_weight=args.sync_weight,
+        velocity_weight=args.velocity_weight,
     )
     initial_confidence = _confidence_stats(initial_raw)
     initial_loss = float(initial_result.loss.item())
@@ -1232,6 +1271,7 @@ def main() -> None:
         step_metric_error = None
         step_confidence_loss = None
         step_sync_loss = None
+        step_velocity_loss = None
         for anchor_index, anchor_weight in active_anchors:
             anchor_correspondences = per_anchor_correspondences[anchor_index]
             with _autocast_context(args.precision):
@@ -1257,6 +1297,7 @@ def main() -> None:
                     confidence_weight=args.confidence_weight,
                     confidence_alpha=confidence_alpha,
                     sync_weight=args.sync_weight,
+                    velocity_weight=args.velocity_weight,
                     # Only the initial and final evaluations are reported; a
                     # per-step occlusion report costs a device sync per figure
                     # and is discarded.
@@ -1270,6 +1311,10 @@ def main() -> None:
                         * anchor_confidence_weights[anchor_index]
                     ),
                     sync_weight=args.sync_weight / len(active_anchors),
+                    velocity_weight=(
+                        args.velocity_weight
+                        * anchor_velocity_weights[anchor_index]
+                    ),
                 )
 
             # Backward per anchor, so this anchor's track-head graph is freed
@@ -1291,6 +1336,11 @@ def main() -> None:
                 step_sync_loss,
                 result.sync_loss,
                 1.0 / len(active_anchors),
+            )
+            step_velocity_loss = _accumulate(
+                step_velocity_loss,
+                result.velocity_loss,
+                anchor_velocity_weights[anchor_index],
             )
             del raw, result, anchor_total
 
@@ -1396,6 +1446,7 @@ def main() -> None:
         confidence_weight=args.confidence_weight,
         confidence_alpha=confidence_alpha,
         sync_weight=args.sync_weight,
+        velocity_weight=args.velocity_weight,
         sync_metric_scale=sync_metric_scale,
         shuffled_views=_shuffled_index_views(scene),
     )
@@ -1544,6 +1595,7 @@ def main() -> None:
         "time_embedding_target_row_norm": embedding_target_row_norm,
         "learning_rates": learning_rates,
         "sync_weight": args.sync_weight,
+        "velocity_weight": args.velocity_weight,
         "min_index_advantage": args.min_index_advantage,
         # The released checkpoint scored with the same alignment and anchors as
         # every other like-for-like number; the bar the trained model must beat.
@@ -1558,6 +1610,12 @@ def main() -> None:
         "baseline_sync_consistency": baseline_sync,
         "initial_sync_consistency": initial_sync,
         "final_sync_consistency": evaluation["sync_consistency"],
+        # Same three points as the sync trio above, and reported on the same
+        # terms: measurable without being trained, which is what lets
+        # --velocity_weight be evaluated rather than merely enabled.
+        "baseline_velocity_consistency": baseline_result.velocity_stats,
+        "initial_velocity_consistency": initial_result.velocity_stats,
+        "final_velocity_consistency": evaluation["velocity_consistency"],
         # Step-0 measurements of what the initialized embedding does to the
         # frozen network: signal transport to the taps, and reconstruction
         # perturbation. Answers on the real checkpoint what the synthetic
@@ -1581,6 +1639,8 @@ def main() -> None:
         # larger set than the position term and carries its own shares.
         "anchor_confidence_sample_counts": anchor_confidence_counts,
         "anchor_confidence_weights": anchor_confidence_weights,
+        "anchor_velocity_sample_counts": anchor_velocity_counts,
+        "anchor_velocity_weights": anchor_velocity_weights,
         # The full split, accounting for every query, with both rules stated in
         # it as strings so a summary is self-describing.
         "eligibility": eligibility,
