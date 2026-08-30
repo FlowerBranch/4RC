@@ -39,8 +39,13 @@ from .trainer_state import (
     save_atomically,
 )
 from .predictions import (
+    LEGACY_PREDICTION_KEYS,
+    OCCLUSION_DISTANCE_M,
     PREDICTION_KEYS,
+    UNTHRESHOLDED_PREDICTION_KEYS,
     build_prediction_arrays,
+    read_scene_predictions,
+    reference_tau,
     write_scene_predictions,
 )
 from .manifest_plan import (
@@ -103,8 +108,13 @@ __all__ = [
     "gather_query_anchor_points",
     "load_temporal_tracking_checkpoint",
     "ManifestPlanError",
+    "LEGACY_PREDICTION_KEYS",
+    "OCCLUSION_DISTANCE_M",
     "PREDICTION_KEYS",
+    "UNTHRESHOLDED_PREDICTION_KEYS",
     "build_prediction_arrays",
+    "read_scene_predictions",
+    "reference_tau",
     "write_scene_predictions",
     "PlanTally",
     "TRAINER_STATE_VERSION",

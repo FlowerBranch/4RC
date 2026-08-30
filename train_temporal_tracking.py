@@ -41,6 +41,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from arc.training.manifest_plan import (
@@ -662,6 +663,7 @@ def evaluate_held_out(
     step: int,
     output_dir: Path,
     query_anchors,
+    confidence_alpha: float | None,
     emit_predictions: bool = True,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
@@ -688,6 +690,15 @@ def evaluate_held_out(
     Predictions are written in the cluster scorers' schema and **not scored** --
     ``evaluate_3dpt`` lives in the other environment.
 
+    ``confidence_alpha`` is the run's frozen alpha, which sets the bundles'
+    reference occlusion threshold at ``alpha / OCCLUSION_DISTANCE_M``. It is a
+    property of the RUN, not of this step, so every scene of every step writes the
+    same threshold and two eval points are comparable. ``None`` on a run that never
+    resolved one -- ``--confidence_alpha auto`` resolves only inside the confidence
+    term, so a ``--confidence_weight 0`` run has no alpha -- and those bundles then
+    carry ``conf`` with no ``occ`` at all. Required rather than defaulted: a caller
+    that forgot it would silently produce that unthresholded form.
+
     A held-out scene whose anchor set reaches nothing is **skipped and recorded**,
     never fatal -- the opposite disposition to ``train_step``'s, deliberately. One
     unsupervisable held-out scene must not end a 4-5 segment run, and the skip is
@@ -701,7 +712,7 @@ def evaluate_held_out(
         gather_query_anchor_points,
         sparse_tracking_loss,
     )
-    from arc.training.predictions import write_scene_predictions
+    from arc.training.predictions import reference_tau, write_scene_predictions
     from arc.training.runtime import shuffled_index_views
 
     rng = capture_rng_state()
@@ -709,6 +720,10 @@ def evaluate_held_out(
     directory = Path(output_dir) / "eval" / f"step-{step}"
     per_scene: list[dict] = []
     skipped: list[dict] = []
+    # Summed over the step's written bundles. `expp1` is 1+exp(x) and overflows to
+    # inf in BF16, and a non-finite confidence is reported occluded -- so this is
+    # what separates "the model called these occluded" from "the channel overflowed".
+    confidence_nonfinite = 0
 
     try:
         model.eval()
@@ -780,8 +795,21 @@ def evaluate_held_out(
 
                 if emit_predictions:
                     arrays = _prediction_arrays(
-                        raw, scene, correspondences, alignment, anchors
+                        raw,
+                        scene,
+                        correspondences,
+                        alignment,
+                        anchors,
+                        confidence_alpha,
                     )
+                    # None, not 0.0, on a run with no operating point: the bundle
+                    # carries no `occ` to take a fraction of, and a zero here would
+                    # read as "the model called nothing occluded", which is a
+                    # measurement rather than the absence of one.
+                    entry["predicted_occluded_fraction"] = (
+                        float(arrays["occ"].mean()) if "occ" in arrays else None
+                    )
+                    confidence_nonfinite += int((~np.isfinite(arrays["conf"])).sum())
                     write_scene_predictions(
                         directory / "pred" / f"{plan.seq_name}.npz", arrays
                     )
@@ -811,6 +839,18 @@ def evaluate_held_out(
         "position_loss_shuffled": (
             sum(shuffled_losses) / len(shuffled_losses) if shuffled_losses else None
         ),
+        # The operating point every bundle of this step was written at, so an eval
+        # curve can be read without opening a single .npz. Both None on a run that
+        # resolved no alpha, whose bundles carry no `occ` at all.
+        "confidence_alpha": (
+            None if confidence_alpha is None else float(confidence_alpha)
+        ),
+        "confidence_tau": (
+            None
+            if confidence_alpha is None
+            else float(reference_tau(confidence_alpha))
+        ),
+        "confidence_nonfinite": confidence_nonfinite,
         # Held-out scenes no anchor could supervise, each with the split that
         # says why. "scenes" above counts the SCORED ones, so a reader can tell a
         # scene that was skipped from one that scored zero -- which the averages,
@@ -823,7 +863,9 @@ def evaluate_held_out(
     return metrics
 
 
-def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
+def _prediction_arrays(
+    raw, scene, correspondences, alignment, anchors, confidence_alpha
+):
     """Assemble one scene's bundle in the scorers' schema.
 
     **The axis change is the substance here.** This repo's observation axis ``S``
@@ -832,16 +874,29 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     visibility reduced with ``any`` over cameras. So each covered timestep's
     cameras are combined before writing.
 
-    The fusion is a **confidence-weighted mean**, mirroring `score_joint.py`
+    **Positions** fuse by a **confidence-weighted mean**, mirroring `score_joint.py`
     verbatim (``clip(conf, 1e-6)`` then a weighted average) rather than inventing
     a rule: that is what the existing joint-pass numbers were produced with, so a
     different rule here would make these files incomparable with them.
+
+    **Confidence itself** fuses by **max**, from the *unclamped* channel. Two
+    reasons, and they agree: the cluster scorer's own occlusion call is
+    ``~(max over cameras of conf > tau)``, and ``gt_vis_any`` is ``any`` over
+    cameras -- max is the confidence analogue of ``any``, so the predicted and
+    ground-truth channels answer the same question. A mean would not; a point
+    tracked confidently in one camera of four would average down while
+    ``gt_vis_any`` still called it visible.
+
+    ``confidence_alpha`` is the run's frozen alpha (``None`` on a run that never
+    resolved one). It sets the reference threshold in ``build_prediction_arrays``;
+    it is not read per sample and nothing about it depends on this eval's ground
+    truth.
     """
 
     from arc.training import gather_at_correspondences, sparse_targets
     from arc.training.predictions import build_prediction_arrays
 
-    positions, visible, _finite, mask = sparse_targets(scene, correspondences)
+    positions, visible, _finite, _mask = sparse_targets(scene, correspondences)
     metric = float(scene.track_upscaling_factor)
     # From the predictions, matching `sparse_tracking_loss` (`device =
     # tracks.device`). Taking it from `positions` inverts that: targets follow the
@@ -853,7 +908,6 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     # derived from `device`, so they are co-located here rather than at each use.
     positions = positions.to(device)
     visible = visible.to(device)
-    mask = mask.to(device)
 
     displacement = gather_at_correspondences(
         raw["track_multi"], correspondences.to(device)
@@ -867,18 +921,21 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     )
     target = positions * metric
 
-    confidence = raw.get("conf_track_multi")
-    weights = (
-        gather_at_correspondences(confidence, correspondences.to(device)).clamp_min(
-            1e-6
-        )
-        if confidence is not None
-        else torch.ones_like(mask, dtype=torch.float32)
+    # Unguarded, and a KeyError here is the intended failure. `Arc._forward` sets
+    # `track_multi` and `conf_track_multi` in the same `inference_track` branch, so
+    # if the dereference two lines above succeeded this one does too. The former
+    # `is None -> ones_like` fallback is gone: under the confidence contract it
+    # fabricated a measurement, since an all-ones conf is indistinguishable in the
+    # written file from a real, saturated model.
+    gathered = gather_at_correspondences(
+        raw["conf_track_multi"], correspondences.to(device)
     )
+    # Clamped for the position weights only. What gets STORED is the raw channel.
+    weights = gathered.clamp_min(1e-6)
 
     slot_times = scene.slot_times.to(device)
     covered = sorted({int(value) for value in slot_times.tolist()})
-    fused, fused_gt, fused_visible = [], [], []
+    fused, fused_gt, fused_visible, fused_conf = [], [], [], []
     for original_time in covered:
         slots = (slot_times == original_time).nonzero(as_tuple=True)[0]
         weight = weights[:, slots]
@@ -890,10 +947,13 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
         # instant carries it; taking the first is exact, not an approximation.
         fused_gt.append(target[:, slots[0]])
         fused_visible.append(visible[:, slots].any(dim=1))
+        # Max, matching the `any` on the line above -- see the docstring.
+        fused_conf.append(gathered[:, slots].amax(dim=1))
 
     predicted_tn = torch.stack(fused, dim=0)
     target_tn = torch.stack(fused_gt, dim=0)
     visible_tn = torch.stack(fused_visible, dim=0)
+    confidence_tn = torch.stack(fused_conf, dim=0)
 
     # Column 0 is the index into the covered timesteps, never the original frame.
     position_of_time = {value: index for index, value in enumerate(covered)}
@@ -918,9 +978,11 @@ def _prediction_arrays(raw, scene, correspondences, alignment, anchors):
     return build_prediction_arrays(
         predicted_positions=predicted_tn,
         ground_truth_positions=target_tn,
-        # The scorer wants predicted visibility and inverts this, so what is
-        # stored is occlusion.
-        occluded=~visible_tn,
+        # The model's own channel. `occ` is derived from it there, at
+        # `confidence_alpha / d` -- the scorer wants predicted visibility and
+        # inverts what is stored, so what is stored is occlusion.
+        confidence=confidence_tn,
+        confidence_alpha=confidence_alpha,
         query_points=queries,
         visible_any_camera=visible_tn,
     )
@@ -2058,6 +2120,11 @@ def run_training(
                 step=completed,
                 output_dir=output_dir,
                 query_anchors=val_anchors,
+                # The run's frozen alpha, which sets the bundles' reference
+                # occlusion threshold. Still None here on a position-only run, and
+                # on an 'auto' run's eval before the first executed step -- both
+                # write `conf` with no `occ`.
+                confidence_alpha=args.resolved_confidence_alpha,
             )
             evaluations.append(metrics)
             print(
@@ -2065,7 +2132,10 @@ def run_training(
                 f"skipped={len(metrics['skipped_scenes'])} "
                 f"held_out_loss={metrics['position_loss']} "
                 f"held_out_metric_error_m={metrics['metric_error_m']} "
-                f"shuffled={metrics['position_loss_shuffled']}"
+                f"shuffled={metrics['position_loss_shuffled']} "
+                # None here says the bundles carry no `occ`, which is the one
+                # thing about them a reader cannot infer from the loss curve.
+                f"conf_tau={metrics['confidence_tau']}"
             )
         if args.save_every and completed % args.save_every == 0:
             _write_checkpoint(

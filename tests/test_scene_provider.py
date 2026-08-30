@@ -26,8 +26,13 @@ import torch
 
 import train_temporal_tracking as train_cli
 from arc.training.predictions import (
+    LEGACY_PREDICTION_KEYS,
+    OCCLUSION_DISTANCE_M,
     PREDICTION_KEYS,
+    UNTHRESHOLDED_PREDICTION_KEYS,
     build_prediction_arrays,
+    read_scene_predictions,
+    reference_tau,
     write_scene_predictions,
 )
 from arc.training.scene_provider import (
@@ -418,12 +423,25 @@ def test_the_transform_is_read_by_key_not_by_position(stub_transform_scene):
 # --------------------------------------------------------- prediction schema ---
 
 
-def _bundle(time_count=3, track_count=4):
+# The alpha every bundle below is built at. A literal, never `reference_tau`'s own
+# output: a fixture that called the function under test could not catch that
+# function changing. tau is therefore 2.0 / 0.10 == 20.0.
+_ALPHA = 2.0
+_TAU = 20.0
+
+
+def _bundle(time_count=3, track_count=4, confidence_alpha=_ALPHA):
     generator = torch.Generator().manual_seed(5)
     return dict(
         predicted_positions=torch.randn(time_count, track_count, 3, generator=generator),
         ground_truth_positions=torch.randn(time_count, track_count, 3, generator=generator),
-        occluded=torch.zeros(time_count, track_count, dtype=torch.bool),
+        # Straddles tau, so `occ` is neither all-True nor all-False. The old fixture
+        # passed `occluded=zeros` beside `visible_any_camera=ones`, which IS the
+        # degeneracy these tests exist to catch -- consistent by luck, never asserted.
+        confidence=torch.linspace(
+            1.0, 40.0, time_count * track_count
+        ).reshape(time_count, track_count),
+        confidence_alpha=confidence_alpha,
         query_points=torch.cat(
             [
                 torch.zeros(track_count, 1),
@@ -465,6 +483,14 @@ def test_the_written_npz_carries_exactly_what_the_cluster_scorer_reads(tmp_path)
     assert loaded["occ"].dtype == bool
     assert (~loaded["occ"]).shape == visible_any.shape
     assert loaded["query_points"].shape == (gt.shape[1], 4)
+    # conf, tau, confidence_alpha and tau_distance_m are ours, not the scorers'.
+    # np.load ignores a key nothing indexes, which is what keeps the five reads
+    # transcribed above working unchanged against the wider bundle.
+    assert loaded["conf"].dtype == np.float32
+    assert loaded["conf"].shape == visible_any.shape
+    for scalar in ("tau", "confidence_alpha", "tau_distance_m"):
+        assert loaded[scalar].shape == (), scalar
+        assert loaded[scalar].dtype == np.float32, scalar
 
 
 def test_query_times_outside_the_covered_window_are_refused(tmp_path):
@@ -486,10 +512,301 @@ def test_a_bundle_missing_a_key_is_refused_before_it_reaches_disk(tmp_path):
     """A file the scorer cannot read is worse than no file."""
 
     arrays = build_prediction_arrays(**_bundle())
-    del arrays["occ"]
+    del arrays["tau"]
 
-    with pytest.raises(ValueError, match="missing \\['occ'\\]"):
+    with pytest.raises(ValueError, match="missing \\['tau'\\]"):
         write_scene_predictions(tmp_path / "0001.npz", arrays)
+
+
+def test_a_bundle_carrying_an_extra_key_is_refused_before_it_reaches_disk(tmp_path):
+    """The other half of the writer's gate, which nothing exercised.
+
+    The check is a symmetric set difference, and the `unexpected` branch is what
+    makes the on-disk key set exact rather than merely sufficient -- which is what
+    lets `occ` be refused when there is no threshold behind it.
+    """
+
+    arrays = build_prediction_arrays(**_bundle())
+    arrays["extra"] = np.zeros(3, dtype=np.float32)
+
+    with pytest.raises(ValueError, match="unexpected \\['extra'\\]"):
+        write_scene_predictions(tmp_path / "0001.npz", arrays)
+
+
+def test_occlusion_is_derived_from_confidence_and_not_from_the_inverted_ground_truth():
+    """The regression test this whole change carries.
+
+    `occ` was `~visible_tn` while `gt_vis_any` was `visible_tn` -- one tensor
+    written into both slots -- so every AJ, OA and delta_avg figure ever produced
+    from these bundles was scored with ORACLE visibility, and the track head's
+    confidence channel was read by no metric at all. A bundle whose `occ` is still
+    recoverable from `gt_vis_any` is that measurement, re-shipped under a new name.
+    """
+
+    arrays = build_prediction_arrays(**_bundle())
+
+    assert arrays["gt_vis_any"].all(), "the fixture must not make the two agree by luck"
+    assert not np.array_equal(arrays["occ"], ~arrays["gt_vis_any"])
+    # And it is the confidence split, not merely something different.
+    np.testing.assert_array_equal(arrays["occ"], arrays["conf"] < _TAU)
+    assert arrays["occ"].any() and not arrays["occ"].all()
+
+
+def test_two_models_with_different_confidence_write_different_occlusion():
+    """The defect was invisible because `occ` was a function of the scene alone.
+
+    No model, however badly calibrated, could move it. Two confidence channels over
+    identical positions and identical ground truth must now disagree.
+    """
+
+    first = _bundle()
+    second = _bundle()
+    second["confidence"] = torch.flip(second["confidence"], dims=(0,))
+
+    left = build_prediction_arrays(**first)
+    right = build_prediction_arrays(**second)
+
+    np.testing.assert_array_equal(left["pred"], right["pred"])
+    np.testing.assert_array_equal(left["gt_vis_any"], right["gt_vis_any"])
+    assert not np.array_equal(left["occ"], right["occ"])
+
+
+def test_the_reference_threshold_is_the_implied_error_at_the_recorded_distance(tmp_path):
+    """tau is the channel's own calibration, not a quantile of it.
+
+    `conf* = alpha/err` is the confidence term's optimum, so a point's implied error
+    is `alpha/conf` and calling it occluded past `d` metres is `conf <= alpha/d`.
+    Asserted against a literal, and re-derived from the two scalars the file stores,
+    because `d` is unrecoverable from a bundle that records only tau.
+    """
+
+    arrays = build_prediction_arrays(**_bundle(confidence_alpha=_ALPHA))
+    assert float(arrays["tau"]) == _TAU
+    assert arrays["tau_distance_m"] == np.float32(OCCLUSION_DISTANCE_M)
+
+    loaded = np.load(write_scene_predictions(tmp_path / "0001.npz", arrays))
+    assert loaded["tau"] == loaded["confidence_alpha"] / loaded["tau_distance_m"]
+
+
+def test_a_confidence_shaped_like_the_observation_axis_is_refused():
+    """`conf` arrives as (M,S), camera-major over cameras x times, and must be fused.
+
+    An unfused (M,S) whose S happened to equal T, or a stray trailing axis, would
+    broadcast or transpose the threshold onto the wrong points and still write a
+    perfectly well-formed file.
+    """
+
+    for wrong in (torch.ones(4, 3), torch.ones(3, 4, 1), torch.ones(12)):
+        bundle = _bundle(time_count=3, track_count=4)
+        bundle["confidence"] = wrong
+        with pytest.raises(ValueError, match="conf must have shape"):
+            build_prediction_arrays(**bundle)
+
+
+def test_a_boolean_confidence_is_refused_rather_than_cast_to_ones_and_zeros():
+    """The original bug, reachable again through the new parameter.
+
+    `_as_array` casts unconditionally, so a caller handing the visibility mask where
+    confidence belongs would get 1.0/0.0 and an `occ` that is ground truth once more
+    -- with nothing anywhere to say so.
+    """
+
+    for wrong in (
+        torch.zeros(3, 4, dtype=torch.bool),
+        torch.ones(3, 4, dtype=torch.long),
+        np.ones((3, 4), dtype=bool),
+    ):
+        bundle = _bundle(time_count=3, track_count=4)
+        bundle["confidence"] = wrong
+        with pytest.raises(ValueError, match="conf must "):
+            build_prediction_arrays(**bundle)
+
+
+def test_the_stored_occlusion_is_exactly_recomputable_from_the_stored_confidence(tmp_path):
+    """Nothing in THIS repository scores these files; evaluate_3dpt is elsewhere.
+
+    So the only guarantee that a published figure can be re-derived is that `occ` is
+    a total function of two arrays inside the same file. That fails silently if the
+    reader's dtype promotion differs from the writer's: a float64 tau against a
+    float32 conf disagrees within one ulp, and NEP 50 weak promotion gives a third
+    answer again. The fixture straddles tau, sits exactly ON tau, and carries a NaN
+    and an inf -- without the tie and the NaN this cannot fail for either reason it
+    exists.
+    """
+
+    bundle = _bundle(time_count=2, track_count=3)
+    bundle["confidence"] = torch.tensor(
+        [[1.0, _TAU, 40.0], [19.999999, float("inf"), float("nan")]]
+    )
+
+    loaded = np.load(
+        write_scene_predictions(
+            tmp_path / "0001.npz", build_prediction_arrays(**bundle)
+        )
+    )
+    conf, tau, occ = loaded["conf"], loaded["tau"], loaded["occ"]
+
+    np.testing.assert_array_equal(occ, ~(conf >= tau))
+    np.testing.assert_array_equal(
+        occ, ~(conf.astype(np.float64) >= tau.astype(np.float64))
+    )
+    finite = np.isfinite(conf)
+    np.testing.assert_array_equal(occ[finite], (conf < tau)[finite])
+    # The tie is visible and the value one ulp below it is not: the two directions
+    # of `>=` are both exercised, on real float32 neighbours.
+    assert not occ[0, 1] and occ[1, 0]
+
+
+def test_a_non_finite_confidence_reads_as_occluded_rather_than_visible(tmp_path):
+    """numpy sends `nan < tau` to False, and the scorer inverts `occ` into visibility.
+
+    The naive rule therefore turns a confidence that overflowed `expp1` into "the
+    model confidently called this point visible". A NaN is the absence of a call.
+    `+inf` is not -- it is a real, enormous confidence, and stays visible.
+    """
+
+    bundle = _bundle(time_count=1, track_count=2)
+    bundle["confidence"] = torch.tensor([[float("nan"), float("inf")]])
+
+    arrays = build_prediction_arrays(**bundle)
+
+    assert arrays["occ"][0, 0], "a NaN confidence must not be credited as visible"
+    assert not arrays["occ"][0, 1], "an overflowed +inf is a real, enormous confidence"
+
+
+def test_a_run_with_no_resolved_alpha_omits_occlusion_entirely(tmp_path):
+    """A `--confidence_weight 0` run has no alpha, hence no operating point.
+
+    Absence, not an all-occluded array: the cluster's `score_curve.py` guards on the
+    five legacy keys and otherwise indexes `z["occ"]` unguarded, so an all-occluded
+    bundle would be scored and would report OA near the 10.6% base rate beside real
+    numbers. `conf` still ships, so the file stays sweepable.
+    """
+
+    arrays = build_prediction_arrays(**_bundle(confidence_alpha=None))
+
+    assert "occ" not in arrays
+    assert np.isnan(arrays["tau"]) and np.isnan(arrays["confidence_alpha"])
+    assert arrays["tau_distance_m"] == np.float32(OCCLUSION_DISTANCE_M), "d must survive"
+    assert np.isfinite(arrays["conf"]).all() and arrays["conf"].std() > 0
+
+    loaded = np.load(write_scene_predictions(tmp_path / "0001.npz", arrays))
+    assert set(loaded.files) == set(UNTHRESHOLDED_PREDICTION_KEYS)
+
+
+def test_an_unthresholded_bundle_trips_the_cluster_scorers_own_missing_key_branch(
+    tmp_path,
+):
+    """Asserted against a transcription of `score_curve.py`, not our own key tuple.
+
+    Checking our constant against our constant cannot fail for the reason omission
+    exists. This is that file's guard, copied by hand:
+
+        missing = {"pred","gt","occ","query_points","gt_vis_any"} - set(z.files)
+        if missing: print(... "skipping"); continue
+
+    so the bundle must be skipped with a message, and any consumer that reaches past
+    the guard must get a KeyError naming the key rather than a scorable array.
+    """
+
+    path = write_scene_predictions(
+        tmp_path / "0001.npz",
+        build_prediction_arrays(**_bundle(confidence_alpha=None)),
+    )
+
+    z = np.load(path)
+    assert set(LEGACY_PREDICTION_KEYS) - set(z.files) == {"occ"}
+    with pytest.raises(KeyError):
+        z["occ"]
+
+
+def test_an_occlusion_array_beside_a_non_finite_threshold_never_reaches_disk(tmp_path):
+    """The writer derives its expected keys from the bundle's own tau.
+
+    So the all-occluded array cannot reach disk by any route, not merely by the one
+    `build_prediction_arrays` declines to take.
+    """
+
+    arrays = build_prediction_arrays(**_bundle(confidence_alpha=None))
+    arrays["occ"] = np.ones_like(arrays["conf"], dtype=bool)
+
+    with pytest.raises(ValueError, match="unexpected \\['occ'\\]"):
+        write_scene_predictions(tmp_path / "0001.npz", arrays)
+
+
+def test_a_legacy_bundle_is_refused_until_the_caller_asks_for_oracle_visibility(tmp_path):
+    """An old bundle's `occ` IS `~gt_vis_any`, and no post-hoc fix recovers a
+    prediction that was never made.
+
+    Scored by default it would put an oracle-occlusion AJ in the same table as a
+    real one, which is the failure this change exists to end -- so the reader
+    refuses rather than returning a flag a caller can forget to check.
+    """
+
+    arrays = build_prediction_arrays(**_bundle())
+    legacy = {key: arrays[key] for key in LEGACY_PREDICTION_KEYS}
+    legacy["occ"] = ~arrays["gt_vis_any"]
+    path = tmp_path / "legacy.npz"
+    np.savez_compressed(path, **legacy)
+
+    with pytest.raises(ValueError, match="predates the confidence contract"):
+        read_scene_predictions(path)
+
+    loaded = read_scene_predictions(path, allow_unscorable=True)
+    assert set(loaded) == set(LEGACY_PREDICTION_KEYS)
+
+
+def test_a_bundle_with_no_operating_point_is_refused_until_the_caller_opts_in(tmp_path):
+    """The second half of the same gate, with its own message.
+
+    A tau-sweeping consumer opts in because it reads `conf` and never `occ`; one
+    that meant to read `occ` gets told there is no threshold behind it.
+    """
+
+    path = write_scene_predictions(
+        tmp_path / "0001.npz",
+        build_prediction_arrays(**_bundle(confidence_alpha=None)),
+    )
+
+    with pytest.raises(ValueError, match="no reference operating point"):
+        read_scene_predictions(path)
+
+    loaded = read_scene_predictions(path, allow_unscorable=True)
+    assert "occ" not in loaded and np.isfinite(loaded["conf"]).all()
+
+
+def test_an_unthresholded_bundle_is_shape_checked_too(tmp_path):
+    """The opt-in caller is the one that needs the shape contract MOST.
+
+    A tau-sweeping consumer passes allow_unscorable=True and then indexes `conf`
+    against `pred`, `gt` and `gt_vis_any` itself -- so enforcing the contract only
+    on the thresholded path, which that consumer never takes, would be backwards.
+    The writer checks keys and not shapes, so nothing else stands between a
+    malformed file and the sweep.
+    """
+
+    arrays = build_prediction_arrays(**_bundle(confidence_alpha=None))
+    arrays["conf"] = np.zeros((7, 7), dtype=np.float32)
+    path = write_scene_predictions(tmp_path / "0001.npz", arrays)
+
+    with pytest.raises(ValueError, match="conf must have shape"):
+        read_scene_predictions(path, allow_unscorable=True)
+
+
+def test_a_bundle_whose_occlusion_disagrees_with_its_own_threshold_is_refused(tmp_path):
+    """The point of recording tau is that a figure cannot be separated from it.
+
+    The writer makes them agree by construction, so this catches the case the
+    construction cannot: a file edited, half-migrated or assembled elsewhere.
+    """
+
+    arrays = build_prediction_arrays(**_bundle())
+    arrays["occ"] = arrays["occ"].copy()
+    arrays["occ"][0, 0] = not arrays["occ"][0, 0]
+    path = write_scene_predictions(tmp_path / "0001.npz", arrays)
+
+    with pytest.raises(ValueError, match="not `~\\(conf >= tau\\)`"):
+        read_scene_predictions(path)
 
 
 # ------------------------------------------------------------- axis fusion ---
@@ -531,7 +848,9 @@ def test_cameras_are_fused_per_timestep_by_confidence(dumped_scene):
     alignment = DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3))
     anchors = torch.zeros(correspondences.count, 3)
 
-    arrays = train_cli._prediction_arrays(raw, scene, correspondences, alignment, anchors)
+    arrays = train_cli._prediction_arrays(
+        raw, scene, correspondences, alignment, anchors, _ALPHA
+    )
 
     covered = sorted({int(t) for t in scene.slot_times.tolist()})
     assert arrays["pred"].shape == (len(covered), correspondences.count, 3)
@@ -544,6 +863,17 @@ def test_cameras_are_fused_per_timestep_by_confidence(dumped_scene):
     expected = float((values * weights).sum() / weights.sum())
 
     np.testing.assert_allclose(arrays["pred"][0, :, 0], expected, rtol=1e-5)
+
+    # Confidence itself fuses by MAX, not by the weighted mean the positions use.
+    # Pinned against that mean, which for these slots is a strictly smaller number:
+    # `gt_vis_any` reduces cameras with `any`, and max is its confidence analogue --
+    # a mean would let a point tracked confidently in one camera of four average
+    # down while ground truth still called it visible.
+    assert float(arrays["conf"][0].max()) == max(slot + 1 for slot in slots)
+    np.testing.assert_allclose(
+        arrays["conf"][0, :], float(max(slot + 1 for slot in slots)), rtol=1e-5
+    )
+    assert max(slot + 1 for slot in slots) > expected
 
 
 def test_the_covered_timestep_column_indexes_the_window_not_the_frames(dumped_scene):
@@ -567,6 +897,7 @@ def test_the_covered_timestep_column_indexes_the_window_not_the_frames(dumped_sc
         correspondences,
         DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
         torch.zeros(correspondences.count, 3),
+        _ALPHA,
     )
 
     covered = sorted({int(t) for t in scene.slot_times.tolist()})

@@ -31,7 +31,18 @@ import torch
 import torch.nn as nn
 
 import train_temporal_tracking as train_cli
-from arc.training.predictions import PREDICTION_KEYS
+from arc.training.predictions import (
+    PREDICTION_KEYS,
+    UNTHRESHOLDED_PREDICTION_KEYS,
+    OCCLUSION_DISTANCE_M,
+)
+
+# The alpha the eval tests pass, and the threshold it implies. _FakeArc's confidence
+# channel spans [1+100q, 101+100q) per query slot, so a tau of 50 lands inside the
+# q=0 band and splits it -- which is what makes `occ` a real call rather than a
+# constant array that would satisfy every assertion below for the wrong reason.
+_EVAL_ALPHA = 5.0
+_EVAL_TAU = _EVAL_ALPHA / OCCLUSION_DISTANCE_M
 from arc.training.scene_provider import MVTrackerSceneProvider, SceneProviderError
 from arc.training.manifest_plan import StepPlan
 from arc.training.schedule import (
@@ -1037,7 +1048,30 @@ class _FakeArc(nn.Module):
         track = (
             torch.ones(1, self.observations, self.height, self.width, 3) * feats[0]
         )
-        confidence = torch.ones(1, self.observations, self.height, self.width)
+        # Deliberately NOT constant. A flat confidence makes every occlusion test
+        # vacuous: the fused (T,N) channel comes out uniform, so `occ` is all-True
+        # or all-False whatever the threshold, and "occ is not ~gt_vis_any" passes
+        # for the wrong reason. Four constraints hold it in place:
+        #   * strictly > 1, mirroring `expp1`; `track_confidence_loss` takes
+        #     log(conf) and a value at 0 would trip assert_trainable_gradients_finite
+        #   * finite everywhere, so the confidence term still drops nothing
+        #   * varying across (S,H,W), so distinct correspondences gather distinct
+        #     values and the fused channel is non-degenerate
+        #   * independent of `feats`, which carries the parameter sum -- a
+        #     dependency would put confidence in the autograd graph and move the
+        #     gradient norms every _weighted_step test reads
+        # Varies over (H,W) and with the query slot, but NOT over S, so the eval's
+        # max-over-cameras fusion is a value this file can predict: every covered
+        # timestep's fused confidence spans the same [1+100q, 101+100q) that one
+        # camera does. `expp1` output really does reach the low hundreds, so this
+        # is the right order of magnitude for _EVAL_ALPHA to sit inside.
+        pixels = torch.arange(self.height * self.width, dtype=torch.float32)
+        confidence = 1.0 + 100.0 * (query_idx + pixels / pixels.numel())
+        confidence = (
+            confidence.reshape(1, 1, self.height, self.width)
+            .expand(1, self.observations, self.height, self.width)
+            .contiguous()
+        )
         return track, confidence
 
     def forward(self, views, force_no_output_conversion=False):
@@ -1278,6 +1312,7 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         step=7,
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
     )
 
     assert metrics["step"] == 7 and metrics["scenes"] == 1
@@ -1294,6 +1329,161 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     assert written["query_anchors"] == ["0:0"]
     loaded = np.load(directory / "pred" / "0000.npz")
     assert set(loaded.files) == set(PREDICTION_KEYS)
+    # The threshold the step wrote at, readable without opening a single .npz.
+    assert written["confidence_alpha"] == _EVAL_ALPHA
+    assert written["confidence_tau"] == pytest.approx(_EVAL_TAU)
+    assert written["confidence_nonfinite"] == 0
+    assert written["per_scene"][0]["predicted_occluded_fraction"] is not None
+
+
+def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkeypatch):
+    """The end-to-end twin of the schema regression test.
+
+    `occ` was `~visible_tn` and `gt_vis_any` was `visible_tn`, so every figure these
+    bundles ever produced was scored with oracle visibility. Asserted through the
+    real `evaluate_held_out` rather than the builder alone, because the defect lived
+    in the trainer's call and not in the schema.
+    """
+
+    # Hidden in BOTH cameras, so `gt_vis_any` -- which reduces cameras with `any` --
+    # is genuinely mixed; hiding it in one leaves the fused row True and the oracle
+    # `occ` uniformly False, which would let the comparison below pass against the
+    # very defect it exists to catch. At time 2, not at the anchor time, so the
+    # query stays eligible and the track still reaches the bundle.
+    scene = _step_scene(tmp_path, monkeypatch, invisible=((0, 2, 2), (1, 2, 2)))
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=2,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
+    )
+
+    loaded = np.load(tmp_path / "out" / "eval" / "step-2" / "pred" / "0000.npz")
+    occ, conf, tau = loaded["occ"], loaded["conf"], loaded["tau"]
+    visible = loaded["gt_vis_any"]
+
+    # Both sides non-degenerate, or the inequality could hold for the wrong reason.
+    assert occ.any() and not occ.all(), "the fake's confidence must straddle tau"
+    assert visible.any() and not visible.all(), "the fixture must occlude something"
+    assert not np.array_equal(occ, ~visible)
+    np.testing.assert_array_equal(occ, ~(conf >= tau))
+    assert tau == pytest.approx(_EVAL_TAU)
+
+
+def test_a_position_only_run_writes_a_sweepable_bundle_with_no_operating_point(
+    tmp_path, monkeypatch
+):
+    """`--confidence_weight 0` resolves no alpha, so there is no threshold to write.
+
+    The bundle must still be well formed and still carry the model's own confidence
+    -- an unsupervised channel is a true measurement -- but it carries no `occ`,
+    because an all-occluded array would be scored by the cluster's existing guards
+    and would report a real-looking OA that means nothing.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=4,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=None,
+    )
+
+    assert metrics["confidence_alpha"] is None
+    assert metrics["confidence_tau"] is None
+    assert metrics["per_scene"][0]["predicted_occluded_fraction"] is None
+
+    loaded = np.load(tmp_path / "out" / "eval" / "step-4" / "pred" / "0000.npz")
+    assert set(loaded.files) == set(UNTHRESHOLDED_PREDICTION_KEYS)
+    assert np.isnan(loaded["tau"]) and np.isnan(loaded["confidence_alpha"])
+    # The artifact that makes the file worth keeping: a real, varying channel to
+    # sweep a threshold over downstream.
+    assert np.isfinite(loaded["conf"]).all() and loaded["conf"].std() > 0
+
+
+def test_the_eval_writes_one_threshold_from_the_runs_own_alpha(tmp_path, monkeypatch):
+    """tau belongs to the RUN, so every scene of a step is written at the same one.
+
+    A per-scene threshold would make the scenes inside a single eval point
+    incomparable with each other -- the finer-grained version of separating a figure
+    from the threshold that produced it.
+    """
+
+    good = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = good.views[0]["img"].shape[-2:]
+    model = _FakeArc(good.num_observations, height, width)
+
+    train_cli.evaluate_held_out(
+        model=model,
+        plans=[
+            plan_record(_record(seq_name="0000"), budget=48, stride=2),
+            plan_record(_record(seq_name="0001"), budget=48, stride=2),
+        ],
+        scene_provider=lambda _plan: good,
+        precision="32",
+        huber_delta_m=0.05,
+        step=6,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
+    )
+
+    directory = tmp_path / "out" / "eval" / "step-6" / "pred"
+    first = np.load(directory / "0000.npz")
+    second = np.load(directory / "0001.npz")
+
+    assert first["tau"] == second["tau"] == np.float32(_EVAL_TAU)
+    assert first["tau"] == first["confidence_alpha"] / first["tau_distance_m"]
+
+
+def test_a_raw_prediction_without_a_confidence_channel_is_refused(
+    tmp_path, monkeypatch
+):
+    """The old `conf_track_multi is None -> ones_like` fallback wrote a fiction.
+
+    An all-ones confidence thresholds to a bundle claiming the model called every
+    point visible, indistinguishable in the file from a real saturated model.
+    `Arc._forward` sets `track_multi` and `conf_track_multi` in the same branch, so
+    the only caller the fallback could ever have served was a malformed one.
+    """
+
+    from arc.training import DetachedSim3, build_anchor_correspondences
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    correspondences, _ = build_anchor_correspondences(scene)
+    height, width = scene.views[0]["img"].shape[-2:]
+    raw = {
+        "track_multi": torch.zeros(
+            1, 1, scene.num_observations, height, width, 3
+        ),
+        "track_query_idx": scene.track_query_observation_slots.clone(),
+    }
+
+    with pytest.raises(KeyError, match="conf_track_multi"):
+        train_cli._prediction_arrays(
+            raw,
+            scene,
+            correspondences,
+            DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
+            torch.zeros(correspondences.count, 3),
+            _EVAL_ALPHA,
+        )
 
 
 def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
@@ -1325,6 +1515,7 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
         step=1,
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
         emit_predictions=False,
     )
 
@@ -2015,6 +2206,7 @@ def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
         step=3,
         output_dir=tmp_path / "out",
         query_anchors=["0:0", "1:0"],
+        confidence_alpha=_EVAL_ALPHA,
     )
 
     assert metrics["scenes"] == 1
@@ -2701,6 +2893,7 @@ def test_the_eval_is_position_only_whatever_the_training_flags_say(
         step=0,
         output_dir=tmp_path,
         query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
     )
 
     assert seen, "the eval must have scored something"
@@ -3431,6 +3624,7 @@ def test_an_unsupervisable_held_out_scene_is_skipped_and_recorded(
         step=5,
         output_dir=tmp_path / "out",
         query_anchors=["0:2"],
+        confidence_alpha=_EVAL_ALPHA,
     )
 
     # Scored zero scenes, and said so rather than raising.
@@ -3481,6 +3675,7 @@ def test_one_unsupervisable_held_out_scene_leaves_the_others_scored(
         step=1,
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
         emit_predictions=False,
     )
 
