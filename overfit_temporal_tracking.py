@@ -240,6 +240,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--encoder_local_checkpointing",
+        action="store_true",
+        help=(
+            "Also activation-checkpoint the encoder's local-attention blocks -- "
+            "26 of the 40 at alt_start=13, and the bulk of the retained encoder "
+            "activations. The 14 global-attention blocks are already "
+            "checkpointed in training mode whether this is set or not. "
+            "Recomputing costs one extra forward over those 26 blocks, which is "
+            "about 65%% of one encoder forward -- NOT 65%% of a step, which also "
+            "carries a backward running roughly twice forward plus the motion "
+            "decoder, DPT head, track head and camera head. Off, the default, is "
+            "exactly today's behaviour"
+        ),
+    )
+    parser.add_argument(
         "--parse_only",
         action="store_true",
         help=(
@@ -968,6 +983,7 @@ def main() -> None:
         "" if late_global_blocks is None else f", k={late_global_blocks}"
     )
     model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    model.set_encoder_local_checkpointing(args.encoder_local_checkpointing)
     report = assert_trainable_parameter_set(
         model,
         freeze_mode=args.freeze_mode,
@@ -977,7 +993,8 @@ def main() -> None:
     print(
         "trainable="
         f"{report['tensor_count']} tensors / {report['parameter_count']} "
-        f"parameters ({args.freeze_mode}{late_global_note})"
+        f"parameters ({args.freeze_mode}{late_global_note}) "
+        f"encoder_local_checkpointing={args.encoder_local_checkpointing}"
     )
 
     _move_views_to_cuda(scene.views)
@@ -1584,6 +1601,11 @@ def main() -> None:
         # None under the modes whose name already fixes their parameter set, so
         # an archived summary is never ambiguous about which mask ran.
         "late_global_blocks": late_global_blocks,
+        # Memory, not objective: it changes what the encoder retains for
+        # backward, not what the run optimizes. Recorded next to gpu_name below
+        # for the same reason -- it is part of what produced this run's step
+        # times, and nothing else in the summary would show it.
+        "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
         # A run is bit-exact for a given (input, GPU), and different kernels act
         # like an input perturbation -- the archived arm matrix saw a matched
         # pair of runs differ by more than the whole spread between arms. Record

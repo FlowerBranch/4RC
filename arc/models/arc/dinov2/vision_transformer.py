@@ -149,6 +149,14 @@ class DinoVisionTransformer(nn.Module):
         self.rope_start = rope_start
         self.cat_token = cat_token
         self.has_time_token = has_time_token
+        # Off is exactly the shipped behaviour: process_attention checkpoints the
+        # global-attention blocks in training mode regardless of this, and leaves
+        # the local-attention ones -- 26 of 40 at alt_start=13 -- retained.  Set
+        # post-construction (Arc.set_encoder_local_checkpointing) rather than
+        # taken as a constructor argument, because PyTorchModelHubMixin
+        # serializes Arc's __init__ kwargs into config.json and this is a runtime
+        # memory knob, not architecture.
+        self.checkpoint_local_attention = False
         if isinstance(max_time_indices, bool) or not isinstance(max_time_indices, int):
             raise TypeError("max_time_indices must be a positive integer")
         if max_time_indices <= 0:
@@ -473,11 +481,17 @@ class DinoVisionTransformer(nn.Module):
         else:
             raise ValueError(f"Invalid attention type: {attn_type}")
 
-        if attn_type == "global" and self.training:
+        if self.training and (attn_type == "global" or self.checkpoint_local_attention):
             # Non-reentrant checkpointing: unlike the reentrant default it
             # computes gradients for the block's own parameters even when no
             # input tensor requires grad, which matters for freeze modes that
             # train these blocks on inputs produced by frozen layers.
+            #
+            # The captured values are passed as checkpoint *arguments*, so the
+            # lambda binds parameters rather than enclosing-scope names -- the
+            # late-binding failure ce12837 fixed in MotionDecoder, where
+            # recomputation replayed every segment with the last layer's weights
+            # and left the forward bit-identical while the gradients went wrong.
             x = torch.utils.checkpoint.checkpoint(
                 lambda inp, p, m: block(inp, pos=p, attn_mask=m), x, pos, attn_mask,
                 use_reentrant=False,

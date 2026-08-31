@@ -261,6 +261,11 @@ def _loop_args(tmp_path, **overrides):
         # The run's frozen alpha, which run_training pins after the first step
         # and _checkpoint_settings carries. None until something resolves it.
         resolved_confidence_alpha=None,
+        # Memory, not objective. _checkpoint_settings stores it and
+        # check_resume_settings warns -- rather than refuses -- on a change, so
+        # every loop test needs it present. Off is the parser's default and the
+        # behaviour every existing test assumes.
+        encoder_local_checkpointing=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -2848,6 +2853,27 @@ def test_the_loss_weights_are_recorded_in_the_plan_summary_settings(tmp_path):
     assert settings["resolved_confidence_alpha"] == 3.0
 
 
+def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):
+    """run_summary.json's settings come from _plan_summary, so the flag has to
+    land there and not only in the checkpoint -- an archived summary should say
+    which memory regime produced its step times."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    for enabled in (False, True):
+        args = _validator_args(
+            tmp_path, manifest="m.jsonl", encoder_local_checkpointing=enabled
+        )
+        settings = train_cli._plan_summary(tally, args)["settings"]
+        assert settings["encoder_local_checkpointing"] is enabled
+
+
 def test_unusable_loss_weights_are_refused_at_parse_time(tmp_path):
     for bad in (-1e-9, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="--confidence_weight"):
@@ -3530,6 +3556,77 @@ def test_flipping_the_adaptive_flag_on_resume_is_refused(tmp_path):
             ),
             [],
         )
+
+
+def test_switching_on_local_checkpointing_across_a_resume_warns_and_continues(
+    tmp_path, capsys
+):
+    """The OOM rescue, and the reason this key warns instead of refusing.
+
+    A run that dies on torch.OutOfMemoryError must be recoverable from its last
+    checkpoint by resuming with checkpointing on -- job 19819006 is the case that
+    motivated it. Refusing would force a restart, and the flag's most valuable
+    use would be unavailable exactly when it is needed.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    _run(tmp_path / "a", _loop_args(tmp_path / "a", num_steps=4), [])
+    payload = read_trainer_state(tmp_path / "a" / "train_state.pt")
+    assert payload["settings"]["encoder_local_checkpointing"] is False
+
+    second: list[_Recorded] = []
+    _run(
+        tmp_path / "b",
+        _loop_args(
+            tmp_path / "b",
+            num_steps=6,
+            resume=str(tmp_path / "a" / "train_state.pt"),
+            encoder_local_checkpointing=True,
+        ),
+        second,
+    )
+
+    error_output = capsys.readouterr().err
+    assert "encoder_local_checkpointing=False" in error_output
+    assert "encoder_local_checkpointing=True" in error_output
+    assert [r.step for r in second] == [4, 5]
+
+
+def test_a_checkpoint_predating_local_checkpointing_resumes_silently(tmp_path, capsys):
+    """Absent means absent, not False-by-implication.
+
+    The key is in the warned tier, and check_resume_settings compares a warned key
+    only when the checkpoint carries it -- which is why it deliberately has no
+    _RESUME_SETTINGS_ABSENT_DEFAULTS entry. A pre-flag checkpoint therefore
+    resumes without a warning, whether or not the new run sets the flag.
+    """
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["encoder_local_checkpointing"]
+
+    for enabled in (False, True):
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, encoder_local_checkpointing=enabled)
+        )
+        assert "encoder_local_checkpointing" not in capsys.readouterr().err
+
+
+def test_local_checkpointing_is_warned_rather_than_refused(tmp_path):
+    """The tier itself, pinned.
+
+    Recomputation re-runs identical math in the identical dtype and differs only
+    in reduction order -- a perturbation the size of the atomicAdd nondeterminism
+    this backward already carries. Moving it to the refused tier would be a
+    behaviour change, not a tightening, so it is asserted rather than left to the
+    tuple's reading order.
+    """
+
+    assert "encoder_local_checkpointing" in train_cli._RESUME_SETTINGS_WARNED
+    assert "encoder_local_checkpointing" not in train_cli._RESUME_SETTINGS_REFUSED
+    assert (
+        "encoder_local_checkpointing"
+        not in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS
+    )
 
 
 def test_eligibility_counts_sum_over_executed_steps_into_the_totals(tmp_path):

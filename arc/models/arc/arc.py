@@ -368,6 +368,23 @@ class Arc(
             late_global_blocks if freeze == "temporal_tracking_late_global" else None
         )
 
+    def set_encoder_local_checkpointing(self, enabled):
+        """Also activation-checkpoint the encoder's local-attention blocks.
+
+        The global-attention blocks are checkpointed in training mode whatever
+        this is set to (vision_transformer.py, in `process_attention`); the
+        local ones -- 26 of 40 at alt_start=13 -- are the ones this covers, and
+        they hold the bulk of the retained encoder activations.  Off is the
+        shipped behaviour and leaves the forward and the gradients exactly as
+        they were.
+
+        Here rather than in the drivers so the `backbone.pretrained` path is
+        written once: two trainers and the tests set this, and an attribute
+        assigned through the wrong handle would silently do nothing.
+        """
+
+        self.backbone.pretrained.checkpoint_local_attention = bool(enabled)
+
     def get_trainable_parameter_report(self):
         parameters = [
             (name, parameter.numel())

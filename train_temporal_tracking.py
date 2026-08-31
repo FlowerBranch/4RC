@@ -1456,6 +1456,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(default: %(default)s). The committed window runs near it by design"
         ),
     )
+    training.add_argument(
+        "--encoder_local_checkpointing",
+        action="store_true",
+        help=(
+            "Also activation-checkpoint the encoder's local-attention blocks -- "
+            "26 of the 40 at alt_start=13, and the bulk of the retained encoder "
+            "activations. The 14 global-attention blocks are already "
+            "checkpointed in training mode whether this is set or not. "
+            "Recomputing costs one extra forward over those 26 blocks, which is "
+            "about 65%% of one encoder forward -- NOT 65%% of a step: a step is "
+            "forward plus a backward running roughly twice forward, across the "
+            "motion decoder, DPT head, track head and camera head as well, so "
+            "the step-level cost is a small fraction of that. May be switched on "
+            "across a --resume, which warns and continues rather than refusing, "
+            "so an out-of-memory run can be rescued from its last checkpoint "
+            "instead of restarted. Off, the default, is exactly today's behaviour"
+        ),
+    )
     training.add_argument("--scene_cache", type=int, default=1)
     training.add_argument(
         "--max_scene_skip_fraction",
@@ -1828,6 +1846,12 @@ def _plan_summary(tally, args) -> dict:
             # asked for: None under 'auto' until a step resolves it, which is why
             # this is reported next to the request rather than instead of it.
             "resolved_confidence_alpha": args.resolved_confidence_alpha,
+            # Memory, not objective: it changes what the encoder retains for
+            # backward, not what the run optimizes. Recorded anyway because it
+            # is the difference between a peak that fits the device and one that
+            # does not, so an archived summary should say which regime produced
+            # its step times.
+            "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
         },
     }
 
@@ -2379,6 +2403,7 @@ def _checkpoint_settings(args) -> dict:
         "warmup_steps": args.warmup_steps,
         "min_lr_scale": args.min_lr_scale,
         "precision": args.precision,
+        "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
     }
 
 
@@ -2433,6 +2458,19 @@ def _write_checkpoint(
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
 #
+# encoder_local_checkpointing warns rather than refuses, and the precision
+# analogy is why the line falls there rather than one entry over. Precision
+# changes the arithmetic; local checkpointing re-runs identical math in the
+# identical dtype and differs only in the reduction order recomputation imposes.
+# That perturbation is the size of one this backward already carries -- atomicAdd
+# in the scatter and grid-sample backward puts the same commit 6.7e-6 apart,
+# about 0.04% relative on final_position_loss -- so refusing over it would hold
+# the flag to a standard the run does not meet against itself.
+# The cost of the stricter tier is concrete and has been paid: job 19819006 died
+# on a genuine torch.OutOfMemoryError, and under a refusal an OOM at step 8000 of
+# a four-day run could not be rescued by resuming with checkpointing on. Warning
+# buys exactly that rescue, which is the flag's most valuable use.
+#
 # The init pair is refused rather than warned even though seed_time_index_embedding
 # does not re-seed on a resume: precisely because it does not, this comparison is
 # the only thing left tying the restored table to the run that trained it.
@@ -2465,7 +2503,16 @@ _RESUME_SETTINGS_REFUSED = (
     "confidence_alpha",
     "precision",
 )
-_RESUME_SETTINGS_WARNED = ("num_steps", "warmup_steps", "min_lr_scale")
+_RESUME_SETTINGS_WARNED = (
+    "num_steps",
+    "warmup_steps",
+    "min_lr_scale",
+    # Deliberately NOT in _RESUME_SETTINGS_ABSENT_DEFAULTS below: that map is
+    # read only for refused keys, and check_resume_settings compares a warned key
+    # only when the checkpoint carries it, so a pre-flag checkpoint resumes
+    # silently without needing an entry there.
+    "encoder_local_checkpointing",
+)
 
 # What the ABSENCE of a refused key means, for the keys whose absence has exactly
 # one possible reading. A checkpoint written before --confidence_weight,
@@ -2751,6 +2798,7 @@ def main() -> None:
         args.checkpoint_dir, max_time_indices=args.max_time_indices
     ).to("cuda")
     model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    model.set_encoder_local_checkpointing(args.encoder_local_checkpointing)
     report = assert_trainable_parameter_set(
         model,
         freeze_mode=args.freeze_mode,
@@ -2759,7 +2807,8 @@ def main() -> None:
     )
     print(
         f"trainable={report['tensor_count']} tensors / "
-        f"{report['parameter_count']} parameters ({args.freeze_mode})"
+        f"{report['parameter_count']} parameters ({args.freeze_mode}) "
+        f"encoder_local_checkpointing={args.encoder_local_checkpointing}"
     )
 
     # Before build_optimizer, which splits the embedding into its own

@@ -1771,7 +1771,14 @@ def test_run_summary_fields_are_only_ever_added_to():
     # The freeze mask a run actually trained under: the mode name alone does
     # not fix it, and gpu_name is what makes a mixed-hardware comparison
     # detectable in the archive rather than being read as a result.
-    assert {"late_global_blocks", "gpu_name"} <= written
+    # encoder_local_checkpointing joins them for the same reason: it changes what
+    # the encoder retains for backward, so it is part of what produced this run's
+    # step times and nothing else in the summary would show it.
+    assert {
+        "late_global_blocks",
+        "gpu_name",
+        "encoder_local_checkpointing",
+    } <= written
 
 
 def test_confidence_gradient_norms_split_the_shared_output_conv():
@@ -3789,6 +3796,8 @@ def test_new_training_flags_default_to_the_archived_behaviour():
     assert args.encoder_lr is None
     assert args.min_index_advantage == 0.01
     assert args.late_global_blocks == overfit_cli.DEFAULT_LATE_GLOBAL_BLOCKS == 4
+    # Memory only, and off: the encoder retains exactly what it always retained.
+    assert args.encoder_local_checkpointing is False
 
     for flag, bad in (
         ("--time_embedding_init_scale", "0"),
