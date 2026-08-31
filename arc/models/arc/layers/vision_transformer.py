@@ -7,6 +7,16 @@
 #   https://github.com/facebookresearch/dino/blob/main/vision_transformer.py
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
+# NOT the encoder path. Orphaned copy of upstream DINOv2 with no importers; the
+# encoder Arc actually runs is arc/models/arc/dinov2/vision_transformer.py,
+# which checkpoints its global-attention blocks in process_attention. The
+# use_checkpoint / use_reentrant attributes below are dead and use_reentrant is
+# never assigned -- setting use_checkpoint True would raise AttributeError, and
+# would change no training run in any case. Kept rather than deleted because it
+# is vendored upstream code and removing a file costs rebase friction; this note
+# exists because the file has already misdirected one diagnosis of where the
+# encoder's activation checkpointing lives.
+
 from functools import partial
 import math
 import logging
