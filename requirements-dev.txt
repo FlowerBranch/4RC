@@ -25,3 +25,7 @@ opencv-python
 matplotlib
 tqdm
 pytest
+# Not a linter for style: tests/test_static_analysis.py asserts on exactly two
+# pyflakes message classes, the "name is read but not bound" pair that
+# pyrightconfig.json already declares fatal and nothing in the suite enforces.
+pyflakes
