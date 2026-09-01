@@ -925,6 +925,25 @@ def _time_varying_depth_report(scene) -> dict:
     }
 
 
+def _resolve_device(parser: argparse.ArgumentParser) -> torch.device:
+    """The one place the run decides what it runs on.
+
+    A resolved value rather than a ``torch.cuda.is_available()`` call at each
+    site, which is what the sibling trainer does.  The gate here is the first of
+    those sites, so anything that stubs the predicate to get past it re-arms
+    every other guard -- the two defeat each other.  One value, read everywhere
+    below, is what lets a CPU test reach the summary write at all, and a file
+    whose main() could not be executed off-GPU is how an UnboundLocalError in
+    that summary shipped behind a green suite.
+
+    On a GPU this returns ``cuda`` and every path below is what it always was.
+    """
+
+    if not torch.cuda.is_available():
+        parser.error("A CUDA GPU is required for the released 4RC model")
+    return torch.device("cuda")
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -958,12 +977,13 @@ def main() -> None:
         f"time {query_observation.original_time}, "
         f"slot {query_observation.slot})"
     )
-    if not torch.cuda.is_available():
-        parser.error("A CUDA GPU is required for the released 4RC model")
+    device = _resolve_device(parser)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    # No device guard: without CUDA this is a documented no-op -- _lazy_call
+    # defers it and it returns None -- so a guard would only add a branch.
     torch.cuda.manual_seed_all(args.seed)
 
     from arc.models.arc import Arc
@@ -971,7 +991,7 @@ def main() -> None:
     model = Arc.from_pretrained(
         args.checkpoint_dir,
         max_time_indices=args.max_time_indices,
-    ).to("cuda")
+    ).to(device)
     # One resolved value for the whole run: the startup assertion below and the
     # re-assert before the patch is saved both read it, so they cannot drift.
     late_global_blocks = (
@@ -997,7 +1017,8 @@ def main() -> None:
         f"encoder_local_checkpointing={args.encoder_local_checkpointing}"
     )
 
-    _move_views_to_cuda(scene.views)
+    if device.type == "cuda":
+        _move_views_to_cuda(scene.views)
 
     # ---- Baseline: exact released-checkpoint behaviour. The embedding is
     # still at its constructor zeros here, so this forward -- indexed views
@@ -1245,10 +1266,13 @@ def main() -> None:
         f"embedding {learning_rates['embedding']:.3g}, "
         f"encoder_blocks {learning_rates['encoder_blocks']}"
     )
+    # No device guard: a disabled GradScaler constructs fine without CUDA, and
+    # --precision 16-mixed is not reachable off-GPU anyway.
     scaler = torch.cuda.amp.GradScaler(
         enabled=args.precision == "16-mixed"
     )
-    torch.cuda.reset_peak_memory_stats()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
 
     last_gradient_norms = None
     last_confidence_gradient_norms = None
@@ -1495,7 +1519,9 @@ def main() -> None:
         final_shuffled_loss=evaluation["loss_shuffled"],
         min_index_advantage=args.min_index_advantage,
     )
-    peak_memory_bytes = int(torch.cuda.max_memory_allocated())
+    peak_memory_bytes = (
+        int(torch.cuda.max_memory_allocated()) if device.type == "cuda" else 0
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1610,8 +1636,11 @@ def main() -> None:
         # like an input perturbation -- the archived arm matrix saw a matched
         # pair of runs differ by more than the whole spread between arms. Record
         # the device so a comparison across mixed hardware is detectable after
-        # the fact rather than being read as a result.
-        "gpu_name": torch.cuda.get_device_name(),
+        # the fact rather than being read as a result. None off-GPU, matching
+        # the trainer's own gpu_name.
+        "gpu_name": (
+            torch.cuda.get_device_name() if device.type == "cuda" else None
+        ),
         "time_embedding_init": args.time_embedding_init,
         "time_embedding_init_scale": args.time_embedding_init_scale,
         "time_embedding_target_row_norm": embedding_target_row_norm,

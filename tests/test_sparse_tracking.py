@@ -2097,6 +2097,46 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
     assert evaluation["confidence"]["mean"] == pytest.approx(3.0)
 
 
+# ------------------------------------------------------------ device guard ---
+
+
+def test_resolve_device_gates_on_cuda_and_is_the_only_device_decision(monkeypatch):
+    """One resolved value, not a torch.cuda.is_available() call per site.
+
+    The sibling trainer guards each site with its own is_available() call, which
+    cannot work here: the gate is itself one of those sites, so anything that
+    stubs the predicate to clear it re-arms every other guard.  Routing them all
+    through one device is what lets the end-to-end test below execute main() at
+    all -- and a main() nothing could execute off-GPU is how an UnboundLocalError
+    in the run summary shipped behind a green suite.
+    """
+
+    parser = overfit_cli.build_arg_parser()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert overfit_cli._resolve_device(parser) == torch.device("cuda")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(SystemExit):
+        overfit_cli._resolve_device(parser)
+
+    # And the decision stays centralised. A second is_available() call inside
+    # main() is exactly the shape that defeats the stub above, and it would fail
+    # no other test -- main() would simply drop back out of CPU reach.
+    source = Path(overfit_cli.__file__).read_text()
+    main_def = next(
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    assert not [
+        node
+        for node in ast.walk(main_def)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", None) == "is_available"
+    ], "main() must take the device from _resolve_device, not re-ask torch.cuda"
+
+
 def test_parse_only_main_needs_neither_cuda_nor_checkpoint(
     tmp_path,
     monkeypatch,
