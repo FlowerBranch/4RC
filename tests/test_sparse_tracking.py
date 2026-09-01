@@ -32,6 +32,7 @@ from arc.training import (
     save_temporal_tracking_checkpoint,
     sparse_tracking_loss,
 )
+from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
 from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
 from arc.models.arc.utils.transform import mat_to_quat, quat_to_mat
@@ -5023,6 +5024,266 @@ def test_an_anchor_set_that_reaches_nothing_is_reported_not_raised(
     assert "rejected.query_time_mismatch=3/3" in printed
     assert "accounted=3/3" in printed
     assert "PASS eligibility report" in printed
+
+
+# --------------------------------------------- the summary write, end to end ---
+
+
+class _SummaryPathPretrained(nn.Module):
+    """``backbone.pretrained``: the handles main() reaches through by name."""
+
+    def __init__(self, max_time_indices: int) -> None:
+        super().__init__()
+        self.has_time_token = True
+        self.checkpoint_local_attention = False
+        self.time_token = nn.Parameter(
+            torch.ones(1, 1, runtime_module.TIME_EMBEDDING_DIM)
+        )
+        self.time_index_embedding = nn.Embedding(
+            max_time_indices, runtime_module.TIME_EMBEDDING_DIM
+        )
+        self.frozen_backbone_weight = nn.Parameter(torch.ones(1))
+        # The released checkpoint zero-fills the table; main() re-seeds it and
+        # then gates on the table having moved, so it must start where the real
+        # constructor leaves it.
+        nn.init.zeros_(self.time_index_embedding.weight)
+
+    # The production re-seeder, bound rather than reimplemented. main() calls it
+    # between the freeze and the step-0 snapshot, and a stub would let the
+    # embedding-moved gate score against a table this file invented.
+    reinitialize_time_index_embedding = (
+        DinoVisionTransformer.reinitialize_time_index_embedding
+    )
+
+
+class _SummaryPathBackbone(nn.Module):
+    """Tap tuples shaped as ``temporal_injection_report`` reads them."""
+
+    def __init__(self, max_time_indices: int) -> None:
+        super().__init__()
+        self.pretrained = _SummaryPathPretrained(max_time_indices)
+
+    def forward(self, images, ref_view_strategy="first", time_indices=None):
+        batch, observations = images.shape[:2]
+        dim = runtime_module.TIME_EMBEDDING_DIM
+        # Non-zero, so the report's relative-change denominators are live rather
+        # than short-circuiting to None on a zero base.
+        base = torch.linspace(0.1, 1.0, dim)
+        patches = base.expand(batch, observations, 4, dim).clone()
+        camera = base.expand(batch, observations, dim).clone()
+        time = self.pretrained.time_token.expand(batch, observations, dim).clone()
+        if time_indices is not None:
+            # The indexed forward really does differ from the unindexed one, and
+            # differs *by index*, which is what the report measures.
+            offsets = self.pretrained.time_index_embedding(time_indices)
+            time = time + offsets
+            patches = patches + offsets[:, :, None, :]
+        return [(patches, camera, time)], None
+
+
+class _SummaryPathArc(Arc):
+    """A real Arc whose ViT-G-sized pieces are stubs.
+
+    Subclassing rather than faking wholesale so ``set_freeze``,
+    ``set_encoder_local_checkpointing``, ``_preprocess_input`` and ``freeze``
+    are the production implementations -- the freeze mask main() saves the patch
+    from is real, and only the three forward pieces that would need 314M
+    parameters are replaced.
+    """
+
+    def __init__(self, observations, height, width, *, max_time_indices, freeze_mode):
+        nn.Module.__init__(self)
+        self.observations, self.height, self.width = observations, height, width
+        self.max_time_indices = max_time_indices
+        self._reported_freeze_mode = freeze_mode
+        # main() refuses to re-seed a table that came from the checkpoint.
+        self.consumed_legacy_missing_keys = {runtime_module.TIME_EMBEDDING_KEY}
+        self.backbone = _SummaryPathBackbone(max_time_indices)
+        self.head = nn.Linear(1, 1)
+        self.cam_dec = nn.Linear(1, 1)
+        self.motion_decoder = nn.Linear(1, 1)
+        self.track_head = nn.Linear(1, 1)
+
+    def get_trainable_parameter_report(self):
+        """The counts ``assert_trainable_parameter_set`` expects of ViT-G.
+
+        The one place this stub lies, and it is disclosed rather than patched
+        out: the production assertion still runs, but a 4-linear-layer model
+        cannot satisfy a 231-tensor / 314M-parameter expectation. The freeze
+        mask itself is covered for real in ``tests/test_runtime.py``; what this
+        test is for is everything downstream of that check.
+        """
+
+        report = super().get_trainable_parameter_report()
+        tensors, non_embedding = runtime_module.expected_trainable_set(
+            self._reported_freeze_mode, None
+        )
+        report["tensor_count"] = tensors
+        report["parameter_count"] = (
+            non_embedding + self.max_time_indices * runtime_module.TIME_EMBEDDING_DIM
+        )
+        return report
+
+    def encode_features(self, images, ref_view_strategy="first", time_indices=None):
+        # Every trainable tensor must take gradient or main()'s own guards fire.
+        return [
+            self.motion_decoder.weight.sum()
+            + self.motion_decoder.bias.sum()
+            + self.track_head.weight.sum()
+            + self.track_head.bias.sum()
+            + self.backbone.pretrained.time_index_embedding.weight.sum()
+        ]
+
+    def reconstruct(self, feats, images):
+        return {
+            "depth": torch.ones(1, self.observations, self.height, self.width),
+            "pose_enc": torch.zeros(1, self.observations, 9),
+        }
+
+    def track_for_query(self, feats, images, query_idx):
+        track = (
+            torch.ones(1, self.observations, self.height, self.width, 3) * feats[0]
+        )
+        # Strictly > 1 and varying, mirroring `expp1`: a flat channel would make
+        # the confidence stats degenerate. Independent of feats, so confidence
+        # stays out of the autograd graph the gradient norms are read from.
+        pixels = torch.arange(self.height * self.width, dtype=torch.float32)
+        confidence = 1.0 + 100.0 * (query_idx + pixels / pixels.numel())
+        confidence = (
+            confidence.reshape(1, 1, self.height, self.width)
+            .expand(1, self.observations, self.height, self.width)
+            .contiguous()
+        )
+        return track, confidence
+
+    def forward(self, views, force_no_output_conversion=False):
+        images, track_query_idx, time_indices = self._preprocess_input(views)
+        feats = self.encode_features(images, time_indices=time_indices)
+        output = self.reconstruct(feats, images)
+        query_slots = [
+            int(value)
+            for value in torch.as_tensor(track_query_idx).flatten().tolist()
+        ]
+        tracks, confidences = zip(
+            *(self.track_for_query(feats, images, slot) for slot in query_slots)
+        )
+        output["track_multi"] = torch.stack(tracks, dim=1)
+        output["conf_track_multi"] = torch.stack(confidences, dim=1)
+        output["track_query_idx"] = torch.tensor(query_slots, dtype=torch.long)
+        return output
+
+
+def test_main_writes_a_run_summary_carrying_the_velocity_trio(tmp_path, monkeypatch):
+    """The test that would have caught the run_summary UnboundLocalError.
+
+    ``main()`` read ``baseline_result`` and ``initial_result`` inside the summary
+    dict literal after both had been ``del``-ed, so every run crashed at line
+    1638 -- after training, after saving temporal_tracking.pt, and before
+    run_summary.json. 492 tests passed against that: the three summary tests
+    above AST-parse the literal for key *presence* and never evaluate a value,
+    which is exactly the check an unbound name is invisible to.
+
+    So this executes the write. Three production seams, each a real gap in what
+    the test covers rather than scaffolding:
+
+      * ``_resolve_device``  -- the CUDA gate; without it main() exits at the top
+      * ``Arc.from_pretrained`` -- patched on the *class*, because main() imports
+        Arc function-locally and there is no module global to reach
+      * ``_predicted_pointmaps`` -- hands fit_scene_sim3 the scene's own metric
+        pointmap so the alignment is exact; a stub model's real geometry is
+        arbitrary and would make every gate downstream noise
+
+    Asserting the trio is non-None matters as much as asserting it is present:
+    a summary carrying three nulls where measurements belong is the failure
+    mode a name-resolution check cannot see.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True)
+    # Loaded exactly as main() loads it -- no `size`, so the fixture's 56x56
+    # frames come back at the model's own resolution. A 56x56 lever here would
+    # disagree with the scene main() builds, which is the whole reason the
+    # geometry seam has to be built from the same call.
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0),),
+    )
+    target, _ = sparse_module._metric_pointmap_at_anchor(
+        scene, scene.query_observation_slot
+    )
+    pointmaps = (
+        torch.from_numpy(target)
+        .float()
+        .expand(1, scene.num_observations, *target.shape)
+        .contiguous()
+    )
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _SummaryPathArc(
+        scene.num_observations,
+        height,
+        width,
+        max_time_indices=32,
+        freeze_mode="temporal_tracking",
+    )
+    monkeypatch.setattr(Arc, "from_pretrained", lambda *args, **kwargs: model)
+    monkeypatch.setattr(
+        overfit_cli, "_resolve_device", lambda parser: torch.device("cpu")
+    )
+
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "overfit_temporal_tracking.py",
+            "--data_root", str(tmp_path),
+            "--scene", "0000",
+            "--cameras", "0", "1",
+            "--times", "0", "1", "2", "3",
+            "--query_anchor", "0:0",
+            "--checkpoint_dir", str(tmp_path / "ckpt"),
+            "--output_dir", str(output_dir),
+            "--steps", "2",
+            # 32 makes _autocast_context a nullcontext, which is what keeps this
+            # off the CUDA autocast without touching the shared runtime helper.
+            "--precision", "32",
+        ],
+    )
+
+    try:
+        overfit_cli.main()
+    except SystemExit as exit_request:
+        # Two steps of a stub model are not expected to clear the improvement
+        # gates. main() writes the summary before it exits on them, and the
+        # summary is the whole point here.
+        assert exit_request.code == 1
+
+    written = json.loads((output_dir / "run_summary.json").read_text())
+
+    # The trio the crash was in. Measured whatever --velocity_weight is, which
+    # is why a run that never trains the term still has to record all three.
+    for key in (
+        "baseline_velocity_consistency",
+        "initial_velocity_consistency",
+        "final_velocity_consistency",
+    ):
+        stats = written[key]
+        assert stats is not None, f"{key} is null; the term was not measured"
+        assert set(stats) == {
+            "pair_count", "sample_count", "mean_m", "median_m", "p90_m"
+        }, key
+        assert stats["sample_count"] > 0, key
+
+    assert written["velocity_weight"] == 0.0
+    # And the file round-tripped through json, which is the other thing an AST
+    # key check cannot do: every value in that literal is bound AND serializable.
+    assert written["success"] in (True, False)
+    assert written["gpu_name"] is None
+    assert written["peak_gpu_memory_bytes"] == 0
 
 
 def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences(tmp_path):
