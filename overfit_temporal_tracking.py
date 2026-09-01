@@ -1141,6 +1141,11 @@ def main() -> None:
         scene.slot_time_indices,
         metric_scale=sync_metric_scale,
     )
+    # Captured beside its sync sibling because the summary reports the two as
+    # one trio, and because the `del` below drops the result object. A plain
+    # dict of floats built under no_grad: it pins no graph, so keeping it costs
+    # nothing the memory figure would notice.
+    baseline_velocity_stats = baseline_result.velocity_stats
     baseline_drift = reconstruction_drift_report(
         baseline_raw,
         scene,
@@ -1235,6 +1240,9 @@ def main() -> None:
         scene.slot_time_indices,
         metric_scale=sync_metric_scale,
     )
+    # Same reason as baseline_velocity_stats above: the trio is reported
+    # together, and the `del` below drops the result object it comes from.
+    initial_velocity_stats = initial_result.velocity_stats
     initial_confidence_loss = (
         None
         if initial_result.confidence_loss is None
@@ -1664,8 +1672,8 @@ def main() -> None:
         # Same three points as the sync trio above, and reported on the same
         # terms: measurable without being trained, which is what lets
         # --velocity_weight be evaluated rather than merely enabled.
-        "baseline_velocity_consistency": baseline_result.velocity_stats,
-        "initial_velocity_consistency": initial_result.velocity_stats,
+        "baseline_velocity_consistency": baseline_velocity_stats,
+        "initial_velocity_consistency": initial_velocity_stats,
         "final_velocity_consistency": evaluation["velocity_consistency"],
         # Step-0 measurements of what the initialized embedding does to the
         # frozen network: signal transport to the taps, and reconstruction
