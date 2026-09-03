@@ -109,9 +109,12 @@ DEFAULT_MAX_UNREPLAYABLE_FRACTION = 0.02
 DEFAULT_MAX_DEVICE_FRACTION = 0.97
 
 
-# Set by the signal handlers, read at the top of each step. A handler that wrote a
-# checkpoint from inside the signal context could land mid-backward; setting a
-# flag and checkpointing at a known-safe point cannot.
+# Set by the signal handlers, read at the top of each accumulation window. A
+# handler that wrote a checkpoint from inside the signal context could land
+# mid-backward; setting a flag and checkpointing at a known-safe point cannot.
+# The safe point is a window top, not any step: between a window's micro-steps
+# the model carries half-accumulated gradients that no checkpoint records, so a
+# stop there would silently drop part of a window on resume.
 _STOP_REQUESTED: list[str] = []
 
 
@@ -124,7 +127,10 @@ def install_signal_handlers() -> None:
 
     SLURM sends USR1 at T-300s (``#SBATCH --signal=USR1@300``), so the grace
     window is what this has to fit inside: flag now, write at the top of the next
-    step, exit 0 so the requeue is a resume rather than a failure.
+    accumulation window, exit 0 so the requeue is a resume rather than a failure.
+    At --grad_accum N the flag can wait up to N-1 micro-steps for that window
+    top; at ~19s a micro-step that fits 300s through N=8, but N>=16 needs the
+    sbatch's signal lead raised to match.
     """
 
     for number in (signal.SIGUSR1, signal.SIGTERM):
@@ -147,7 +153,16 @@ class StepOutcome:
     alignment_scale: float
     alignment_residual_m: float
     learning_rates: list[float]
-    gradient_norms: dict
+    # Measured once per accumulation window, after the last micro-step's backward
+    # and the unscale_; `clipped_total` is the total norm the once-per-window clip
+    # saw. None on a row that does not close a window -- at --grad_accum 1 every
+    # row closes one, so archived histories are unchanged.
+    gradient_norms: dict | None
+    # Peak CUDA bytes since the window START: the most memory this optimizer
+    # step's whole window needed, which is what the observation-budget fit is
+    # built on. A mid-window row carries the running peak so far, and a held-out
+    # eval that lands inside a window is folded into the reading, since the
+    # counter is only reset at the next window start.
     peak_bytes: int = 0
     confidence: dict | None = None
     eligibility: dict | None = None
@@ -383,6 +398,45 @@ class SceneCache:
         return scene
 
 
+def finish_window(*, model, optimizer, scaler, grad_clip: float) -> dict:
+    """Close an accumulation window: unscale, guard, clip ONCE, step, update.
+
+    Split out of train_step so the clip is structurally once per window: the
+    gradients here are the window's accumulated mean, and clipping any earlier
+    -- per micro-step, before the average -- would bound each draw instead of
+    the update, silently optimizing a different objective than the flags claim.
+    The zero-norm guards judge the same summed gradient, so they run here too:
+    mid-window there is nothing final to judge. Called by train_step on its
+    window_end micro-step, and by run_training directly when a window's closing
+    micro-step lost its scene to a skip.
+    """
+
+    scaler.unscale_(optimizer)
+    assert_trainable_gradients_finite(model)
+    norms = {
+        "time_embedding": gradient_norm(
+            model.backbone.pretrained.time_index_embedding.parameters()
+        ),
+        "motion_decoder": gradient_norm(model.motion_decoder.parameters()),
+        "track_head": gradient_norm(model.track_head.parameters()),
+    }
+    if norms["time_embedding"] == 0:
+        raise RuntimeError("Temporal embedding gradient norm is zero")
+    if norms["motion_decoder"] == 0 or norms["track_head"] == 0:
+        raise RuntimeError("MotionDecoder or track-head gradient norm is zero")
+    # Clip after unscale_ and before step, or the threshold is applied to scaled
+    # gradients and means nothing.
+    norms["clipped_total"] = float(
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in model.parameters() if p.requires_grad], grad_clip
+        ).item()
+    )
+    assert_frozen_gradients_absent(model)
+    scaler.step(optimizer)
+    scaler.update()
+    return norms
+
+
 def train_step(
     *,
     model,
@@ -399,12 +453,26 @@ def train_step(
     velocity_weight: float,
     learning_rates: list[float],
     step: int,
+    accum_steps: int,
+    window_start: bool,
+    window_end: bool,
 ) -> StepOutcome:
-    """One optimizer step over one scene, with every guard the harness runs.
+    """One micro-step over one scene, with every guard the harness runs.
 
     Reuses the existing machinery unchanged — this adds nothing to
     ``arc/training``'s semantics. There is no within-scene split: `ef8bcff`
     deleted it, so every eligible correspondence is supervised.
+
+    Under ``--grad_accum`` this is one micro-step of an ``accum_steps``-wide
+    accumulation window: the forward/backward half runs on every call, with the
+    backwarded scalar weighted by ``1/accum_steps`` so the window's summed
+    gradient is the mean over its draws; ``window_start`` (the window's first
+    *executed* micro-step) gates the zero_grad and the peak-counter reset, and
+    ``window_end`` gates :func:`finish_window` — unscale, guards, ONE clip, and
+    the optimizer step. Clipping must not run per micro-step: clipping each draw
+    before the average silently optimizes a different objective than the flags
+    claim. At ``accum_steps=1`` every call is a whole window and the step is
+    bit-identical to the pre-accumulation one.
 
     Several anchors are supervised the way the overfit does it: the encoder and
     the frozen reconstruction run once, each anchor's track-head pass backwards
@@ -429,9 +497,18 @@ def train_step(
     model.train()
     model.head.eval()
     model.cam_dec.eval()
-    optimizer.zero_grad(set_to_none=True)
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats()
+    if window_start:
+        optimizer.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    # Applied to every backwarded scalar, unconditionally: at accum_steps=1 the
+    # factor is exactly 1.0, and IEEE754 multiplication by 1.0 is bit-exact
+    # forward and backward, so the default path stays bit-identical without an
+    # `if` that would fork the arithmetic in two. The LOSS is scaled, not the
+    # grads — under an enabled 16-mixed scaler that is the one correct place,
+    # since the scaler's own factor is constant across the window (`update()`
+    # only runs at the boundary, inside finish_window).
+    window_scale = 1.0 / accum_steps
 
     correspondences, eligibility = build_anchor_correspondences(scene)
     anchor_count = len(scene.anchor_observation_slots)
@@ -593,8 +670,11 @@ def train_step(
             )
         # Backward per anchor, so this anchor's track-head graph is freed
         # before the next one allocates its own; the gradient lands on the cut
-        # and is pushed through the encoder once, after the loop.
-        scaler.scale(anchor_total).backward()
+        # and is pushed through the encoder once, after the loop. The window
+        # scale rides on the backwarded scalar only: the reported step_loss and
+        # friends below stay this micro-step's own undivided means, because 1/N
+        # is a cross-step weight, not a property of this scene's samples.
+        scaler.scale(anchor_total * window_scale).backward()
         step_loss = accumulate_weighted(step_loss, result.loss, anchor_weight)
         step_metric_error = accumulate_weighted(
             step_metric_error, result.metric_error, anchor_weight
@@ -636,29 +716,14 @@ def train_step(
 
     backward_through_cut(cut_pairs)
     del cut_feats, cut_pairs, feats, recon, images
-    scaler.unscale_(optimizer)
-    assert_trainable_gradients_finite(model)
-    norms = {
-        "time_embedding": gradient_norm(
-            model.backbone.pretrained.time_index_embedding.parameters()
-        ),
-        "motion_decoder": gradient_norm(model.motion_decoder.parameters()),
-        "track_head": gradient_norm(model.track_head.parameters()),
-    }
-    if norms["time_embedding"] == 0:
-        raise RuntimeError("Temporal embedding gradient norm is zero")
-    if norms["motion_decoder"] == 0 or norms["track_head"] == 0:
-        raise RuntimeError("MotionDecoder or track-head gradient norm is zero")
-    # Clip after unscale_ and before step, or the threshold is applied to scaled
-    # gradients and means nothing.
-    norms["clipped_total"] = float(
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], grad_clip
-        ).item()
+    # The ternary binds `norms` on both paths for the drivers' unbound-name gate.
+    norms = (
+        finish_window(
+            model=model, optimizer=optimizer, scaler=scaler, grad_clip=grad_clip
+        )
+        if window_end
+        else None
     )
-    assert_frozen_gradients_absent(model)
-    scaler.step(optimizer)
-    scaler.update()
 
     return StepOutcome(
         step=step,
@@ -1326,6 +1391,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=500,
         help="Linear warmup before the cosine decay begins (default: %(default)s)",
     )
+    training.add_argument(
+        "--grad_accum",
+        type=int,
+        default=1,
+        help=(
+            "Micro-steps averaged into one optimizer step. Every step count on "
+            "this CLI stays in MICRO-steps (one manifest row each): the "
+            "optimizer takes ceil(num_steps/N) steps and warms up over "
+            "ceil(warmup_steps/N) of them, so at N=8 the default 500-row warmup "
+            "is only 63 optimizer steps -- raise --warmup_steps if that is "
+            "shorter than you meant. Prefer num_steps, eval_every and "
+            "save_every divisible by N (default: %(default)s)"
+        ),
+    )
     training.add_argument("--lr", type=float, default=1e-5)
     training.add_argument("--embedding_lr", type=float, default=None)
     training.add_argument(
@@ -1610,6 +1689,21 @@ def _parse_confidence_alpha(value) -> float | None:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.observation_budget < 1:
         raise ValueError("--observation_budget must be positive")
+    if args.grad_accum < 1:
+        raise ValueError(f"--grad_accum must be at least 1, got {args.grad_accum}")
+    # The schedule's warmup>=total refusal, but against the DERIVED optimizer
+    # counts and at submit time: warmup_cosine_scale would raise the same
+    # verdict, but only at the first loop iteration, after the model load and
+    # the provider preflight. Raw counts passing while derived ones refuse is
+    # exactly the case --grad_accum introduces.
+    if -(-args.warmup_steps // args.grad_accum) >= -(-args.num_steps // args.grad_accum):
+        raise ValueError(
+            f"--warmup_steps {args.warmup_steps} against --num_steps "
+            f"{args.num_steps} derives "
+            f"{-(-args.warmup_steps // args.grad_accum)} warmup optimizer steps "
+            f"of {-(-args.num_steps // args.grad_accum)} total at --grad_accum "
+            f"{args.grad_accum}; a run that never leaves warmup has no schedule"
+        )
     if args.stride < 1:
         raise ValueError("--stride must be at least 1")
     if args.max_time_indices < 1:
@@ -1852,6 +1946,14 @@ def _plan_summary(tally, args) -> dict:
             # does not, so an archived summary should say which regime produced
             # its step times.
             "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
+            # Both units, side by side: the CLI and the manifest count
+            # micro-steps (num_steps and warmup_steps in the flat summary), the
+            # optimizer counts windows. Recorded so a curve cannot be misread
+            # against the wrong horizon. Ceil, so a partial final window counts
+            # as the one step it takes.
+            "grad_accum": int(args.grad_accum),
+            "num_optimizer_steps": -(-args.num_steps // args.grad_accum),
+            "warmup_optimizer_steps": -(-args.warmup_steps // args.grad_accum),
         },
     }
 
@@ -1968,6 +2070,7 @@ def run_training(
     args,
     scene_provider,
     step_fn=train_step,
+    finish_window_fn=finish_window,
     output_dir: Path,
     val_plans=None,
 ) -> dict:
@@ -1977,6 +2080,9 @@ def run_training(
     to end without a GPU or a scene source -- which is what lets resume, the
     schedule and the cache be tested at all, and is also the seam the real scene
     source plugs into: main() builds MVTrackerSceneProvider and wraps it.
+    ``finish_window_fn`` is the same seam for the one boundary the loop closes
+    itself -- a window whose last micro-step lost its scene -- so those tests
+    need no model with a real backbone either.
     """
 
     # Captured BEFORE any optimizer.load_state_dict: that call overwrites each
@@ -1994,6 +2100,29 @@ def run_training(
         # Before any state is restored: a refused resume must leave the model,
         # optimizer and RNG streams exactly as built.
         check_resume_settings(payload.get("settings") or {}, args)
+        # After the settings check, so a changed --grad_accum gets that check's
+        # own refusal first. Inert at 1, where every step is a boundary -- which
+        # is what lets pre-flag and in-flight checkpoints resume untouched.
+        resume_step = int(payload["step"])
+        if args.grad_accum > 1 and resume_step % args.grad_accum != 0:
+            # The one writer that produces a non-boundary step is the natural
+            # end of a run whose num_steps is not divisible by grad_accum: the
+            # tail write records num_steps itself, and the ceil below applies
+            # only on an interrupt. That partial window DID step, so nothing is
+            # lost -- but a segment resumed here would seat a second short
+            # window at the seam and silently average fewer draws than the
+            # flags claim, which is exactly the distortion the window
+            # arithmetic exists to prevent.
+            raise RuntimeError(
+                f"--resume checkpoint stops at micro-step {resume_step}, which "
+                f"is not a window boundary at --grad_accum {args.grad_accum} "
+                "(windows close at multiples of it). This is the natural end "
+                "of a run whose num_steps is not divisible by grad_accum: its "
+                "final short window already stepped, but a resumed segment "
+                "would seat another short window at the seam and silently "
+                "average fewer draws than the flags claim. Extend runs whose "
+                "num_steps is divisible by --grad_accum instead"
+            )
         # The run's frozen alpha, restored before the first resumed step so it
         # is not re-resolved against a model that has since moved. Not a flag and
         # so not in either resume tier: it is derived state the checkpoint
@@ -2019,7 +2148,7 @@ def run_training(
                 file=sys.stderr,
             )
         base_learning_rates = stored
-        start_step = int(payload["step"])
+        start_step = resume_step
         restore_rng_state(payload["rng"])
         if payload.get("scaler") is not None:
             scaler.load_state_dict(payload["scaler"])
@@ -2127,18 +2256,40 @@ def run_training(
     last_saved_step = None
     scene_load_skips: Counter = Counter()
     consecutive_skips = 0
+    # The window arithmetic, bound once. Every CLI count stays in micro-steps;
+    # the optimizer's horizon is derived by ceil so a partial final window
+    # counts as the one step it takes. At accum=1 both ceils are the identity.
+    accum = args.grad_accum
+    optimizer_horizon = -(-args.num_steps // accum)
+    warmup_horizon = -(-args.warmup_steps // accum)
+    # Micro-steps EXECUTED in the open window -- not `step % accum`, so a window
+    # whose first plans lost their scenes still zero_grads on the first
+    # micro-step that actually runs, and an all-skipped window takes no step.
+    window_executed = 0
+    checkpoint_due = False
 
     for step in range(start_step, args.num_steps):
-        signal_name = stop_requested()
-        if signal_name is not None:
-            interrupted = signal_name
-            print(f"{signal_name} received; checkpointing at step {step} and exiting 0")
-            break
+        if step % accum == 0:
+            # Only at a window top: between micro-steps the model carries
+            # half-accumulated gradients no checkpoint records, so stopping
+            # there would silently drop part of a window on resume.
+            signal_name = stop_requested()
+            if signal_name is not None:
+                interrupted = signal_name
+                print(
+                    f"{signal_name} received; checkpointing at step {step} "
+                    "and exiting 0"
+                )
+                break
 
+        # A pure function of the WINDOW index against the derived horizons, so
+        # the rate moves only at boundaries; re-applying the same value on each
+        # mid-window micro-step changes nothing. warmup_cosine_scale's own
+        # warmup>=total refusal thereby compares the derived counts too.
         scale = warmup_cosine_scale(
-            step,
-            warmup_steps=args.warmup_steps,
-            total_steps=args.num_steps,
+            step // accum,
+            warmup_steps=warmup_horizon,
+            total_steps=optimizer_horizon,
             min_lr_scale=args.min_lr_scale,
         )
         learning_rates = apply_learning_rate(optimizer, base_learning_rates, scale)
@@ -2165,6 +2316,12 @@ def run_training(
                 max_consecutive=args.max_consecutive_scene_skips,
             )
 
+        # A window closes on its Nth micro-step or on the run's last one -- the
+        # partial final window of a num_steps not divisible by accum still
+        # steps, with the same 1/accum divisor, since the ceil horizon already
+        # counted it.
+        window_end = ((step + 1) % accum == 0) or (step + 1 == args.num_steps)
+
         # Deliberately NOT `continue`: the eval and checkpoint boundaries below
         # are properties of the step *number*, not of whether this step produced
         # a gradient. Skipping past them would drop the held-out point whenever a
@@ -2189,7 +2346,11 @@ def run_training(
                 velocity_weight=args.velocity_weight,
                 learning_rates=learning_rates,
                 step=step,
+                accum_steps=accum,
+                window_start=(window_executed == 0),
+                window_end=window_end,
             )
+            window_executed += 1
             # Pin what the first executed step resolved, so every later step
             # descends toward the same optimum. Written back onto args because
             # that is what _checkpoint_settings reads, which is how the value
@@ -2267,8 +2428,30 @@ def run_training(
                 f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
                 f"{breakdown_log}"
             )
+        elif window_end and window_executed > 0:
+            # The window's closing micro-step lost its scene, but earlier
+            # micro-steps already accumulated gradient: close the window now or
+            # it leaks into the next one. The norms have no history row to live
+            # on -- a skipped step writes none -- so they are dropped.
+            # Unreachable at accum=1, where a skipped step leaves
+            # window_executed at 0.
+            finish_window_fn(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                grad_clip=args.grad_clip,
+            )
+        if window_end:
+            window_executed = 0
 
         completed = step + 1
+        # The eval cadence stays in micro-steps -- RCMV_EVAL_EVERY is pinned to
+        # the paired run's CURVE_EVAL_FREQ, so the two curves overlay row for
+        # row. An eval landing mid-window is safe (no_grad, RNG and module
+        # modes restored, .grad untouched), but its allocations fold into the
+        # window's peak_bytes reading, since the counter resets only at the
+        # next window start; keep --eval_every divisible by --grad_accum to
+        # keep the figure clean.
         if val_plans and args.eval_every and completed % args.eval_every == 0:
             metrics = evaluate_held_out(
                 model=model,
@@ -2296,7 +2479,15 @@ def run_training(
                 # thing about them a reader cannot infer from the loss curve.
                 f"conf_tau={metrics['confidence_tau']}"
             )
+        # Deferred to the next window boundary: a mid-window save would record a
+        # step whose window's gradients are half-accumulated and unrecoverable.
+        # Several due-marks inside one window coalesce into the one boundary
+        # write; a mark still pending when the loop ends is covered by the tail
+        # write below. At accum=1 every step is a boundary, so the writes land
+        # on exactly the steps they always did.
         if args.save_every and completed % args.save_every == 0:
+            checkpoint_due = True
+        if checkpoint_due and completed % accum == 0:
             _write_checkpoint(
                 model,
                 optimizer,
@@ -2307,23 +2498,39 @@ def run_training(
                 args=args,
             )
             last_saved_step = completed
+            checkpoint_due = False
 
     completed_steps = (
         (step + 1)
         if history and interrupted is None
         else (history[-1].step + 1 if history else start_step)
     )
+    # completed_steps stays the truthful micro-step count for run_summary and
+    # the gate. The checkpoint's step is ceiled to its window boundary on an
+    # interrupt: a stop only breaks at a window top, so the only way
+    # completed_steps lands mid-window is trailing SKIPPED micro-steps -- and
+    # their window's optimizer step already fired (via the fallback above),
+    # counting them as zero draws. Recording the boundary means the resume does
+    # not replay a window that already stepped; a fully-skipped trailing window
+    # never stepped, ceils to the boundary it started on, and is re-attempted,
+    # exactly as an unaccumulated run re-attempts a skipped step. At accum=1
+    # this is completed_steps verbatim.
+    checkpoint_step = (
+        -(-completed_steps // accum) * accum
+        if interrupted is not None and accum > 1
+        else completed_steps
+    )
     # A clean run whose last step lands on a --save_every boundary has already
     # written exactly this state. The rename is atomic and the content identical,
     # so repeating it is harmless -- but it is a multi-GB write to shared storage
     # at the end of every aligned run, for nothing.
-    if last_saved_step != completed_steps:
+    if last_saved_step != checkpoint_step:
         _write_checkpoint(
             model,
             optimizer,
             scaler,
             base_learning_rates,
-            step=completed_steps,
+            step=checkpoint_step,
             output_dir=output_dir,
             args=args,
         )
@@ -2402,6 +2609,11 @@ def _checkpoint_settings(args) -> dict:
         "num_steps": args.num_steps,
         "warmup_steps": args.warmup_steps,
         "min_lr_scale": args.min_lr_scale,
+        # Refused, unlike the three schedule flags above: N is how many draws
+        # average into each update, so changing it mid-run continues the step
+        # counter over a different optimisation. Coerced like kubric_max_depth
+        # for the weights_only round trip.
+        "grad_accum": int(args.grad_accum),
         "precision": args.precision,
         "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
     }
@@ -2502,6 +2714,7 @@ _RESUME_SETTINGS_REFUSED = (
     "velocity_weight",
     "confidence_alpha",
     "precision",
+    "grad_accum",
 )
 _RESUME_SETTINGS_WARNED = (
     "num_steps",
@@ -2540,6 +2753,10 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     "sync_weight": 0.0,
     "velocity_weight": 0.0,
     "confidence_alpha": None,
+    # A checkpoint from before --grad_accum could only have been written at 1:
+    # every step was its own window. So absence resolves, pre-flag runs resume
+    # silently at 1, and resuming one at N>1 is refused like any changed value.
+    "grad_accum": 1,
 }
 
 
@@ -2863,10 +3080,11 @@ def main() -> None:
         val_plans=val_plans,
     )
 
-    # train_step resets the CUDA peak counter at every step, so the reading here
-    # covers only the tail since the last reset; the run-wide peak is the max
-    # over the per-step readings, with the tail folded in for whatever the final
-    # eval and checkpoint write allocated after the last step's reset.
+    # train_step resets the CUDA peak counter at every accumulation-window
+    # start, so the reading here covers only the tail since the last reset; the
+    # run-wide peak is the max over the per-step readings, with the tail folded
+    # in for whatever the final eval and checkpoint write allocated after the
+    # last window's reset.
     peak_gpu_memory_bytes = max(
         (outcome.peak_bytes for outcome in result["history"]), default=0
     )

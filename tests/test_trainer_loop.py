@@ -266,6 +266,11 @@ def _loop_args(tmp_path, **overrides):
         # every loop test needs it present. Off is the parser's default and the
         # behaviour every existing test assumes.
         encoder_local_checkpointing=False,
+        # How many micro-steps average into one optimizer step. run_training
+        # derives its window arithmetic from it and _checkpoint_settings stores
+        # it; 1 is the parser's default and the every-step-is-a-window contract
+        # every existing test assumes.
+        grad_accum=1,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1149,6 +1154,9 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
+        accum_steps=1,
+        window_start=True,
+        window_end=True,
     )
 
     assert outcome.step == 0
@@ -1957,37 +1965,20 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
 
     import copy
 
-    from arc.training import (
-        build_anchor_correspondences,
-        fit_scene_sim3,
-        gather_query_anchor_points,
-        sparse_tracking_loss,
-    )
-    from arc.training.runtime import tracking_only
-
     scene = _step_scene(tmp_path, monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     stepped = _FakeArc(scene.num_observations, height, width)
     reference = copy.deepcopy(stepped)
 
-    outcome = train_cli.train_step(
-        model=stepped,
-        scene=scene,
-        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
-        optimizer=torch.optim.AdamW(
-            [{"params": list(stepped.parameters()), "lr": 1e-3}]
-        ),
-        scaler=torch.amp.GradScaler("cuda", enabled=False),
-        precision="32",
-        huber_delta_m=0.05,
-        grad_clip=1.0,
-        confidence_weight=0.0,
-        confidence_alpha=None,
-        sync_weight=0.0,
-        velocity_weight=0.0,
-        learning_rates=[1e-3],
+    outcome = _micro_step(
+        stepped,
+        scene,
+        torch.optim.AdamW([{"params": list(stepped.parameters()), "lr": 1e-3}]),
         step=0,
+        accum_steps=1,
+        index=0,
+        last=True,
     )
 
     # The combined pipeline exactly as the step ran it before multi-anchor.
@@ -1998,19 +1989,7 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
         [{"params": list(reference.parameters()), "lr": 1e-3}]
     )
     reference_optimizer.zero_grad(set_to_none=True)
-    correspondences, _ = build_anchor_correspondences(scene)
-    raw = reference(scene.views, force_no_output_conversion=True)
-    alignment, _ = fit_scene_sim3(raw, scene)
-    anchors = gather_query_anchor_points(raw, scene, correspondences)
-    result = sparse_tracking_loss(
-        tracking_only(raw),
-        scene,
-        correspondences,
-        alignment,
-        anchors,
-        huber_delta_m=0.05,
-        collect_diagnostics=False,
-    )
+    result = _combined_reference_loss(reference, scene)
     result.total_loss.backward()
     torch.nn.utils.clip_grad_norm_(
         [p for p in reference.parameters() if p.requires_grad], 1.0
@@ -2022,6 +2001,402 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
     reference_parameters = dict(reference.named_parameters())
     for name, parameter in stepped.named_parameters():
         assert torch.equal(parameter, reference_parameters[name]), name
+
+
+def _micro_step(model, scene, optimizer, *, step, accum_steps, index, last):
+    """One real train_step micro-step at the default position-only weights."""
+
+    return train_cli.train_step(
+        model=model,
+        scene=scene,
+        plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+        velocity_weight=0.0,
+        learning_rates=[1e-3],
+        step=step,
+        accum_steps=accum_steps,
+        window_start=(index == 0),
+        window_end=last,
+    )
+
+
+def _combined_reference_loss(reference, scene):
+    """One draw of the pre-accumulation combined pipeline, loss kept alive."""
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+        sparse_tracking_loss,
+    )
+    from arc.training.runtime import tracking_only
+
+    correspondences, _ = build_anchor_correspondences(scene)
+    raw = reference(scene.views, force_no_output_conversion=True)
+    alignment, _ = fit_scene_sim3(raw, scene)
+    anchors = gather_query_anchor_points(raw, scene, correspondences)
+    return sparse_tracking_loss(
+        tracking_only(raw),
+        scene,
+        correspondences,
+        alignment,
+        anchors,
+        huber_delta_m=0.05,
+        collect_diagnostics=False,
+    )
+
+
+def test_grad_accum_one_is_bit_identical_to_the_pre_accumulation_step(
+    tmp_path, monkeypatch
+):
+    """The governing invariant of --grad_accum, pinned the way the velocity
+    term's weight-0 identity is: at 1 the window machinery must vanish.
+
+    The reference is today's exact pre-accumulation sequence -- zero_grad, one
+    combined forward, one backward, one clip, one step. The step's only numeric
+    addition at accum_steps=1 is a multiply of the backwarded scalar by
+    1.0/1 == 1.0, which IEEE754 makes bit-exact forward and backward, so this
+    requires equality -- not closeness -- of the loss, every parameter
+    gradient, every parameter, and the optimizer's own moments.
+    """
+
+    import copy
+
+    scene = _step_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    stepped = _FakeArc(scene.num_observations, height, width)
+    reference = copy.deepcopy(stepped)
+    stepped_optimizer = torch.optim.AdamW(
+        [{"params": list(stepped.parameters()), "lr": 1e-3}]
+    )
+
+    outcome = _micro_step(
+        stepped, scene, stepped_optimizer, step=0, accum_steps=1, index=0, last=True
+    )
+
+    reference.train()
+    reference.head.eval()
+    reference.cam_dec.eval()
+    reference_optimizer = torch.optim.AdamW(
+        [{"params": list(reference.parameters()), "lr": 1e-3}]
+    )
+    reference_optimizer.zero_grad(set_to_none=True)
+    result = _combined_reference_loss(reference, scene)
+    result.total_loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in reference.parameters() if p.requires_grad], 1.0
+    )
+    reference_optimizer.step()
+
+    assert outcome.loss == float(result.loss.item())
+    assert outcome.gradient_norms is not None
+    assert "clipped_total" in outcome.gradient_norms
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in stepped.named_parameters():
+        assert torch.equal(parameter, reference_parameters[name]), name
+        reference_grad = reference_parameters[name].grad
+        if parameter.grad is None:
+            assert reference_grad is None, name
+        else:
+            assert torch.equal(parameter.grad, reference_grad), name
+    stepped_state = stepped_optimizer.state_dict()["state"]
+    reference_state = reference_optimizer.state_dict()["state"]
+    assert stepped_state.keys() == reference_state.keys()
+    for index, moments in stepped_state.items():
+        for key in ("exp_avg", "exp_avg_sq"):
+            assert torch.equal(moments[key], reference_state[index][key]), (
+                index,
+                key,
+            )
+
+
+def test_a_window_of_four_equals_one_combined_backward(tmp_path, monkeypatch):
+    """The arithmetic the whole change rests on, at the paper's kind of scale.
+
+    Four draws of the SAME scene, deliberately. Backwarding ``l_i * 0.25``
+    hands each branch an incoming gradient of exactly 0.25 -- the same value
+    the add node of ``(l1+l2+l3+l4) * 0.25`` hands each branch, and a power of
+    two, so the scale commutes bit-exactly with every rounding in the chain.
+    What is NOT order-free is the accumulation into ``.grad`` at shared
+    parameters: sequential micro-steps add in draw order while one combined
+    backward adds in the engine's branch-completion order, and left-associated
+    float sums over DISTINCT values differ across orders. With identical draws
+    every contribution is the same tensor, order cannot matter, and
+    ``torch.equal`` is required; the distinct-scene sibling below asserts the
+    same equivalence within tolerance, and must not be "tightened" back to
+    ``torch.equal`` -- it would flake on exactly this order effect.
+    """
+
+    import copy
+
+    scene = _step_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    stepped = _FakeArc(scene.num_observations, height, width)
+    reference = copy.deepcopy(stepped)
+    stepped_optimizer = torch.optim.AdamW(
+        [{"params": list(stepped.parameters()), "lr": 1e-3}]
+    )
+
+    outcomes = [
+        _micro_step(
+            stepped,
+            scene,
+            stepped_optimizer,
+            step=index,
+            accum_steps=4,
+            index=index,
+            last=(index == 3),
+        )
+        for index in range(4)
+    ]
+    # The window's norms exist only on the row that closed it.
+    assert [outcome.gradient_norms for outcome in outcomes[:3]] == [None] * 3
+    assert outcomes[3].gradient_norms is not None
+    # Below the clip, or the equality proves less than it claims: a bound clip
+    # rescales to unit norm and would normalize a wrong window divisor away.
+    assert outcomes[3].gradient_norms["clipped_total"] < 1.0
+
+    reference.train()
+    reference.head.eval()
+    reference.cam_dec.eval()
+    reference_optimizer = torch.optim.AdamW(
+        [{"params": list(reference.parameters()), "lr": 1e-3}]
+    )
+    reference_optimizer.zero_grad(set_to_none=True)
+    losses = [
+        _combined_reference_loss(reference, scene).total_loss for _ in range(4)
+    ]
+    ((losses[0] + losses[1] + losses[2] + losses[3]) * 0.25).backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in reference.parameters() if p.requires_grad], 1.0
+    )
+    reference_optimizer.step()
+
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in stepped.named_parameters():
+        assert torch.equal(parameter, reference_parameters[name]), name
+        if parameter.grad is not None:
+            assert torch.equal(
+                parameter.grad, reference_parameters[name].grad
+            ), name
+
+
+def test_a_window_over_distinct_scenes_matches_the_combined_mean_closely(
+    tmp_path, monkeypatch
+):
+    """The realistic window: four different scenes, equivalence to tolerance.
+
+    Same claim as the torch.equal test above, on draws whose per-branch
+    gradients genuinely differ -- which is exactly why the assert is
+    ``assert_close`` here: the two routes sum those distinct contributions into
+    ``.grad`` in different orders, and left-associated float sums are not
+    order-free. See the sibling's docstring before tightening this.
+    """
+
+    import copy
+
+    import arc.training.sparse_tracking as sparse_module
+    from arc.training import load_dumped_kubric_scene
+    from test_sparse_tracking import _write_scene
+
+    scenes = []
+    pointmaps_by_scene = {}
+    for index in range(4):
+        root = tmp_path / f"scene_{index}"
+        # Distinct visibility masks make the four losses -- and so the four
+        # per-branch gradients -- genuinely different draws.
+        invisible = ((0, 1, index % 3),) if index else ()
+        _write_scene(
+            root, time_count=4, view_count=2, depth_sidecar=True, invisible=invisible
+        )
+        scene = load_dumped_kubric_scene(
+            root, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+        )
+        target, _ = sparse_module._metric_pointmap_at_anchor(
+            scene, scene.query_observation_slot
+        )
+        pointmaps_by_scene[id(scene)] = (
+            torch.from_numpy(target)
+            .float()
+            .expand(1, scene.num_observations, *target.shape)
+            .contiguous()
+        )
+        scenes.append(scene)
+    current = {}
+    monkeypatch.setattr(
+        sparse_module, "_predicted_pointmaps", lambda raw: current["pointmaps"]
+    )
+
+    height, width = scenes[0].views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    stepped = _FakeArc(scenes[0].num_observations, height, width)
+    reference = copy.deepcopy(stepped)
+    stepped_optimizer = torch.optim.AdamW(
+        [{"params": list(stepped.parameters()), "lr": 1e-3}]
+    )
+
+    for index, scene in enumerate(scenes):
+        current["pointmaps"] = pointmaps_by_scene[id(scene)]
+        _micro_step(
+            stepped,
+            scene,
+            stepped_optimizer,
+            step=index,
+            accum_steps=4,
+            index=index,
+            last=(index == 3),
+        )
+
+    reference.train()
+    reference.head.eval()
+    reference.cam_dec.eval()
+    reference_optimizer = torch.optim.AdamW(
+        [{"params": list(reference.parameters()), "lr": 1e-3}]
+    )
+    reference_optimizer.zero_grad(set_to_none=True)
+    losses = []
+    for scene in scenes:
+        current["pointmaps"] = pointmaps_by_scene[id(scene)]
+        losses.append(_combined_reference_loss(reference, scene).total_loss)
+    ((losses[0] + losses[1] + losses[2] + losses[3]) * 0.25).backward()
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in reference.parameters() if p.requires_grad], 1.0
+    )
+    reference_optimizer.step()
+
+    reference_parameters = dict(reference.named_parameters())
+    for name, parameter in stepped.named_parameters():
+        torch.testing.assert_close(
+            parameter, reference_parameters[name], msg=name
+        )
+        if parameter.grad is not None:
+            torch.testing.assert_close(
+                parameter.grad, reference_parameters[name].grad, msg=name
+            )
+
+
+def test_the_clip_fires_once_per_window_not_per_micro_step(tmp_path, monkeypatch):
+    """The count half of the clipping contract; the semantics half is below."""
+
+    scene = _step_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    torch.manual_seed(0)
+    model = _FakeArc(scene.num_observations, height, width)
+    optimizer = torch.optim.AdamW(
+        [{"params": list(model.parameters()), "lr": 1e-3}]
+    )
+
+    clip_calls = []
+    real_clip = torch.nn.utils.clip_grad_norm_
+    monkeypatch.setattr(
+        torch.nn.utils,
+        "clip_grad_norm_",
+        lambda *args, **kwargs: (clip_calls.append(1), real_clip(*args, **kwargs))[1],
+    )
+
+    for index in range(4):
+        _micro_step(
+            model,
+            scene,
+            optimizer,
+            step=index,
+            accum_steps=4,
+            index=index,
+            last=(index == 3),
+        )
+
+    assert len(clip_calls) == 1, (
+        f"clip_grad_norm_ ran {len(clip_calls)} times over one window; clipping "
+        "each micro-step bounds the draws instead of the update"
+    )
+
+
+def test_the_clip_binds_the_window_average_not_each_draw(tmp_path):
+    """The silent failure the once-per-window placement exists to prevent.
+
+    The fixture is the dangerous configuration: every micro-gradient alone
+    exceeds the clip norm while the window's accumulated average does not, so
+    the correct route clips nothing and a clip-each-draw route rescales every
+    contribution -- a different optimisation than the flags claim, with no
+    error and no NaN to notice. SGD rather than AdamW, deliberately: Adam's
+    normalisation shrinks the two routes' difference toward the float32 floor,
+    and the claim under test is about the gradients, not one optimizer's
+    response to them.
+    """
+
+    import copy
+
+    torch.manual_seed(0)
+    model = _FakeArc(4, 8, 8)
+    replica = copy.deepcopy(model)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    grad_clip = 1.0
+
+    # +v, -v, +v, -v+eps at ||v|| far above the clip: pairs cancel, so the
+    # accumulated mean is 0.25*eps -- tiny -- while each draw alone is huge.
+    directions = []
+    for sign in (1.0, -1.0, 1.0, -1.0):
+        directions.append([torch.full_like(p, sign * 100.0) for p in trainable])
+    directions[3] = [d + 0.01 for d in directions[3]]
+
+    optimizer = torch.optim.SGD(trainable, lr=0.1)
+    optimizer.zero_grad(set_to_none=True)
+    for contribution in directions:
+        loss = sum(
+            (p * c).sum() for p, c in zip(trainable, contribution)
+        ) * 0.25
+        loss.backward()
+
+    norms = train_cli.finish_window(
+        model=model,
+        optimizer=optimizer,
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        grad_clip=grad_clip,
+    )
+    # The premise held: the window's average was inside the threshold, so the
+    # one clip was a no-op.
+    assert norms["clipped_total"] < grad_clip
+
+    # The wrong route: clip each draw's own gradient, then average, then step.
+    replica_trainable = [p for p in replica.parameters() if p.requires_grad]
+    replica_optimizer = torch.optim.SGD(replica_trainable, lr=0.1)
+    accumulated = [torch.zeros_like(p) for p in replica_trainable]
+    for contribution in directions:
+        replica_optimizer.zero_grad(set_to_none=True)
+        loss = sum(
+            (p * c).sum() for p, c in zip(replica_trainable, contribution)
+        ) * 0.25
+        loss.backward()
+        micro_norm = torch.nn.utils.clip_grad_norm_(replica_trainable, grad_clip)
+        # Each draw alone really does exceed the threshold, or this test
+        # asserts nothing.
+        assert float(micro_norm) > grad_clip
+        for total, p in zip(accumulated, replica_trainable):
+            total += p.grad
+    for p, total in zip(replica_trainable, accumulated):
+        p.grad = total
+    replica_optimizer.step()
+
+    replica_parameters = dict(replica.named_parameters())
+    differing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and not torch.equal(parameter, replica_parameters[name])
+    ]
+    assert differing, (
+        "clipping once on the average and clipping each draw produced the same "
+        "parameters; the fixture no longer distinguishes the two routes"
+    )
 
 
 def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
@@ -2065,6 +2440,9 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
         velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
+        accum_steps=1,
+        window_start=True,
+        window_end=True,
     )
 
     # Seated two, supervised one, and the record says which: length is what the
@@ -2159,6 +2537,9 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
         velocity_weight=0.0,
         learning_rates=[1e-3],
         step=0,
+        accum_steps=1,
+        window_start=True,
+        window_end=True,
     )
 
     _, eligibility = build_anchor_correspondences(scene)
@@ -2267,6 +2648,9 @@ def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
             velocity_weight=0.0,
             learning_rates=[1e-3],
             step=0,
+            accum_steps=1,
+            window_start=True,
+            window_end=True,
         )
     assert "query_time_mismatch" in str(excinfo.value)
     assert not isinstance(excinfo.value, SceneProviderError)
@@ -2321,6 +2705,9 @@ def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
         grad_clip=1.0,
         learning_rates=[1e-3],
         step=0,
+        accum_steps=1,
+        window_start=True,
+        window_end=True,
         **weights,
     )
     return outcome, totals, kept, scene
@@ -4330,3 +4717,354 @@ def test_a_window_with_nothing_to_shuffle_reports_none_not_zero(
     assert metrics["velocity_error_shuffled_m"] is None
     # The unshuffled figure is unaffected by any of that.
     assert metrics["velocity_error_m"] is not None
+
+
+def test_the_schedule_advances_once_per_window(tmp_path):
+    """A window at N=4 must sit on the LR a plain run holds for one step.
+
+    Both runs derive the same optimizer horizon -- one warmup step of two total
+    -- so every rate is warmup_cosine_scale under identical arguments and the
+    equality is exact, not approximate.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    accumulated: list[_Recorded] = []
+    _run(
+        tmp_path / "a",
+        _loop_args(tmp_path, num_steps=8, warmup_steps=4, grad_accum=4),
+        accumulated,
+    )
+    reference: list[_Recorded] = []
+    _run(tmp_path / "b", _loop_args(tmp_path, num_steps=2, warmup_steps=1), reference)
+
+    assert [entry.lr for entry in accumulated[:4]] == [reference[0].lr] * 4
+    assert [entry.lr for entry in accumulated[4:]] == [reference[1].lr] * 4
+
+
+def test_a_resume_inside_an_accumulation_window_is_refused(tmp_path):
+    """The pinned policy for a non-boundary checkpoint: refuse, never snap.
+
+    Snapping down would re-run micro-steps whose window's optimizer step
+    already applied; snapping up would skip planned manifest rows. Both are
+    silent, so neither is allowed.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    args = _loop_args(tmp_path, num_steps=8, grad_accum=2)
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    checkpoint = train_cli._write_checkpoint(
+        model, optimizer, scaler, [1e-3], step=3, output_dir=tmp_path / "ckpt", args=args
+    )
+
+    with pytest.raises(RuntimeError, match="not a window boundary"):
+        train_cli.run_training(
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            plans=_plans(4),
+            args=_loop_args(
+                tmp_path, num_steps=8, grad_accum=2, resume=str(checkpoint)
+            ),
+            scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+            step_fn=_recording_step([]),
+            output_dir=tmp_path / "out",
+        )
+
+
+def test_a_resume_on_a_window_boundary_continues(tmp_path):
+    """The refusal's positive arm: a boundary checkpoint resumes normally."""
+
+    train_cli._STOP_REQUESTED.clear()
+    args = _loop_args(tmp_path, num_steps=4, grad_accum=2)
+    model = _toy_model()
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    checkpoint = train_cli._write_checkpoint(
+        model, optimizer, scaler, [1e-3], step=2, output_dir=tmp_path / "ckpt", args=args
+    )
+
+    recorded: list[_Recorded] = []
+    train_cli.run_training(
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        plans=_plans(4),
+        args=_loop_args(
+            tmp_path, num_steps=4, grad_accum=2, resume=str(checkpoint)
+        ),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=_recording_step(recorded),
+        output_dir=tmp_path / "out",
+    )
+
+    assert [entry.step for entry in recorded] == [2, 3]
+
+
+def test_an_interrupt_mid_window_waits_for_the_boundary(tmp_path):
+    """A stop flag raised mid-window checkpoints at the next window top.
+
+    The flag lands during step 4 of an N=2 run -- inside window [4,5] -- so the
+    loop must run step 5 to close the window before breaking at step 6, and the
+    written state must sit on that boundary; a checkpoint between micro-steps
+    would silently drop half a window on resume.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    recorded: list[_Recorded] = []
+    base_step = _recording_step(recorded)
+
+    def interrupted_step(**kwargs):
+        outcome = base_step(**kwargs)
+        if kwargs["step"] == 4:
+            train_cli._request_stop(signal.SIGUSR1, None)
+        return outcome
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=8, grad_accum=2),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=interrupted_step,
+        output_dir=tmp_path,
+    )
+    train_cli._STOP_REQUESTED.clear()
+
+    assert [entry.step for entry in recorded] == list(range(6))
+    assert result["interrupted_by"] == "SIGUSR1"
+    payload = read_trainer_state(tmp_path / "train_state.pt")
+    assert payload["step"] == 6
+
+
+def test_a_mid_window_save_boundary_defers_to_the_window_end(tmp_path, monkeypatch):
+    """--save_every stays in micro-steps; the write waits for the boundary.
+
+    At save_every=3 and N=2 the marks land at 3 and 6: the first defers to
+    step 4, the second is already on a boundary, and the tail write covers the
+    run's end -- so a mid-window step number never reaches a checkpoint.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    written: list[int] = []
+    real = train_cli._write_checkpoint
+    monkeypatch.setattr(
+        train_cli,
+        "_write_checkpoint",
+        lambda *a, **k: (written.append(k["step"]), real(*a, **k))[1],
+    )
+
+    model = _toy_model()
+    train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=8, save_every=3, grad_accum=2),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=_recording_step([]),
+        output_dir=tmp_path,
+    )
+
+    assert written == [4, 6, 8], (
+        f"expected the step-3 mark deferred to 4, the step-6 mark in place and "
+        f"the tail write at 8, got {written}"
+    )
+
+
+def test_a_window_whose_last_micro_step_skipped_is_still_closed(tmp_path):
+    """The loop closes a window train_step could not: gradient must not leak.
+
+    Window [2,3] at N=2 loses step 3's scene after step 2 accumulated, so
+    run_training itself must fire the boundary work -- once -- or those
+    gradients ride into the next window's average.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    closed: list[int] = []
+
+    def recording_finish(**kwargs):
+        closed.append(1)
+        return {}
+
+    plans = _plans(4)
+
+    def provider(plan):
+        if plan.step == 3:
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the pool at '/root' (0 scenes)"
+            )
+        return SimpleNamespace(name=plan.seq_name)
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4, grad_accum=2),
+        scene_provider=provider,
+        step_fn=_recording_step([]),
+        finish_window_fn=recording_finish,
+        output_dir=tmp_path,
+    )
+
+    assert closed == [1], "the half-accumulated window must be closed exactly once"
+    assert result["completed_steps"] == 4
+
+
+def test_a_wholly_skipped_window_takes_no_optimizer_step(tmp_path):
+    """No executed micro-step, no gradient, no boundary work -- like a skipped
+    step today, just window-sized."""
+
+    train_cli._STOP_REQUESTED.clear()
+    closed: list[int] = []
+    plans = _plans(4)
+
+    def provider(plan):
+        if plan.step in (2, 3):
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the pool at '/root' (0 scenes)"
+            )
+        return SimpleNamespace(name=plan.seq_name)
+
+    model = _toy_model()
+    train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4, grad_accum=2),
+        scene_provider=provider,
+        step_fn=_recording_step([]),
+        output_dir=tmp_path,
+        finish_window_fn=lambda **kwargs: closed.append(1),
+    )
+
+    assert closed == [], "an all-skipped window has no gradient to step on"
+
+
+def test_a_checkpoint_predating_grad_accum_resumes_at_one(tmp_path):
+    """Absence resolves to the only reachable value, then compares like any
+    stored one: a pre-flag checkpoint resumes silently at 1 and is refused at
+    anything else."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["grad_accum"]
+
+    # Same stream on both sides: continues without a word.
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="predates"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, grad_accum=4))
+
+
+def test_a_resume_that_changes_grad_accum_is_refused(tmp_path):
+    """N is refused-tier: a changed window width continues the step counter
+    over a different optimisation."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, grad_accum=2))
+    with pytest.raises(RuntimeError, match="carries grad_accum=2"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, grad_accum=4))
+
+
+def test_the_accumulation_settings_record_both_units(tmp_path):
+    """run_summary must carry micro AND optimizer counts, or a curve gets read
+    against the wrong horizon."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+    args = _validator_args(
+        tmp_path,
+        manifest="m.jsonl",
+        num_steps=20000,
+        warmup_steps=500,
+        grad_accum=8,
+    )
+
+    settings = train_cli._plan_summary(tally, args)["settings"]
+
+    assert settings["grad_accum"] == 8
+    assert settings["num_optimizer_steps"] == 2500
+    # ceil: the 500-row warmup is 63 optimizer steps at N=8, not 62 -- the
+    # short-warmup consequence the flag's help text warns about.
+    assert settings["warmup_optimizer_steps"] == 63
+
+
+def test_a_warmup_swallowing_the_derived_schedule_is_refused_at_submit_time(
+    tmp_path,
+):
+    """The warmup>=steps refusal compares DERIVED optimizer counts.
+
+    Raw counts that pass at N=1 can still derive to a schedule that never
+    leaves warmup once both are ceiled -- that must be refused by
+    _validate_args, before a model load or a GPU allocation, not by
+    warmup_cosine_scale at the first loop iteration.
+    """
+
+    # 6 of 10 micro-steps passes raw; at N=5 both ceil to 2 and there is no
+    # schedule left.
+    train_cli._validate_args(
+        _validator_args(tmp_path, num_steps=10, warmup_steps=6)
+    )
+    with pytest.raises(ValueError, match="never leaves warmup"):
+        train_cli._validate_args(
+            _validator_args(tmp_path, num_steps=10, warmup_steps=6, grad_accum=5)
+        )
+    with pytest.raises(ValueError, match="grad_accum"):
+        train_cli._validate_args(_validator_args(tmp_path, grad_accum=0))
+
+
+def test_the_partial_final_window_still_closes(tmp_path):
+    """num_steps % N != 0: the last short window steps on the run's last row.
+
+    At num_steps=3 and N=2 the flags must read (start, -), (-, end),
+    (start, end): the full window closes on its second micro-step and the
+    one-draw tail window opens AND closes on the run's last -- not stepping it
+    would let completed_steps reach the target while the tail rows never
+    trained. The tail checkpoint then records step 3 itself; the ceil is
+    reserved for interrupts, whose breaks only land on window tops.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    flags: list[tuple[bool, bool]] = []
+    base_step = _recording_step([])
+
+    def flag_recording_step(**kwargs):
+        flags.append((kwargs["window_start"], kwargs["window_end"]))
+        return base_step(**kwargs)
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=3, grad_accum=2),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=flag_recording_step,
+        output_dir=tmp_path,
+    )
+
+    assert flags == [(True, False), (False, True), (True, True)]
+    assert result["completed_steps"] == 3
+    payload = read_trainer_state(tmp_path / "train_state.pt")
+    assert payload["step"] == 3
