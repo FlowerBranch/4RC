@@ -240,6 +240,11 @@ def _loop_args(tmp_path, **overrides):
         # refused on resume like the spec, and run_training reads it to work out
         # which slots that window seats; every loop test needs it present.
         val_cameras=[0, 1, 2, 3],
+        # The window's other dimension: the clip length its times are clamped
+        # to. _checkpoint_settings stores it and _validate_args/_val_plans derive
+        # the held-out window from it, so every loop test needs it present; 24
+        # is the parser's default and the loader's evaluation clip.
+        val_seq_len=24,
         # Where the time-index table started. _checkpoint_settings stores both
         # and check_resume_settings refuses a change, so every loop test needs
         # them present; these are the parser's defaults.
@@ -3644,6 +3649,94 @@ def test_an_anchor_the_val_window_cannot_seat_is_refused_at_parse_time(tmp_path)
         train_cli._validate_args(args)
 
 
+def test_the_val_window_is_clamped_by_the_held_out_clip_length(tmp_path):
+    """The traceback: budget 60 over 4 cameras asked for 15 times at stride 2,
+    frames 0..28, and build_scene refused frame 24 against a 24-frame clip --
+    after the model load. The clip length is loader configuration, so the window
+    is clamped to it here, from flags, exactly as select_times clamps a training
+    step to its row's seq_len."""
+
+    scenes = tmp_path / "val.json"
+    scenes.write_text(json.dumps(["0000"]))
+    args = _validator_args(
+        tmp_path,
+        observation_budget=60,
+        val_scenes_file=str(scenes),
+        val_data_root="/held",
+    )
+    train_cli._validate_args(args)
+
+    assert train_cli._val_time_count(args) == 12
+    plan = train_cli._val_plans(args)[0]
+    assert plan.times == tuple(range(0, 24, 2))
+    assert plan.times[-1] == 22 < args.val_seq_len
+
+    # The flag is what decides it: a longer clip lets the budget's 15 through.
+    args.val_seq_len = 30
+    assert train_cli._val_time_count(args) == 15
+    assert train_cli._val_plans(args)[0].times[-1] == 28
+
+
+@pytest.mark.parametrize(
+    "budget, times", [(24, 6), (36, 9), (40, 10), (44, 11), (48, 12)]
+)
+def test_the_val_window_is_unchanged_at_every_archived_budget(tmp_path, budget, times):
+    """Every budget an archived run used seats at most 12 times at stride 2, which
+    is exactly what a 24-frame clip holds -- so the clamp is inert for all of
+    them and bites only from 52 up, where today's window crashes."""
+
+    args = _validator_args(
+        tmp_path,
+        observation_budget=budget,
+        val_scenes_file="val.json",
+        val_data_root="/held",
+    )
+    train_cli._validate_args(args)
+
+    assert train_cli._val_time_count(args) == times == min(budget // 4, 32)
+
+
+def test_the_parse_time_anchor_check_sees_the_clamped_window(tmp_path):
+    """The clamp lives in _val_time_count, not only in _val_plans.
+
+    Clamping the plans alone would leave the parse-time check vouching for slot
+    12 while the plan seats 0..11, and resolve_query_anchors would then refuse
+    it from run_training -- the same line, after the same model load.
+    """
+
+    # Strict: refused at parse time, naming the window the clamp produced.
+    args = _validator_args(
+        tmp_path,
+        observation_budget=60,
+        query_anchors=["0:12"],
+        val_scenes_file="val.json",
+        val_data_root="/held",
+    )
+    with pytest.raises(
+        ValueError, match="time slot 12 does not fit the held-out window's 12 times"
+    ):
+        train_cli._validate_args(args)
+
+    # Adaptive: dropped, and the provider drops the same one from the plan.
+    scenes = tmp_path / "val.json"
+    scenes.write_text(json.dumps(["0000"]))
+    args = _validator_args(
+        tmp_path,
+        observation_budget=60,
+        query_anchors=["0:0", "0:12"],
+        adaptive_query_anchors=True,
+        val_scenes_file=str(scenes),
+        val_data_root="/held",
+    )
+    train_cli._validate_args(args)
+    assert train_cli._val_anchor_slots(args) == ((0, 0),)
+    provider = MVTrackerSceneProvider(
+        query_anchor_slots=train_cli.parse_query_anchor_slots(args.query_anchors),
+        adaptive_query_anchors=True,
+    )
+    assert provider.resolve_query_anchors(train_cli._val_plans(args)[0]) == ((0, 0),)
+
+
 def test_an_anchor_time_slot_a_planned_step_cannot_seat_is_refused_under_plan_only(
     tmp_path, monkeypatch, capsys
 ):
@@ -4977,6 +5070,34 @@ def test_a_resume_that_changes_grad_accum_is_refused(tmp_path):
     stored = train_cli._checkpoint_settings(_loop_args(tmp_path, grad_accum=2))
     with pytest.raises(RuntimeError, match="carries grad_accum=2"):
         train_cli.check_resume_settings(stored, _loop_args(tmp_path, grad_accum=4))
+
+
+def test_a_checkpoint_predating_val_seq_len_resumes_at_the_default(tmp_path):
+    """Absence resolves: a run written before the flag could only have had a
+    held-out window that already fit the 24-frame clip -- the preflight loads
+    every held-out scene before step 0, and any wider window died there before
+    a train_state.pt existed -- and the clamp at 24 reproduces that window
+    exactly. So a pre-flag checkpoint resumes silently at 24 and is refused at
+    anything else."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["val_seq_len"]
+
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="predates"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, val_seq_len=30))
+
+
+def test_a_resume_that_changes_val_seq_len_is_refused(tmp_path):
+    """Refused-tier: the clip length is half of the held-out window's shape, so
+    a segment under a different value extends one curve over a different
+    measurement while the step counter continues."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, val_seq_len=24))
+    assert stored["val_seq_len"] == 24
+    with pytest.raises(RuntimeError, match="carries val_seq_len=24"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, val_seq_len=30))
 
 
 def test_the_accumulation_settings_record_both_units(tmp_path):

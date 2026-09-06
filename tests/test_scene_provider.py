@@ -963,6 +963,21 @@ def test_the_provider_overrides_every_eval_default_that_breaks_a_replay():
     assert kwargs["max_depth"] == 24.0
 
 
+def test_the_trainers_held_out_clip_length_is_the_loaders_evaluation_clip():
+    """DEFAULT_VAL_SEQ_LEN clamps the held-out window at parse time, with no
+    scene load, on the strength of the loader being built with seq_len=24 -- the
+    eval default above, which dataset_overrides leaves alone. A seq_len override
+    added there would desync the parse-time window from the loaded clip silently
+    (a longer clip would score fewer frames than it holds; a shorter one would
+    fail the loader's own n_frames >= seq_len assert), so the two are pinned to
+    each other: move one, move both."""
+
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    assert train_cli.DEFAULT_VAL_SEQ_LEN == EVAL_DEFAULT_KWARGS["seq_len"] == 24
+    assert "seq_len" not in MVTrackerSceneProvider().dataset_overrides("/d")
+
+
 def test_the_depth_clip_is_the_paired_runs_and_is_overridable():
     """The value mirrors another repo's config, so it must not be a literal here.
 

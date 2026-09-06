@@ -49,6 +49,7 @@ from arc.training.manifest_plan import (
     ManifestPlanError,
     StepPlan,
     plan_manifest,
+    select_times,
 )
 from arc.training.runtime import (
     TIME_EMBEDDING_KEY,
@@ -98,6 +99,16 @@ DEFAULT_STRIDE = 2
 # The time-index embedding's row count. A window may not carry more times than
 # the table can index, whatever the budget allows.
 DEFAULT_MAX_TIME_INDICES = 32
+# How many frames every held-out clip carries, so the held-out window can be
+# clamped to it at parse time, with no scene load, exactly as select_times clamps
+# a training step to its row's seq_len. Loader configuration rather than scene
+# data: KubricMultiViewDataset.from_name emits "seq_len": 24 on the evaluation
+# path (kubric_multiview_dataset.py:133), the constructor defaults to the same
+# (:209), and __getitem__ crops every longer clip to exactly seq_len (:826-841).
+# MVTrackerSceneProvider.dataset_overrides deliberately leaves seq_len alone; if
+# a seq_len override is ever added there, this default must move with it, or the
+# parse-time window and the loaded clip desync silently.
+DEFAULT_VAL_SEQ_LEN = 24
 # Above this share of unreplayable rows the manifest is damaged rather than
 # merely untidy, and training on the remainder would be training on a fraction of
 # the recorded stream while every other number looked healthy.
@@ -1658,6 +1669,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "measures while the step counter continues (default: %(default)s)"
         ),
     )
+    evaluation.add_argument(
+        "--val_seq_len",
+        type=int,
+        default=DEFAULT_VAL_SEQ_LEN,
+        help=(
+            "Frames in every held-out clip. Caps the held-out window alongside "
+            "--observation_budget and --max_time_indices, exactly as a manifest "
+            "row's seq_len caps a training step. Loader configuration rather "
+            "than scene data -- MVTracker's loader crops every evaluation clip "
+            "to this -- so the window is decided at parse time and under "
+            "--plan_only (default: %(default)s)"
+        ),
+    )
     return parser
 
 
@@ -1822,8 +1846,9 @@ def _validate_args(args: argparse.Namespace) -> None:
                 raise ValueError(
                     "no --query_anchors slot fits the held-out window's "
                     f"{len(args.val_cameras)} cameras (--val_cameras) x "
-                    f"{val_times} times (--observation_budget // "
-                    "len(--val_cameras), capped by --max_time_indices), so "
+                    f"{val_times} times (the least of --observation_budget // "
+                    "len(--val_cameras), --max_time_indices, and the "
+                    "--val_seq_len clip at --stride), so "
                     "--adaptive_query_anchors would drop every one of them and "
                     "the eval would supervise nothing"
                 )
@@ -1838,8 +1863,10 @@ def _validate_args(args: argparse.Namespace) -> None:
                 if time_slot >= val_times:
                     raise ValueError(
                         f"--query_anchors time slot {time_slot} does not fit the "
-                        f"held-out window's {val_times} times (--observation_budget "
-                        "// len(--val_cameras), capped by --max_time_indices)"
+                        f"held-out window's {val_times} times (the least of "
+                        "--observation_budget // len(--val_cameras), "
+                        "--max_time_indices, and the --val_seq_len clip at "
+                        "--stride)"
                     )
     # Canonical form, recorded everywhere the spec is recorded: format-only
     # normalization ("01:00" becomes "1:0"), order preserved -- the order is
@@ -2588,6 +2615,10 @@ def _checkpoint_settings(args) -> dict:
         # 0 and therefore owns the eval's Sim(3). Stored as a list for the same
         # reason query_anchors is.
         "val_cameras": list(args.val_cameras),
+        # The window's other dimension: the clip length its times are clamped
+        # to, alongside the budget and the table. Coerced like grad_accum for
+        # the weights_only round trip.
+        "val_seq_len": int(args.val_seq_len),
         "kubric_max_depth": float(args.kubric_max_depth),
         # Where the time-index table started. Coerced like kubric_max_depth so a
         # value round-tripped through torch.load(weights_only=True) compares
@@ -2655,7 +2686,9 @@ def _write_checkpoint(
 # observations either way), what the held-out curve measures (val_cameras: since
 # the window drops every slot it cannot seat, this count IS the eval's anchor
 # count under a ceiling, so changing it between segments moves the measurement
-# while the step counter continues), where the time-index table started
+# while the step counter continues; and val_seq_len, the clip length that
+# window's times are clamped to, so the same budget seats a different number of
+# them under a different value), where the time-index table started
 # (time_embedding_init and its scale -- a different init is a different set of
 # per-index offsets, so the encoder is conditioned differently from step 0 and
 # every weight downstream of it descends from that), which objective the run
@@ -2706,6 +2739,7 @@ _RESUME_SETTINGS_REFUSED = (
     "query_anchors",
     "adaptive_query_anchors",
     "val_cameras",
+    "val_seq_len",
     "kubric_max_depth",
     "time_embedding_init",
     "time_embedding_init_scale",
@@ -2741,7 +2775,10 @@ _RESUME_SETTINGS_WARNED = (
 # strictly refused when absent unless it is listed here, and the ones that are
 # not listed are the ones whose absence is genuinely ambiguous: val_cameras and
 # the time-embedding pair each had a reachable non-default value before they were
-# recorded, so nothing can say which one an old checkpoint used.
+# recorded, so nothing can say which one an old checkpoint used. val_seq_len IS
+# listed even though the window was unclamped before the flag: an unclamped
+# window wider than the clip died in the held-out preflight before step 0, so
+# the only checkpoints that exist are from windows the clamp reproduces exactly.
 #
 # This exists because the tier's original premise -- "only disposable smokes lack
 # the newest key" -- stopped being true once multi-day runs began resuming across
@@ -2757,6 +2794,13 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # every step was its own window. So absence resolves, pre-flag runs resume
     # silently at 1, and resuming one at N>1 is refused like any changed value.
     "grad_accum": 1,
+    # A checkpoint from before --val_seq_len could only have been written by a
+    # run whose held-out window already fit the 24-frame clip: run_training
+    # loads every held-out scene in its preflight, before step 0 and before the
+    # first train_state.pt, and an unclamped window that overran the clip died
+    # there. The clamp at 24 reproduces the surviving windows bit for bit, so
+    # absence resolves to the default and any other value is refused.
+    "val_seq_len": DEFAULT_VAL_SEQ_LEN,
 }
 
 
@@ -3178,17 +3222,43 @@ def main() -> None:
     print(f"gates_passed={summary['gates_passed']}")
 
 
+def _val_window(args) -> tuple[tuple[int, ...], str]:
+    """The held-out window's times and the bound that decided them, from flags.
+
+    The training side's own primitive, so the held-out window is the same
+    three-way min a training step gets -- the budget at this camera count, the
+    embedding table, and the clip's own length at ``--stride`` -- rather than a
+    restatement of two of its terms.  The third term is what
+    ``--observation_budget 60`` died on: without it the window planned frames
+    0..28 against the loader's 24-frame clip, and ``build_scene`` refused it
+    after the model load.  ``--val_seq_len`` is a flag rather than a loaded
+    fact so this stays answerable under ``--plan_only`` and before any scene
+    loads.
+
+    Times start at frame 0 at a fixed stride, which is what keeps held-out
+    curves comparable with the archived smokes.
+    """
+
+    return select_times(
+        frame_start=0,
+        seq_len=args.val_seq_len,
+        view_count=len(args.val_cameras),
+        budget=args.observation_budget,
+        stride=args.stride,
+        max_time_indices=args.max_time_indices,
+    )
+
+
 def _val_time_count(args) -> int:
     """How many times the held-out window seats, purely from flags.
 
     Factored out of :func:`_val_plans` so the parse-time anchor-seating check
-    and the plans it vouches for cannot drift apart.  The window itself is
-    unchanged: ``_val_plans`` still builds ``range(0, count * stride, stride)``
-    starting at 0, which is what keeps held-out curves comparable with the
-    archived smokes.
+    and the plans it vouches for cannot drift apart: both read
+    :func:`_val_window`, so a bound that narrows the plans narrows this count
+    -- and every slot check resting on it -- in the same call.
     """
 
-    return min(args.observation_budget // len(args.val_cameras), args.max_time_indices)
+    return len(_val_window(args)[0])
 
 
 def _val_anchor_slots(args) -> tuple[tuple[int, int], ...]:
@@ -3229,15 +3299,16 @@ def _val_plans(args) -> list[StepPlan]:
     """Held-out scenes as plans, so eval and training share one scene path.
 
     These carry no ``track_indices``: there is no recorded draw to replay on the
-    held-out side, so every eligible track is supervised. The window matches
-    training's, which is what makes the two curves the same measurement.
+    held-out side, so every eligible track is supervised. The window is
+    :func:`_val_window`'s -- training's own ``select_times`` over the held-out
+    clip -- which is what makes the two curves the same measurement.
     """
 
     if not args.val_scenes_file:
         return []
     names = json.loads(Path(args.val_scenes_file).read_text())
     cameras = tuple(args.val_cameras)
-    times = tuple(range(0, _val_time_count(args) * args.stride, args.stride))
+    times, bound = _val_window(args)
     return [
         StepPlan(
             step=-1,
@@ -3246,9 +3317,13 @@ def _val_plans(args) -> list[StepPlan]:
             cameras=cameras,
             times=times,
             frame_start=0,
-            seq_len=len(times) * args.stride,
+            # The clip's length, as on a training plan, not the window's span:
+            # at budget 24 the span is 12 frames of a 24-frame clip.
+            seq_len=args.val_seq_len,
             stride=args.stride,
-            time_bound="budget",
+            # Which of the three terms decided T -- 'window' from budget 52 up,
+            # where the clip is shorter than the budget would allow.
+            time_bound=bound,
             track_indices=(),
             scene_transform=None,
             depth_type="gt",
