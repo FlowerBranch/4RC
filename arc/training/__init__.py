@@ -80,11 +80,13 @@ from .sparse_tracking import (
     SparseCorrespondences,
     SparseTrackingLossResult,
     build_anchor_correspondences,
+    camera_major_layout,
     fit_scene_sim3,
     gather_at_correspondences,
     gather_query_anchor_points,
     reconstruction_drift_report,
     sparse_targets,
+    sparse_targets_per_time,
     sparse_tracking_loss,
 )
 
@@ -149,7 +151,9 @@ __all__ = [
     "per_sample_huber_error",
     "resolve_confidence_alpha",
     "save_temporal_tracking_checkpoint",
+    "camera_major_layout",
     "sparse_targets",
+    "sparse_targets_per_time",
     "sparse_tracking_loss",
     "synchronized_consistency_loss",
     "synchronized_consistency_stats",

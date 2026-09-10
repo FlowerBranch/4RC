@@ -1295,6 +1295,7 @@ def sparse_tracking_loss(
     sync_weight: float = 0.0,
     velocity_weight: float = 0.0,
     collect_diagnostics: bool = True,
+    merge_synchronized_slots: bool = False,
 ) -> SparseTrackingLossResult:
     """Huber-supervise postprocess-equivalent absolute track positions.
 
@@ -1330,6 +1331,13 @@ def sparse_tracking_loss(
     residual.  Both cost a device sync per reported figure, and a training step
     throws them away -- only the initial and final evaluations are ever written
     to ``run_summary.json``.
+
+    ``merge_synchronized_slots=True`` scores a merged head: ``track_multi``
+    carries one field per semantic time index instead of one per observation
+    slot, so the observation axis is ``len(scene.times)``, targets reduce
+    through :func:`sparse_targets_per_time`, and the velocity pairing runs over
+    the distinct-time vector with no camera grouping.  ``sync_weight`` is
+    refused with it -- there is no synchronized slot pair left to compare.
     """
 
     if huber_delta_m <= 0 or not np.isfinite(huber_delta_m):
@@ -1340,10 +1348,19 @@ def sparse_tracking_loss(
         raise ValueError("sync_weight must be finite and non-negative")
     if velocity_weight < 0 or not np.isfinite(velocity_weight):
         raise ValueError("velocity_weight must be finite and non-negative")
+    if merge_synchronized_slots and sync_weight > 0.0:
+        raise ValueError(
+            "sync_weight > 0 is meaningless under merge_synchronized_slots: the "
+            "merged head emits one field per time index, so there is no "
+            "synchronized slot pair to compare (the trainer refuses this at "
+            "parse time; this raise covers callers that bypass it)"
+        )
     if correspondences.count == 0:
         raise ValueError("No eligible sparse correspondences")
     if "track_multi" not in raw_predictions:
         raise KeyError("Raw predictions do not contain track_multi")
+
+    merged_layout = camera_major_layout(scene) if merge_synchronized_slots else None
 
     tracks = raw_predictions["track_multi"]
     if tracks.ndim != 6 or tracks.shape[0] != 1 or tracks.shape[-1] != 3:
@@ -1351,7 +1368,13 @@ def sparse_tracking_loss(
             "track_multi must have shape (1,Q,S,H,W,3), got "
             f"{tuple(tracks.shape)}"
         )
-    if tracks.shape[2] != scene.num_observations:
+    if merge_synchronized_slots:
+        if tracks.shape[2] != merged_layout[1]:
+            raise ValueError(
+                f"Model returned {tracks.shape[2]} observation slots where the "
+                f"merged head owes one per time index ({merged_layout[1]})"
+            )
+    elif tracks.shape[2] != scene.num_observations:
         raise ValueError(
             f"Model returned {tracks.shape[2]} observation slots for "
             f"{scene.num_observations} inputs"
@@ -1412,10 +1435,15 @@ def sparse_tracking_loss(
     if not torch.isfinite(query_anchor_points).all():
         raise FloatingPointError("Query pointmap anchor contains NaN or Inf")
 
-    target_positions, target_visible, target_finite, target_mask = sparse_targets(
-        scene,
-        correspondence,
-    )
+    if merge_synchronized_slots:
+        target_positions, target_visible, target_finite, target_mask = (
+            sparse_targets_per_time(scene, correspondence)
+        )
+    else:
+        target_positions, target_visible, target_finite, target_mask = sparse_targets(
+            scene,
+            correspondence,
+        )
     if not target_mask.any():
         raise ValueError("No visible finite sparse query-target samples")
     if not torch.isfinite(predicted_displacement[target_mask]).all():
@@ -1439,6 +1467,29 @@ def sparse_tracking_loss(
     )
     metric_error = track_metric_error(predicted_metric, target_metric, target_mask)
 
+    # One pairing rule for the diagnostic here, the velocity term below, and --
+    # through anchor_velocity_counts, which re-derives it from the scene -- the
+    # multi-anchor weights; the three must agree or the combined objective
+    # silently stops matching the single-anchor one. CPU copies on purpose:
+    # adjacent_pair_indices reads them through `.tolist()` and builds its index
+    # tensors on the value tensor's own device, so moving these first would buy
+    # a host sync and nothing else. Same reasoning as the sync pair count below.
+    if merge_synchronized_slots:
+        # One row per semantic time: the pairing axis IS the distinct-time set.
+        # camera_major_layout proved every camera row's indices equal arange(T),
+        # so camera 0's row is that vector; slot_groups=None because no second
+        # camera remains on the axis for Eq. 8's monocular restriction to
+        # exclude.
+        pairing_time_indices = scene.slot_time_indices.view(*merged_layout)[0]
+        pairing_groups = None
+    else:
+        pairing_time_indices = scene.slot_time_indices.reshape(-1)
+        # One camera's own sequence: Eq. 8 is a monocular objective, and pairing
+        # across cameras would add the synchronized-consistency residual to
+        # every difference -- three quarters of the pairs at the committed
+        # window -- making the velocity weight unreadable against sync_weight.
+        pairing_groups = scene.slot_cameras.reshape(-1)
+
     # Before the fast path, and gated on the reporting flag rather than on the
     # weight: a run that does not train the term still needs its residual, or
     # turning the term on later has nothing to be read against. The training
@@ -1447,13 +1498,9 @@ def sparse_tracking_loss(
         temporal_velocity_stats(
             predicted_metric,
             target_metric,
-            # CPU copies on purpose: adjacent_pair_indices reads them through
-            # `.tolist()` and builds its index tensors on the value tensor's own
-            # device, so moving these first would buy a host sync and nothing
-            # else. Same reasoning as the sync pair count below.
-            scene.slot_time_indices.reshape(-1),
+            pairing_time_indices,
             target_mask,
-            slot_groups=scene.slot_cameras.reshape(-1),
+            slot_groups=pairing_groups,
         )
         if collect_diagnostics
         else None
@@ -1490,19 +1537,12 @@ def sparse_tracking_loss(
     velocity_loss = None
     velocity_pair_count = None
     if velocity_weight > 0.0:
-        # CPU, for the reason given at the diagnostic above.
-        velocity_time_indices = scene.slot_time_indices.reshape(-1)
-        # One camera's own sequence: Eq. 8 is a monocular objective, and pairing
-        # across cameras would add the synchronized-consistency residual to every
-        # difference -- three quarters of the pairs at the committed window --
-        # making this weight unreadable against sync_weight.
-        velocity_groups = scene.slot_cameras.reshape(-1)
         # Counted whether or not the term survives, so 0 says "built and found
         # nothing" while None says "never built". An empty pair list indexes to
         # an (M,0) selection summing to 0, which is the same answer.
         first, second, _ = adjacent_pair_indices(
-            velocity_time_indices,
-            velocity_groups,
+            pairing_time_indices,
+            pairing_groups,
         )
         velocity_pair_count = int(
             (target_mask[:, first] & target_mask[:, second]).sum().item()
@@ -1510,12 +1550,12 @@ def sparse_tracking_loss(
         velocity_loss = velocity_consistency_loss(
             predicted_metric,
             target_metric,
-            velocity_time_indices,
+            pairing_time_indices,
             target_mask,
             # Still metres, per index step: the same physical knee, not a second
             # unmeasured constant.
             huber_delta=huber_delta_m,
-            slot_groups=velocity_groups,
+            slot_groups=pairing_groups,
             # Both tensors are already metric here, unlike the sync term's raw
             # dP grid, so there is nothing left to lift.
         )
@@ -1644,6 +1684,84 @@ def sparse_targets(
         trajectory_indices[None, :],
     ].mT
     finite = torch.isfinite(positions).all(dim=-1)
+    return positions, visible, finite, visible & finite
+
+
+def camera_major_layout(scene: DumpedKubricScene) -> tuple[int, int]:
+    """Prove the ``(V, T)`` camera-major slot grid and return it.
+
+    Every merged-slot reduction reshapes an ``(M, S)`` axis into ``(M, V, T)``;
+    this is the one place that proves ``slot = camera*T + t`` actually holds --
+    rows of ``slot_cameras`` constant and ordered like ``scene.cameras``, every
+    row of ``slot_time_indices`` equal to ``arange(T)``, every row of
+    ``slot_times`` equal to ``scene.times`` (the invariant that lets camera 0
+    carry the per-time targets and the writer transpose by semantic order) --
+    instead of each ``view`` call assuming it.  ``dumped_kubric`` builds
+    exactly this grid, but a reduction must not rest on a producer it cannot
+    see.
+    """
+
+    views_per_time = len(scene.cameras)
+    time_count = len(scene.times)
+    if scene.num_observations != views_per_time * time_count:
+        raise ValueError(
+            f"{scene.num_observations} observation slots do not fill a "
+            f"{views_per_time}x{time_count} camera-major grid"
+        )
+    slot_cameras = scene.slot_cameras.reshape(views_per_time, time_count)
+    expected_cameras = torch.as_tensor(
+        scene.cameras, dtype=slot_cameras.dtype, device=slot_cameras.device
+    )[:, None]
+    if not torch.equal(slot_cameras, expected_cameras.expand_as(slot_cameras)):
+        raise ValueError(
+            "slot_cameras is not camera-major over scene.cameras "
+            f"{tuple(scene.cameras)}: got {scene.slot_cameras.tolist()}"
+        )
+    slot_time_indices = scene.slot_time_indices.reshape(views_per_time, time_count)
+    expected_indices = torch.arange(
+        time_count, dtype=slot_time_indices.dtype, device=slot_time_indices.device
+    )
+    if not torch.equal(
+        slot_time_indices, expected_indices.expand_as(slot_time_indices)
+    ):
+        raise ValueError(
+            "slot_time_indices is not arange(T) within every camera: got "
+            f"{scene.slot_time_indices.tolist()}"
+        )
+    slot_times = scene.slot_times.reshape(views_per_time, time_count)
+    expected_times = torch.as_tensor(
+        scene.times, dtype=slot_times.dtype, device=slot_times.device
+    )
+    if not torch.equal(slot_times, expected_times.expand_as(slot_times)):
+        raise ValueError(
+            f"slot_times does not repeat scene.times {tuple(scene.times)} within "
+            f"every camera: got {scene.slot_times.tolist()}"
+        )
+    return views_per_time, time_count
+
+
+def sparse_targets_per_time(
+    scene: DumpedKubricScene,
+    correspondences: SparseCorrespondences,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``sparse_targets`` reduced over the camera axis: one column per time.
+
+    Positions and their finiteness are camera-independent -- ``sparse_targets``
+    indexes them by ``(slot_times, trajectory)`` alone -- so camera row 0
+    carries them exactly.  Visibility reduces with ``any`` over cameras,
+    matching the ``gt_vis_any`` convention the prediction bundles are written
+    with, and the mask is recomputed as ``visible_any & finite`` rather than
+    reduced from the per-slot mask.  Like ``sparse_targets``, nothing here
+    reads a prediction, so the merged mask keeps weighting anchors before the
+    first forward.
+    """
+
+    positions, visible, finite, _ = sparse_targets(scene, correspondences)
+    views_per_time, time_count = camera_major_layout(scene)
+    count = positions.shape[0]
+    positions = positions.view(count, views_per_time, time_count, 3)[:, 0]
+    visible = visible.view(count, views_per_time, time_count).any(dim=1)
+    finite = finite.view(count, views_per_time, time_count)[:, 0]
     return positions, visible, finite, visible & finite
 
 

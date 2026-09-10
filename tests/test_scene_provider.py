@@ -905,6 +905,70 @@ def test_the_covered_timestep_column_indexes_the_window_not_the_frames(dumped_sc
     assert times.min() >= 0 and times.max() < len(covered)
 
 
+def test_the_merged_bundle_is_written_without_a_fusion_step(dumped_scene):
+    """Under the merge the model already emits the scorers' axis: transpose, not fuse.
+
+    A writer that still ran the per-slot fusion over T rows would weighted-mean
+    each row with itself -- right shape, plausible magnitude, silently different
+    confidence channel (max-of-one versus the raw value under any later change).
+    Pinned with per-time-valued tracks and confidence so a pass-through and a
+    fusion cannot coincide, on hand-built raw dicts because _FakeArc's
+    confidence is constant across the observation axis by design and cannot
+    tell the two apart.
+    """
+
+    from arc.training import (
+        DetachedSim3,
+        build_anchor_correspondences,
+        sparse_targets_per_time,
+    )
+
+    scene = dumped_scene
+    correspondences, _ = build_anchor_correspondences(scene)
+    covered = sorted({int(t) for t in scene.slot_times.tolist()})
+    time_count = len(covered)
+    height, width = scene.views[0]["img"].shape[-2:]
+
+    tracks = torch.zeros(1, 1, time_count, height, width, 3)
+    confidence = torch.ones(1, 1, time_count, height, width)
+    for row in range(time_count):
+        tracks[0, 0, row] = float(row + 1)
+        confidence[0, 0, row] = float(10 * (row + 1))
+    raw = {
+        "track_multi": tracks,
+        "conf_track_multi": confidence,
+        "track_query_idx": scene.track_query_observation_slots.clone(),
+    }
+
+    arrays = train_cli._prediction_arrays(
+        raw,
+        scene,
+        correspondences,
+        DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
+        torch.zeros(correspondences.count, 3),
+        _ALPHA,
+        merge_synchronized_slots=True,
+    )
+
+    metric = float(scene.track_upscaling_factor)
+    assert arrays["pred"].shape == (time_count, correspondences.count, 3)
+    assert arrays["conf"].shape == (time_count, correspondences.count)
+    for row in range(time_count):
+        # The model's row passes through untouched -- no weighted mean anywhere.
+        np.testing.assert_allclose(arrays["pred"][row], (row + 1) * metric, rtol=1e-6)
+        # And the confidence is the raw per-time channel, unclamped, with no
+        # max-over-cameras step left to run.
+        np.testing.assert_allclose(arrays["conf"][row], 10.0 * (row + 1), rtol=1e-6)
+
+    merged_visible = sparse_targets_per_time(scene, correspondences)[1]
+    np.testing.assert_array_equal(arrays["gt_vis_any"], merged_visible.T.numpy())
+
+    # The covered-timestep convention is unchanged: column 0 still indexes the
+    # window, never the original frame numbers.
+    times = arrays["query_points"][:, 0]
+    assert times.min() >= 0 and times.max() < time_count
+
+
 # ------------------------------------------------------- the dataset kwargs ---
 
 

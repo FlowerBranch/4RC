@@ -22,6 +22,55 @@ _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
 
 
+def merge_time_grouped_tokens(
+    tokens: torch.Tensor,
+    *,
+    patch_start_idx: int,
+    track_query_idx: int,
+    views_per_time: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(query [B,T,1+P,C], kv [B,T,V*(1+P),C]) with keys pooled by time index.
+
+    ``tokens`` is [B, S, N, C] laid out camera-major (slot = camera*T + t) with
+    [camera_token, time_token, patches...] along N.  For each of the T times,
+    the pooled key row concatenates all V cameras' blocks for that instant, so
+    cross-view correspondence happens inside the attention softmax instead of
+    being penalised between independently computed fields.
+
+    tokens[:, :, 0] is the encoder's per-slot camera token -- a per-slot
+    attention-evolved summary, NOT a camera identity (the encoder seats one
+    ref token on slot 0 and one shared src token on all others).  Unused by
+    the per-slot path; CONCATENATED here as one extra key token per camera
+    block, the way the time token enters the query -- adding it into the
+    patches would cross a normalization boundary (patch outputs are normed,
+    this token is not: measured RMS 4-18x the patches' at the taps) and
+    suppress patch content in every pooled key.
+
+    The query row for time t is the ANCHOR CAMERA's time token for t plus the
+    anchor slot's own patches: bit-equal in content to the row slot
+    (anchor_camera, t) produces on the per-slot path, so only the keys change.
+    NOT a mean of the V time tokens -- those are different tap activations
+    (processed through many blocks after the raw injection), so a mean would
+    be a blend of them, not the shared value it looks like.
+    """
+
+    B, S, _, C = tokens.shape
+    T = S // views_per_time
+    patches = tokens[:, :, patch_start_idx:, :]
+    P = patches.shape[2]
+    kv = torch.cat([tokens[:, :, 0:1, :], patches], dim=2)            # [B,S,1+P,C]
+    kv = (
+        kv.view(B, views_per_time, T, 1 + P, C)
+        .permute(0, 2, 1, 3, 4)
+        .reshape(B, T, views_per_time * (1 + P), C)                   # [B,T,V*(1+P),C]
+    )
+    query_patches = patches[:, track_query_idx : track_query_idx + 1].expand(B, T, P, C)
+    time_emb = tokens[:, :, 1:2, :].view(B, views_per_time, T, 1, C)[
+        :, track_query_idx // T
+    ]
+    return torch.cat([time_emb, query_patches], dim=2), kv
+
+
 class MotionDecoder(nn.Module):
     def __init__(
         self,
@@ -97,11 +146,19 @@ class MotionDecoder(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         track_query_idx = 0,
+        *,
+        views_per_time: int = 1,
     ) -> torch.Tensor:
         """
         Args:
-            tokens: [B, S, N, C], where N = 1 + 1 + 4 + P
+            tokens: [B, S, N, C], laid out [camera_token, time_token, patches...]
+                at the production call site (patch_start_idx=2)
             patch_start_idx: index where patches start
+            views_per_time: 1, the default, is exactly today's per-slot path --
+                every slot's row attends over that slot's own patches. At V > 1
+                the S = V*T camera-major slots pool into one key set per time
+                index and the decoder emits one row per time; see
+                merge_time_grouped_tokens.
         """
         B, S, _, C = tokens.shape
         _, _, _, H, W = images.shape
@@ -109,39 +166,84 @@ class MotionDecoder(nn.Module):
         patches = tokens[:, :, patch_start_idx:, :] # [B, S, P, C]
         P = patches.shape[2]
 
-        query_patches = patches[:, track_query_idx:track_query_idx+1, :, :]
-        query_patches = query_patches.expand(B, S, P, C)
-        
-        time_emb = tokens[:, :, 1:2, :]
-        
-        time_cond = None
-        if self.use_adaln:
-            time_cond = time_emb.flatten(0, 2)
-        
-        # Concat time token to query patches
-        query = torch.cat([time_emb, query_patches], dim=2) # [B, S, 1+P, C]
-        
-        kv = patches
-        
-        # 3. Prepare Positional Embeddings
-        pos_q = None
-        pos_k = None
-        
-        if self.position_getter is not None:
-            pos_patches = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+        if S % views_per_time != 0:
+            raise ValueError(
+                f"views_per_time={views_per_time} does not divide the "
+                f"{S} observation slots"
+            )
 
-            pos_patches = pos_patches + 1
+        if views_per_time == 1:
+            out_rows = S
 
-            pos_time = torch.zeros(B * S, 1, 2, device=tokens.device, dtype=pos_patches.dtype)
+            query_patches = patches[:, track_query_idx:track_query_idx+1, :, :]
+            query_patches = query_patches.expand(B, S, P, C)
 
-            pos_q = torch.cat([pos_time, pos_patches], dim=1)
+            time_emb = tokens[:, :, 1:2, :]
 
-            pos_k = pos_patches
+            time_cond = None
+            if self.use_adaln:
+                time_cond = time_emb.flatten(0, 2)
 
-            pos_cross = (pos_q, pos_k)
+            # Concat time token to query patches
+            query = torch.cat([time_emb, query_patches], dim=2) # [B, S, 1+P, C]
 
-        query = query.flatten(0, 1)
-        kv = kv.flatten(0, 1)
+            kv = patches
+
+            # 3. Prepare Positional Embeddings
+            pos_q = None
+            pos_k = None
+
+            if self.position_getter is not None:
+                pos_patches = self.position_getter(B * S, H // self.patch_size, W // self.patch_size, device=images.device)
+
+                pos_patches = pos_patches + 1
+
+                pos_time = torch.zeros(B * S, 1, 2, device=tokens.device, dtype=pos_patches.dtype)
+
+                pos_q = torch.cat([pos_time, pos_patches], dim=1)
+
+                pos_k = pos_patches
+
+                pos_cross = (pos_q, pos_k)
+
+            query = query.flatten(0, 1)
+            kv = kv.flatten(0, 1)
+        else:
+            out_rows = S // views_per_time
+
+            query, kv = merge_time_grouped_tokens(
+                tokens,
+                patch_start_idx=patch_start_idx,
+                track_query_idx=track_query_idx,
+                views_per_time=views_per_time,
+            )
+
+            time_cond = None
+            if self.use_adaln:
+                time_cond = query[:, :, 0:1, :].flatten(0, 2)
+
+            pos_q = None
+            pos_k = None
+
+            if self.position_getter is not None:
+                pos_patches = self.position_getter(B * out_rows, H // self.patch_size, W // self.patch_size, device=images.device)
+
+                pos_patches = pos_patches + 1
+
+                pos_time = torch.zeros(B * out_rows, 1, 2, device=tokens.device, dtype=pos_patches.dtype)
+
+                pos_q = torch.cat([pos_time, pos_patches], dim=1)
+
+                # Every camera block of a pooled key row repeats the query's
+                # own layout: the block's camera token at the reserved (0,0),
+                # then the same 2D patch grid -- matching the camera-major
+                # block order of merge_time_grouped_tokens' reshape.
+                pos_k = pos_q.repeat(1, views_per_time, 1)
+
+                pos_cross = (pos_q, pos_k)
+
+            query = query.flatten(0, 1)
+            kv = kv.flatten(0, 1)
 
         # The checkpoint lambdas must bind the block index at definition time:
         # non-reentrant recomputation runs during backward, after this loop has
@@ -181,6 +283,6 @@ class MotionDecoder(nn.Module):
                     else:
                         query = self.self_blocks[cur_i](query, pos=pos_q)
 
-        query = query.view(B, S, 1+P, C)
-        
+        query = query.view(B, out_rows, 1+P, C)
+
         return query

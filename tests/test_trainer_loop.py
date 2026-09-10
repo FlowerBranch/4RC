@@ -262,6 +262,10 @@ def _loop_args(tmp_path, **overrides):
         confidence_weight=0.0,
         sync_weight=0.0,
         velocity_weight=0.0,
+        # Head geometry: per-slot, the contract every existing test assumes.
+        # _checkpoint_settings stores it and check_resume_settings refuses a
+        # change, so every loop test needs it present.
+        merge_synchronized_slots=False,
         confidence_alpha=None,
         # The run's frozen alpha, which run_training pins after the first step
         # and _checkpoint_settings carries. None until something resolves it.
@@ -1015,9 +1019,13 @@ class _FakeArc(nn.Module):
     apart inside this fake while both kept passing.
     """
 
-    def __init__(self, observations, height, width):
+    def __init__(self, observations, height, width, views_per_time=1):
         super().__init__()
         self.observations, self.height, self.width = observations, height, width
+        # How many camera-major slots pool into one output row when a caller
+        # asks for the merged head; 1, the default, keeps every pre-merge
+        # test's behaviour unchanged.
+        self.views_per_time = views_per_time
         self.head = nn.Linear(1, 1)
         self.cam_dec = nn.Linear(1, 1)
         self.motion_decoder = nn.Linear(1, 1)
@@ -1059,12 +1067,13 @@ class _FakeArc(nn.Module):
             "pose_enc": torch.zeros(1, self.observations, 9),
         }
 
-    def track_for_query(self, feats, images, query_idx):
+    def track_for_query(self, feats, images, query_idx, views_per_time=1):
         # (track, confidence) tuple, shaped (1,S,H,W,3) / (1,S,H,W) exactly as
-        # the real head returns them -- anchor_tracks adds the Q=1 axis.
-        track = (
-            torch.ones(1, self.observations, self.height, self.width, 3) * feats[0]
-        )
+        # the real head returns them -- anchor_tracks adds the Q=1 axis. At
+        # views_per_time > 1 the axis is S // views_per_time rows, one per
+        # time, mirroring the merged head.
+        rows = self.observations // views_per_time
+        track = torch.ones(1, rows, self.height, self.width, 3) * feats[0]
         # Deliberately NOT constant. A flat confidence makes every occlusion test
         # vacuous: the fused (T,N) channel comes out uniform, so `occ` is all-True
         # or all-False whatever the threshold, and "occ is not ~gt_vis_any" passes
@@ -1086,12 +1095,12 @@ class _FakeArc(nn.Module):
         confidence = 1.0 + 100.0 * (query_idx + pixels / pixels.numel())
         confidence = (
             confidence.reshape(1, 1, self.height, self.width)
-            .expand(1, self.observations, self.height, self.width)
+            .expand(1, rows, self.height, self.width)
             .contiguous()
         )
         return track, confidence
 
-    def forward(self, views, force_no_output_conversion=False):
+    def forward(self, views, force_no_output_conversion=False, merge_synchronized_slots=False):
         images, track_query_idx, time_indices = self._preprocess_input(views)
         feats = self.encode_features(images, time_indices=time_indices)
         output = self.reconstruct(feats, images)
@@ -1099,8 +1108,12 @@ class _FakeArc(nn.Module):
             int(value)
             for value in torch.as_tensor(track_query_idx).flatten().tolist()
         ]
+        views_per_time = self.views_per_time if merge_synchronized_slots else 1
         tracks, confidences = zip(
-            *(self.track_for_query(feats, images, slot) for slot in query_slots)
+            *(
+                self.track_for_query(feats, images, slot, views_per_time=views_per_time)
+                for slot in query_slots
+            )
         )
         output["track_multi"] = torch.stack(tracks, dim=1)
         output["conf_track_multi"] = torch.stack(confidences, dim=1)
@@ -1355,6 +1368,51 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     assert written["confidence_tau"] == pytest.approx(_EVAL_TAU)
     assert written["confidence_nonfinite"] == 0
     assert written["per_scene"][0]["predicted_occluded_fraction"] is not None
+
+
+def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
+    """Every merged seam of the eval, executed once: the forward kwarg, the
+    merged loss on both arms, and the writer's transpose path.
+
+    This is the merge's counterpart of the end-to-end test above, and exists
+    for the same reason: nothing else executes evaluate_held_out at all, so a
+    seam mis-threaded only on the merged path -- the flag not reaching the
+    second forward, the writer still trying to fuse T rows over S slots --
+    would survive every unit test and die on the cluster.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width, views_per_time=2)
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=7,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
+        merge_synchronized_slots=True,
+    )
+
+    assert metrics["scenes"] == 1
+    assert np.isfinite(metrics["position_loss"])
+    # The shuffled arm must survive the merge: the reversal permutes only the
+    # time conditioning within a camera, and the positional pooling stays
+    # physically correct.
+    assert metrics["position_loss_shuffled"] is not None
+
+    loaded = np.load(tmp_path / "out" / "eval" / "step-7" / "pred" / "0000.npz")
+    assert set(loaded.files) == set(PREDICTION_KEYS)
+    # Four times, not eight slots: the bundle's leading axis is the scorers'
+    # T, emitted by the model directly rather than fused from cameras.
+    assert loaded["pred"].shape[0] == 4
+    assert loaded["conf"].shape[0] == 4
+    assert loaded["gt_vis_any"].shape[0] == 4
 
 
 def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkeypatch):
@@ -3245,6 +3303,27 @@ def test_the_loss_weights_are_recorded_in_the_plan_summary_settings(tmp_path):
     assert settings["resolved_confidence_alpha"] == 3.0
 
 
+def test_merged_slots_are_recorded_in_the_plan_summary_settings(tmp_path):
+    """Nothing else enforces the _plan_summary entry, and the two head
+    geometries' curves are not comparable -- an archived summary must say
+    which one produced its numbers."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    for enabled in (False, True):
+        args = _validator_args(
+            tmp_path, manifest="m.jsonl", merge_synchronized_slots=enabled
+        )
+        settings = train_cli._plan_summary(tally, args)["settings"]
+        assert settings["merge_synchronized_slots"] is enabled
+
+
 def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):
     """run_summary.json's settings come from _plan_summary, so the flag has to
     land there and not only in the checkpoint -- an archived summary should say
@@ -3311,6 +3390,38 @@ def test_the_sync_term_needs_a_window_that_can_hold_a_synchronized_pair(tmp_path
         )
     # Off, the same window is nobody's problem.
     train_cli._validate_args(_validator_args(tmp_path, sync_weight=0.0, min_views=1))
+
+
+def test_sync_weight_with_merged_slots_is_refused_at_parse_time(tmp_path):
+    """The merged head emits one field per time, so the sync term has no pair
+    to compare -- and rather than a silent no-op, synchronized_differences
+    would raise deep inside the first step, after a full model load. The
+    refusal here names both flags before anything is loaded."""
+
+    with pytest.raises(ValueError, match="--merge_synchronized_slots"):
+        train_cli._validate_args(
+            _validator_args(tmp_path, sync_weight=0.5, merge_synchronized_slots=True)
+        )
+    # Each flag alone stays admissible.
+    train_cli._validate_args(_validator_args(tmp_path, sync_weight=0.5))
+    train_cli._validate_args(_validator_args(tmp_path, merge_synchronized_slots=True))
+
+
+def test_merged_slots_need_a_multi_camera_window(tmp_path):
+    """--min_views 1 admits a single-camera window, whose one slot per time IS
+    the per-slot layout -- the merged head would fall back to the per-slot
+    branch on those steps, flipping head geometry per step inside a stream
+    whose checkpoint records merge_synchronized_slots=True."""
+
+    with pytest.raises(
+        ValueError, match="--merge_synchronized_slots needs --min_views >= 2"
+    ):
+        train_cli._validate_args(
+            _validator_args(tmp_path, merge_synchronized_slots=True, min_views=1)
+        )
+    train_cli._validate_args(
+        _validator_args(tmp_path, merge_synchronized_slots=True, min_views=2)
+    )
 
 
 def test_dropped_confidence_samples_are_warned_once_and_totalled(tmp_path, capsys):
@@ -5070,6 +5181,35 @@ def test_a_resume_that_changes_grad_accum_is_refused(tmp_path):
     stored = train_cli._checkpoint_settings(_loop_args(tmp_path, grad_accum=2))
     with pytest.raises(RuntimeError, match="carries grad_accum=2"):
         train_cli.check_resume_settings(stored, _loop_args(tmp_path, grad_accum=4))
+
+
+def test_a_checkpoint_predating_the_merge_flag_resumes_on_the_per_slot_path(tmp_path):
+    """Absence resolves to the only reachable value: before the flag existed
+    no other head geometry was writable, so a pre-flag checkpoint resumes
+    silently on the per-slot path and is refused with the merge on."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored["merge_synchronized_slots"]
+
+    # Same stream on both sides: continues without a word.
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="predates"):
+        train_cli.check_resume_settings(
+            stored, _loop_args(tmp_path, merge_synchronized_slots=True)
+        )
+
+
+def test_a_resume_that_changes_the_merge_flag_is_refused(tmp_path):
+    """Refused-tier: per-slot and merged are different function classes, not
+    different weights on one -- a segment that flips the flag continues the
+    step counter over a different head entirely."""
+
+    stored = train_cli._checkpoint_settings(
+        _loop_args(tmp_path, merge_synchronized_slots=True)
+    )
+    with pytest.raises(RuntimeError, match="carries merge_synchronized_slots=True"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path))
 
 
 def test_a_checkpoint_predating_val_seq_len_resumes_at_the_default(tmp_path):

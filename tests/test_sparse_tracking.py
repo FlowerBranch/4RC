@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import io
 import json
 import sys
@@ -41,9 +42,11 @@ from arc.training import (
     compose_tracking_loss,
     ELIGIBILITY_REJECTION_STAGES,
     ELIGIBILITY_ROLLUP_RULE,
+    camera_major_layout,
     sparse_targets,
+    sparse_targets_per_time,
 )
-from arc.training.runtime import anchor_velocity_counts
+from arc.training.runtime import anchor_sample_counts, anchor_velocity_counts
 from arc.training.dumped_kubric import compute_image_transform
 
 
@@ -5740,3 +5743,230 @@ def test_uncontested_wins_report_a_zero_contested_count(tmp_path):
     assert only["contested_assigned"] == 0
     assert only["contested_depth_error_margin_m"] is None
     assert only["assigned_depth_error_m"]["median"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ------------------ merged synchronized slots: layout proof, targets, loss ---
+
+
+def test_camera_major_layout_proves_the_grid(dumped_scene):
+    """The one place slot = camera*T + t is proved rather than assumed.
+
+    Every merged reduction reshapes an (M, S) axis into (M, V, T) on this
+    helper's say-so; a permuted or transposed grid that slipped past it would
+    pool the wrong slots with no shape error anywhere downstream.
+    """
+
+    assert camera_major_layout(dumped_scene) == (2, 4)
+
+    with pytest.raises(ValueError, match="slot_time_indices"):
+        camera_major_layout(
+            dataclasses.replace(
+                dumped_scene,
+                slot_time_indices=dumped_scene.slot_time_indices.flip(0),
+            )
+        )
+    with pytest.raises(ValueError, match="slot_cameras"):
+        camera_major_layout(
+            dataclasses.replace(
+                dumped_scene,
+                slot_cameras=dumped_scene.slot_cameras.flip(0),
+            )
+        )
+    with pytest.raises(ValueError, match="slot_times"):
+        camera_major_layout(
+            dataclasses.replace(
+                dumped_scene,
+                slot_times=dumped_scene.slot_times + 1,
+            )
+        )
+    with pytest.raises(ValueError, match="camera-major grid"):
+        camera_major_layout(dataclasses.replace(dumped_scene, cameras=(0,)))
+
+
+def test_camera_major_layout_handles_non_contiguous_times(dumped_scene, tmp_path):
+    """slot_times repeats scene.times verbatim, not an arithmetic guess.
+
+    A stride-2 window's times are (0, 2, ...) while slot_time_indices stays
+    arange(T); a helper that conflated the two would refuse every strided
+    window or, worse, accept a tampered one.
+    """
+
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 2, 3),
+        size=56,
+    )
+    assert camera_major_layout(scene) == (2, 3)
+
+
+def test_sparse_targets_per_time_reduces_visibility_with_any(dumped_scene, tmp_path):
+    """Occluded in one camera of two is still visible merged; in both, not.
+
+    This is gt_vis_any's convention, and the merged loss masks on it -- a
+    reduction that took camera 0's visibility (the way it takes camera 0's
+    positions, which ARE camera-independent) would silently unsupervise every
+    sample the other camera still sees.
+    """
+
+    _write_scene(
+        tmp_path,
+        scene_name="occl",
+        invisible=((0, 2, 2),),
+    )
+    scene = load_dumped_kubric_scene(
+        tmp_path, "occl", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    positions, visible, finite, mask = sparse_targets(scene, correspondences)
+    merged = sparse_targets_per_time(scene, correspondences)
+    count = positions.shape[0]
+
+    assert torch.equal(merged[0], positions.view(count, 2, 4, 3)[:, 0])
+    assert torch.equal(merged[1], visible.view(count, 2, 4).any(dim=1))
+    assert torch.equal(merged[2], finite.view(count, 2, 4)[:, 0])
+    assert torch.equal(merged[3], merged[1] & merged[2])
+
+    row = (correspondences.trajectory_indices == 2).nonzero(as_tuple=True)[0]
+    assert row.numel() == 1
+    # Camera 0 lost track 2 at time 2, camera 1 did not: per-slot says so, and
+    # the merged column keeps the sample.
+    assert not visible[row, 0 * 4 + 2]
+    assert visible[row, 1 * 4 + 2]
+    assert merged[1][row, 2]
+
+    _write_scene(
+        tmp_path,
+        scene_name="occl2",
+        invisible=((0, 2, 2), (1, 2, 2)),
+    )
+    both = load_dumped_kubric_scene(
+        tmp_path, "occl2", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    )
+    both_correspondences, _ = build_anchor_correspondences(both)
+    both_merged = sparse_targets_per_time(both, both_correspondences)
+    both_row = (both_correspondences.trajectory_indices == 2).nonzero(as_tuple=True)[0]
+    assert not both_merged[1][both_row, 2]
+
+
+def _merged_conv_predictions(scene, seed=0):
+    """A merged head's raw dict: one field per time, through the real split."""
+
+    torch.manual_seed(seed)
+    height, width = scene.views[0]["img"].shape[-2:]
+    conv = nn.Conv2d(2, 4, kernel_size=1)
+    features = torch.randn(len(scene.times), 2, height, width)
+    track, confidence = activate_head(
+        conv(features),
+        activation="inv_log",
+        conf_activation="expp1",
+    )
+    return {
+        "track_multi": track[None, None],
+        "conf_track_multi": confidence[None, None],
+        "track_query_idx": scene.track_query_observation_slots.clone(),
+    }
+
+
+def test_the_merged_loss_scores_one_field_per_time(dumped_scene):
+    """merge_synchronized_slots flips the loss's observation-axis contract.
+
+    Both mismatches must refuse -- a T-wide grid without the flag and an
+    S-wide grid with it -- or a mis-threaded flag would gather displacements
+    against the wrong axis and train on garbage; and the sample count must be
+    the REDUCED mask's, since it is what weights multi-anchor backwards.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    merged_raw = _merged_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    result = sparse_tracking_loss(
+        merged_raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        merge_synchronized_slots=True,
+    )
+    reduced_mask = sparse_targets_per_time(dumped_scene, correspondences)[3]
+    assert result.sample_count == int(reduced_mask.sum().item())
+    assert torch.isfinite(result.loss)
+
+    with pytest.raises(ValueError, match="observation slots"):
+        sparse_tracking_loss(
+            merged_raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            anchors,
+        )
+    _, per_slot_raw = _shared_conv_predictions(dumped_scene)
+    with pytest.raises(ValueError, match="merged head owes"):
+        sparse_tracking_loss(
+            per_slot_raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            anchors,
+            merge_synchronized_slots=True,
+        )
+    # Belt and braces under the parse-time refusal: a caller that bypasses
+    # _validate_args must not silently build a sync term with no pairs.
+    with pytest.raises(ValueError, match="merge_synchronized_slots"):
+        sparse_tracking_loss(
+            merged_raw,
+            dumped_scene,
+            correspondences,
+            _identity_alignment(),
+            anchors,
+            sync_weight=0.5,
+            merge_synchronized_slots=True,
+        )
+
+
+def test_the_merged_velocity_pairing_matches_the_anchor_counts(dumped_scene):
+    """The three velocity-pairing copies must move together under the merge.
+
+    The loss (sparse_tracking_loss), the diagnostic (temporal_velocity_stats)
+    and the multi-anchor weights (anchor_velocity_counts) each derive the
+    pairing from the scene; if one kept the per-slot camera grouping while the
+    others merged, the per-anchor shares would silently stop matching the loss
+    they weight.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    merged_raw = _merged_conv_predictions(dumped_scene)
+    anchors = _anchors_for(dumped_scene, correspondences)
+
+    result = sparse_tracking_loss(
+        merged_raw,
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+        anchors,
+        velocity_weight=0.5,
+        merge_synchronized_slots=True,
+    )
+    counts = anchor_velocity_counts(
+        dumped_scene,
+        correspondences,
+        len(dumped_scene.anchor_observation_slots),
+        merge_synchronized_slots=True,
+    )
+    assert result.velocity_pair_count == counts[0] > 0
+    # One camera axis left: adjacent pairs over the distinct times, T - 1 of
+    # them, against the per-slot path's (T - 1) * V.
+    assert result.velocity_stats["pair_count"] == 3
+
+    sample_counts = anchor_sample_counts(
+        dumped_scene,
+        correspondences,
+        len(dumped_scene.anchor_observation_slots),
+        merge_synchronized_slots=True,
+    )
+    reduced_mask = sparse_targets_per_time(
+        dumped_scene, correspondences.select_query_slot(0)
+    )[3]
+    assert sample_counts == [int(reduced_mask.sum().item())]

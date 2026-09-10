@@ -467,6 +467,7 @@ def train_step(
     accum_steps: int,
     window_start: bool,
     window_end: bool,
+    merge_synchronized_slots: bool = False,
 ) -> StepOutcome:
     """One micro-step over one scene, with every guard the harness runs.
 
@@ -500,6 +501,7 @@ def train_step(
 
     from arc.training import (
         build_anchor_correspondences,
+        camera_major_layout,
         fit_scene_sim3,
         gather_query_anchor_points,
         sparse_tracking_loss,
@@ -522,6 +524,13 @@ def train_step(
     window_scale = 1.0 / accum_steps
 
     correspondences, eligibility = build_anchor_correspondences(scene)
+    # ONE layout proof per step; every V/T-dependent reduction below -- the
+    # three count helpers, the loss's target reduction, the shape check --
+    # rides on this single assert instead of re-assuming the grid.
+    views_per_time = 1
+    merged_time_count = None
+    if merge_synchronized_slots:
+        views_per_time, merged_time_count = camera_major_layout(scene)
     anchor_count = len(scene.anchor_observation_slots)
     per_anchor_correspondences = [
         correspondences.select_query_slot(anchor_index)
@@ -531,7 +540,12 @@ def train_step(
         correspondences.anchor_rows(anchor_index)
         for anchor_index in range(anchor_count)
     ]
-    sample_counts = anchor_sample_counts(scene, correspondences, anchor_count)
+    sample_counts = anchor_sample_counts(
+        scene,
+        correspondences,
+        anchor_count,
+        merge_synchronized_slots=merge_synchronized_slots,
+    )
     total_samples = sum(sample_counts)
     if total_samples == 0:
         # Fatal before any GPU work, deliberately: a scene like this was fatal
@@ -561,7 +575,10 @@ def train_step(
     # step does exactly the work it did before.
     if confidence_weight > 0:
         confidence_counts = anchor_confidence_counts(
-            scene, correspondences, anchor_count
+            scene,
+            correspondences,
+            anchor_count,
+            merge_synchronized_slots=merge_synchronized_slots,
         )
         total_confidence = sum(confidence_counts)
         confidence_shares = [
@@ -577,7 +594,12 @@ def train_step(
     # peak counter was reset above and an unconditional pass would move
     # `peak_bytes` on a position-only step.
     if velocity_weight > 0:
-        velocity_counts = anchor_velocity_counts(scene, correspondences, anchor_count)
+        velocity_counts = anchor_velocity_counts(
+            scene,
+            correspondences,
+            anchor_count,
+            merge_synchronized_slots=merge_synchronized_slots,
+        )
         total_velocity = sum(velocity_counts)
         velocity_shares = [
             count / total_velocity if total_velocity else 0.0
@@ -624,10 +646,25 @@ def train_step(
     step_alpha = confidence_alpha
     for anchor_index, anchor_weight in active_anchors:
         with autocast_context(precision):
-            raw = anchor_tracks(model, cut_feats, images, scene, anchor_index)
-            if raw["track_multi"].shape[2] != scene.num_observations:
+            raw = anchor_tracks(
+                model,
+                cut_feats,
+                images,
+                scene,
+                anchor_index,
+                views_per_time=views_per_time,
+            )
+            expected_observation_axis = (
+                merged_time_count if merge_synchronized_slots else scene.num_observations
+            )
+            if raw["track_multi"].shape[2] != expected_observation_axis:
                 raise RuntimeError(
                     "Output observation axis does not match the scene's inputs"
+                    + (
+                        " (merged: one slot per time index expected)"
+                        if merge_synchronized_slots
+                        else ""
+                    )
                 )
             if stats is None:
                 # The step's first anchor, not necessarily anchor 0:
@@ -653,6 +690,7 @@ def train_step(
                 sync_weight=sync_weight,
                 velocity_weight=velocity_weight,
                 collect_diagnostics=False,
+                merge_synchronized_slots=merge_synchronized_slots,
             )
             # Whatever the first active anchor resolved, every later one reuses.
             # Guarded rather than assigned: an anchor whose confidence mask came
@@ -777,6 +815,7 @@ def evaluate_held_out(
     query_anchors,
     confidence_alpha: float | None,
     emit_predictions: bool = True,
+    merge_synchronized_slots: bool = False,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
@@ -865,8 +904,14 @@ def evaluate_held_out(
                 )
                 del scene
                 continue
+            # Conditional so the flag-off call stays verbatim: injected models
+            # in the CPU tests bind today's (views, force_no_output_conversion)
+            # surface.
+            forward_kwargs = (
+                {"merge_synchronized_slots": True} if merge_synchronized_slots else {}
+            )
             with torch.no_grad(), autocast_context(precision):
-                raw = model(scene.views, force_no_output_conversion=True)
+                raw = model(scene.views, force_no_output_conversion=True, **forward_kwargs)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
                 anchors = gather_query_anchor_points(raw, scene, correspondences)
                 result = sparse_tracking_loss(
@@ -876,6 +921,7 @@ def evaluate_held_out(
                     alignment,
                     anchors,
                     huber_delta_m=huber_delta_m,
+                    merge_synchronized_slots=merge_synchronized_slots,
                 )
                 entry = {
                     "scene": plan.seq_name,
@@ -896,7 +942,14 @@ def evaluate_held_out(
                 # synchronization to break, and reported as None rather than 0.
                 shuffled = shuffled_index_views(scene)
                 if shuffled is not None:
-                    shuffled_raw = model(shuffled, force_no_output_conversion=True)
+                    # The merged grouping is positional (slot = camera*T + t),
+                    # so the reversal below permutes only the time CONDITIONING
+                    # within each camera -- the pooled key sets stay physically
+                    # correct and the derivation accepts a per-camera
+                    # permutation by design.
+                    shuffled_raw = model(
+                        shuffled, force_no_output_conversion=True, **forward_kwargs
+                    )
                     shuffled_result = sparse_tracking_loss(
                         tracking_only(shuffled_raw),
                         scene,
@@ -904,6 +957,7 @@ def evaluate_held_out(
                         alignment,
                         anchors,
                         huber_delta_m=huber_delta_m,
+                        merge_synchronized_slots=merge_synchronized_slots,
                     )
                     entry["position_loss_shuffled"] = float(shuffled_result.loss.item())
                     # The sharpest read there is on whether the velocity term
@@ -932,6 +986,7 @@ def evaluate_held_out(
                         alignment,
                         anchors,
                         confidence_alpha,
+                        merge_synchronized_slots=merge_synchronized_slots,
                     )
                     # None, not 0.0, on a run with no operating point: the bundle
                     # carries no `occ` to take a fraction of, and a zero here would
@@ -1020,7 +1075,9 @@ def evaluate_held_out(
 
 
 def _prediction_arrays(
-    raw, scene, correspondences, alignment, anchors, confidence_alpha
+    raw, scene, correspondences, alignment, anchors, confidence_alpha,
+    *,
+    merge_synchronized_slots: bool = False,
 ):
     """Assemble one scene's bundle in the scorers' schema.
 
@@ -1029,6 +1086,12 @@ def _prediction_arrays(
     timesteps with the cameras already fused, and their ``gt_vis_any`` is
     visibility reduced with ``any`` over cameras. So each covered timestep's
     cameras are combined before writing.
+
+    Under ``merge_synchronized_slots`` there is nothing left to combine: the
+    merged head already emits one field per time -- the model is trained on
+    the exact quantity the scorers read -- so this function transposes rather
+    than fuses, and ``conf`` is the model's own per-time channel with no
+    max-over-cameras step.
 
     **Positions** fuse by a **confidence-weighted mean**, mirroring `score_joint.py`
     verbatim (``clip(conf, 1e-6)`` then a weighted average) rather than inventing
@@ -1049,10 +1112,19 @@ def _prediction_arrays(
     truth.
     """
 
-    from arc.training import gather_at_correspondences, sparse_targets
+    from arc.training import (
+        gather_at_correspondences,
+        sparse_targets,
+        sparse_targets_per_time,
+    )
     from arc.training.predictions import build_prediction_arrays
 
-    positions, visible, _finite, _mask = sparse_targets(scene, correspondences)
+    if merge_synchronized_slots:
+        positions, visible, _finite, _mask = sparse_targets_per_time(
+            scene, correspondences
+        )
+    else:
+        positions, visible, _finite, _mask = sparse_targets(scene, correspondences)
     metric = float(scene.track_upscaling_factor)
     # From the predictions, matching `sparse_tracking_loss` (`device =
     # tracks.device`). Taking it from `positions` inverts that: targets follow the
@@ -1086,30 +1158,47 @@ def _prediction_arrays(
     gathered = gather_at_correspondences(
         raw["conf_track_multi"], correspondences.to(device)
     )
-    # Clamped for the position weights only. What gets STORED is the raw channel.
-    weights = gathered.clamp_min(1e-6)
 
     slot_times = scene.slot_times.to(device)
     covered = sorted({int(value) for value in slot_times.tolist()})
-    fused, fused_gt, fused_visible, fused_conf = [], [], [], []
-    for original_time in covered:
-        slots = (slot_times == original_time).nonzero(as_tuple=True)[0]
-        weight = weights[:, slots]
-        fused.append(
-            (predicted[:, slots] * weight[..., None]).sum(dim=1)
-            / weight.sum(dim=1)[..., None]
-        )
-        # The target does not depend on which camera saw it, so any slot of this
-        # instant carries it; taking the first is exact, not an approximation.
-        fused_gt.append(target[:, slots[0]])
-        fused_visible.append(visible[:, slots].any(dim=1))
-        # Max, matching the `any` on the line above -- see the docstring.
-        fused_conf.append(gathered[:, slots].amax(dim=1))
+    if merge_synchronized_slots:
+        # One model row per semantic time already; covered (sorted original
+        # times) equals semantic order because scene.times is strictly
+        # increasing, and camera_major_layout proved the grid inside
+        # sparse_targets_per_time above.
+        if len(covered) != predicted.shape[1]:
+            raise RuntimeError(
+                f"{len(covered)} covered times for {predicted.shape[1]} merged rows"
+            )
+        predicted_tn = predicted.transpose(0, 1)
+        target_tn = target.transpose(0, 1)
+        visible_tn = visible.transpose(0, 1)
+        # The model's own per-time channel, raw and unclamped -- the 1e-6 clamp
+        # below exists only to weight the per-slot position fusion, which this
+        # path does not perform.
+        confidence_tn = gathered.transpose(0, 1)
+    else:
+        # Clamped for the position weights only. What gets STORED is the raw channel.
+        weights = gathered.clamp_min(1e-6)
+        fused, fused_gt, fused_visible, fused_conf = [], [], [], []
+        for original_time in covered:
+            slots = (slot_times == original_time).nonzero(as_tuple=True)[0]
+            weight = weights[:, slots]
+            fused.append(
+                (predicted[:, slots] * weight[..., None]).sum(dim=1)
+                / weight.sum(dim=1)[..., None]
+            )
+            # The target does not depend on which camera saw it, so any slot of this
+            # instant carries it; taking the first is exact, not an approximation.
+            fused_gt.append(target[:, slots[0]])
+            fused_visible.append(visible[:, slots].any(dim=1))
+            # Max, matching the `any` on the line above -- see the docstring.
+            fused_conf.append(gathered[:, slots].amax(dim=1))
 
-    predicted_tn = torch.stack(fused, dim=0)
-    target_tn = torch.stack(fused_gt, dim=0)
-    visible_tn = torch.stack(fused_visible, dim=0)
-    confidence_tn = torch.stack(fused_conf, dim=0)
+        predicted_tn = torch.stack(fused, dim=0)
+        target_tn = torch.stack(fused_gt, dim=0)
+        visible_tn = torch.stack(fused_visible, dim=0)
+        confidence_tn = torch.stack(fused_conf, dim=0)
 
     # Column 0 is the index into the covered timesteps, never the original frame.
     position_of_time = {value: index for index, value in enumerate(covered)}
@@ -1472,6 +1561,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument(
+        "--merge_synchronized_slots",
+        action="store_true",
+        help=(
+            "Pool the track head's cross-attention keys by time index: for "
+            "each of the window's T times, the anchor's query row attends over "
+            "ALL cameras' patch tokens of that instant (each camera's block "
+            "prefixed by that slot's encoder camera token -- an existing "
+            "per-slot activation, so no new parameter and the released "
+            "checkpoint loads unchanged) and the head emits ONE displacement "
+            "field per time instead of one per observation slot. Cross-view "
+            "correspondence then happens in attention rather than being "
+            "penalised after the fact, which is why --sync_weight is refused "
+            "alongside it: the merged head leaves no synchronized slot pair "
+            "for that term to compare. Targets reduce to per-time (visibility "
+            "by any-camera), the velocity term pairs adjacent times directly, "
+            "and eval bundles are written per time with no camera fusion "
+            "step -- the model is trained on the quantity it is scored on. "
+            "Off, the default, is exactly today's behaviour."
+        ),
+    )
+    training.add_argument(
         "--velocity_weight",
         type=float,
         default=0.0,
@@ -1785,6 +1895,27 @@ def _validate_args(args: argparse.Namespace) -> None:
             "term compares slots that share a time index, and a single-camera "
             "window has no such pair for it to reduce over"
         )
+    # The merged head leaves the sync term nothing to compare -- and rather
+    # than a silent no-op, synchronized_differences would raise deep inside
+    # the first step, after a full model load. Refused here instead, by name.
+    if args.sync_weight > 0 and args.merge_synchronized_slots:
+        raise ValueError(
+            "--sync_weight cannot be combined with --merge_synchronized_slots: "
+            "the merged head emits one displacement field per time index, so "
+            "there are no synchronized slot pairs for the consistency term to "
+            "compare; drop one of the two flags"
+        )
+    # A single-camera window would take the per-slot branch (one slot per time
+    # IS the per-slot layout), flipping head geometry per step inside a stream
+    # whose checkpoint records the merged one -- exactly what the refused
+    # resume tier exists to prevent.
+    if args.merge_synchronized_slots and args.min_views < 2:
+        raise ValueError(
+            "--merge_synchronized_slots needs --min_views >= 2: a "
+            "single-camera window has one slot per time index, so the merged "
+            "head falls back to the per-slot branch and the run records a "
+            "head geometry it did not train under"
+        )
     # Refused HERE, at parse time, and not where the plans are built: that call
     # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
     # burn a full model load on a cluster node before reporting a missing flag --
@@ -1962,6 +2093,11 @@ def _plan_summary(tally, args) -> dict:
             "confidence_weight": float(args.confidence_weight),
             "sync_weight": float(args.sync_weight),
             "velocity_weight": float(args.velocity_weight),
+            # Which head geometry the run trains -- per-slot fields penalised
+            # into agreement, or one merged field per time. Not enforced by any
+            # test the way the weights are; recorded because the two curves are
+            # not comparable and the summary must say which one this is.
+            "merge_synchronized_slots": bool(args.merge_synchronized_slots),
             "confidence_alpha": args.confidence_alpha,
             # What alpha the run actually trained under, as opposed to what was
             # asked for: None under 'auto' until a step resolves it, which is why
@@ -2376,6 +2512,7 @@ def run_training(
                 accum_steps=accum,
                 window_start=(window_executed == 0),
                 window_end=window_end,
+                merge_synchronized_slots=args.merge_synchronized_slots,
             )
             window_executed += 1
             # Pin what the first executed step resolved, so every later step
@@ -2494,6 +2631,7 @@ def run_training(
                 # on an 'auto' run's eval before the first executed step -- both
                 # write `conf` with no `occ`.
                 confidence_alpha=args.resolved_confidence_alpha,
+                merge_synchronized_slots=args.merge_synchronized_slots,
             )
             evaluations.append(metrics)
             print(
@@ -2631,6 +2769,11 @@ def _checkpoint_settings(args) -> dict:
         "confidence_weight": float(args.confidence_weight),
         "sync_weight": float(args.sync_weight),
         "velocity_weight": float(args.velocity_weight),
+        # Which head geometry the run trains: per-slot fields penalised into
+        # agreement, or one merged field per time index. Refused like
+        # grad_accum -- changing it mid-run continues the step counter over a
+        # different function class entirely.
+        "merge_synchronized_slots": bool(args.merge_synchronized_slots),
         "confidence_alpha": args.confidence_alpha,
         # Derived state rather than a flag, and so deliberately in NEITHER resume
         # tier: check_resume_settings iterates the two tuples only, so this rides
@@ -2696,7 +2839,9 @@ def _write_checkpoint(
 # confidence_alpha -- a segment that changes a loss weight and keeps counting
 # steps reports one curve over two objectives, and the reported `loss` stays
 # the position-only Huber throughout, so nothing in the history would show
-# the switch), or the numerics
+# the switch), which head geometry it trains (merge_synchronized_slots: per-slot
+# fields penalised into agreement, or one merged field per time -- a different
+# function class, not a different weight on the same one), or the numerics
 # under the restored scaler state (precision): a changed value means the
 # "resumed" run trains a different stream while its step counter continues.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
@@ -2746,6 +2891,7 @@ _RESUME_SETTINGS_REFUSED = (
     "confidence_weight",
     "sync_weight",
     "velocity_weight",
+    "merge_synchronized_slots",
     "confidence_alpha",
     "precision",
     "grad_accum",
@@ -2794,6 +2940,11 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # every step was its own window. So absence resolves, pre-flag runs resume
     # silently at 1, and resuming one at N>1 is refused like any changed value.
     "grad_accum": 1,
+    # A checkpoint from before --merge_synchronized_slots could only have been
+    # written on the per-slot path: no other head geometry was reachable. So
+    # absence resolves, pre-flag runs resume silently on the per-slot path, and
+    # resuming one with the merge on is refused like any changed value.
+    "merge_synchronized_slots": False,
     # A checkpoint from before --val_seq_len could only have been written by a
     # run whose held-out window already fit the 24-frame clip: run_training
     # loads every held-out scene in its preflight, before step 0 and before the

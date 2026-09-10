@@ -28,7 +28,11 @@ from contextlib import nullcontext
 import torch
 
 from arc.training.losses import adjacent_pair_indices, compose_tracking_loss
-from arc.training.sparse_tracking import sparse_targets
+from arc.training.sparse_tracking import (
+    camera_major_layout,
+    sparse_targets,
+    sparse_targets_per_time,
+)
 
 
 # Per freeze mode: (trainable tensor count, trainable parameters excluding the
@@ -350,11 +354,21 @@ def encode_and_reconstruct(model, views):
     return images, feats, model.reconstruct(feats, images)
 
 
-def anchor_tracks(model, feats, images, scene, anchor_index):
-    """One anchor's dense field, shaped as the Q=1 raw dict the loss expects."""
+def anchor_tracks(model, feats, images, scene, anchor_index, *, views_per_time: int = 1):
+    """One anchor's dense field, shaped as the Q=1 raw dict the loss expects.
+
+    At ``views_per_time > 1`` the dict's observation axis is one field per
+    time index (the merged head); ``track_query_idx`` stays the S-grid slot
+    index either way -- it names the anchor, not a row of the output.
+    """
 
     slot = scene.anchor_observation_slots[anchor_index]
-    track, track_conf = model.track_for_query(feats, images, slot)
+    if views_per_time == 1:
+        track, track_conf = model.track_for_query(feats, images, slot)
+    else:
+        track, track_conf = model.track_for_query(
+            feats, images, slot, views_per_time=views_per_time
+        )
     return {
         "track_multi": track[:, None],
         "conf_track_multi": track_conf[:, None],
@@ -362,22 +376,31 @@ def anchor_tracks(model, feats, images, scene, anchor_index):
     }
 
 
-def anchor_sample_counts(scene, correspondences, anchor_count: int) -> list[int]:
+def anchor_sample_counts(
+    scene,
+    correspondences,
+    anchor_count: int,
+    *,
+    merge_synchronized_slots: bool = False,
+) -> list[int]:
     """Supervised sample count per anchor, from the scene alone.
 
     These are the weights that make per-anchor backward equal one combined
-    ``reduction="mean"``.  They come from ``sparse_targets``, the same masking
-    the loss itself applies, so the two cannot drift apart; and because nothing
-    in that mask reads a prediction, they are fixed for the whole run.
+    ``reduction="mean"``.  They come from ``sparse_targets`` -- reduced to one
+    column per time under ``merge_synchronized_slots``, exactly as the loss
+    reduces them -- the same masking the loss itself applies, so the two cannot
+    drift apart; and because nothing in that mask reads a prediction, they are
+    fixed for the whole run.
     """
 
+    targets = sparse_targets_per_time if merge_synchronized_slots else sparse_targets
     counts = []
     for anchor_index in range(anchor_count):
         anchor = correspondences.select_query_slot(anchor_index)
         if anchor.count == 0:
             counts.append(0)
             continue
-        _, _, _, mask = sparse_targets(scene, anchor)
+        _, _, _, mask = targets(scene, anchor)
         counts.append(int(mask.sum().item()))
     return counts
 
@@ -386,6 +409,8 @@ def anchor_confidence_counts(
     scene,
     correspondences,
     anchor_count: int,
+    *,
+    merge_synchronized_slots: bool = False,
 ) -> list[int]:
     """Confidence-term sample count per anchor.
 
@@ -401,18 +426,25 @@ def anchor_confidence_counts(
     the drop is counted by cause in ``confidence_dropped`` and warned about.
     """
 
+    targets = sparse_targets_per_time if merge_synchronized_slots else sparse_targets
     counts = []
     for anchor_index in range(anchor_count):
         anchor = correspondences.select_query_slot(anchor_index)
         if anchor.count == 0:
             counts.append(0)
             continue
-        _, _, finite, _ = sparse_targets(scene, anchor)
+        _, _, finite, _ = targets(scene, anchor)
         counts.append(int(finite.sum().item()))
     return counts
 
 
-def anchor_velocity_counts(scene, correspondences, anchor_count: int) -> list[int]:
+def anchor_velocity_counts(
+    scene,
+    correspondences,
+    anchor_count: int,
+    *,
+    merge_synchronized_slots: bool = False,
+) -> list[int]:
     """Velocity-term sample count per anchor.
 
     The velocity term reduces over **pairs** of slots, not slots, so its
@@ -433,17 +465,30 @@ def anchor_velocity_counts(scene, correspondences, anchor_count: int) -> list[in
     is the drift these helpers exist to prevent.
     """
 
-    first, second, _ = adjacent_pair_indices(
-        scene.slot_time_indices.reshape(-1),
-        scene.slot_cameras.reshape(-1),
-    )
+    if merge_synchronized_slots:
+        # The merged pairing rule, re-derived from the scene like the per-slot
+        # one: distinct times (camera 0's proven arange(T) row), no camera
+        # grouping. Must stay in lockstep with sparse_tracking_loss's own
+        # pairing bind, or the shares stop matching the loss they weight.
+        layout = camera_major_layout(scene)
+        first, second, _ = adjacent_pair_indices(
+            scene.slot_time_indices.view(*layout)[0],
+            None,
+        )
+        targets = sparse_targets_per_time
+    else:
+        first, second, _ = adjacent_pair_indices(
+            scene.slot_time_indices.reshape(-1),
+            scene.slot_cameras.reshape(-1),
+        )
+        targets = sparse_targets
     counts = []
     for anchor_index in range(anchor_count):
         anchor = correspondences.select_query_slot(anchor_index)
         if anchor.count == 0:
             counts.append(0)
             continue
-        _, _, _, mask = sparse_targets(scene, anchor)
+        _, _, _, mask = targets(scene, anchor)
         counts.append(int((mask[:, first] & mask[:, second]).sum().item()))
     return counts
 

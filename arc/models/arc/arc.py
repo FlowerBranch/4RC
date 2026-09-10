@@ -190,7 +190,54 @@ class Arc(
         if not track_query_idx:
             track_query_idx = [0]
         return track_query_idx
-    
+
+    def _synchronized_views_per_time(self, time_indices, num_views: int) -> int:
+        """How many cameras observe each time index, from this forward's inputs.
+
+        Accepts a batch whose every row has each distinct time index exactly
+        ``views_per_time`` times AND, reshaped camera-major to (V, T), every
+        camera row a permutation of the distinct set.  Uniform multiplicity
+        alone would accept a time-major layout like [0,0,1,1,2,2,3,3] and the
+        decoder's positional pooling (slot = camera*T + t) would silently merge
+        the wrong slots.  Deliberately NOT row identity: the shuffled-index
+        eval arm (runtime.shuffled_index_views) reverses every non-primary
+        camera's indices, which permutes values within a camera while the
+        positional pooling stays physically correct -- that arm must keep
+        working.
+        """
+
+        if time_indices is None:
+            raise ValueError(
+                "merge_synchronized_slots needs a per-view 'time_index' on "
+                "every view to group the observation slots by time"
+            )
+        views_per_time = None
+        for row in time_indices:
+            _, counts = torch.unique(row, return_counts=True)
+            if int(counts.min()) != int(counts.max()):
+                raise ValueError(
+                    "merge_synchronized_slots needs every time index observed "
+                    f"by the same number of cameras, got counts {counts.tolist()} "
+                    f"for time indices {row.tolist()}"
+                )
+            row_multiplicity = int(counts[0])
+            if views_per_time is None:
+                views_per_time = row_multiplicity
+            elif views_per_time != row_multiplicity:
+                raise ValueError(
+                    "merge_synchronized_slots needs one views-per-time count "
+                    f"across the batch, got {views_per_time} and {row_multiplicity}"
+                )
+            per_camera = row.view(views_per_time, num_views // views_per_time)
+            for camera_row in per_camera:
+                if torch.unique(camera_row).numel() != camera_row.numel():
+                    raise ValueError(
+                        "merge_synchronized_slots needs each camera-major slot "
+                        "group to cover every time index once (positional "
+                        f"pooling would merge the wrong slots), got {row.tolist()}"
+                    )
+        return views_per_time
+
     def _postprocess_output(self, preds, use_ray_pose=False):
         H, W = preds['depth'].shape[2:4]
 
@@ -528,8 +575,17 @@ class Arc(
         profiling=False,
         force_no_output_conversion=False,
         inference_track = True,
+        merge_synchronized_slots: bool = False,
         **kwargs
     ):
+        if merge_synchronized_slots and not force_no_output_conversion:
+            raise ValueError(
+                "merge_synchronized_slots=True requires "
+                "force_no_output_conversion=True: _postprocess_output unbinds "
+                "track_multi over the observation axis against per-view world "
+                "points, and the merged head emits one row per time index, not "
+                "per observation slot"
+            )
         if profiling:
             profiling_info = {} if profiling else None
             start_time = time.time()
@@ -541,6 +597,7 @@ class Arc(
             track_query_idx,
             inference_track=inference_track,
             time_indices=time_indices,
+            merge_synchronized_slots=merge_synchronized_slots,
             **kwargs,
         )
         
@@ -560,6 +617,7 @@ class Arc(
         ref_view_strategy: str = "first",
         inference_track: bool = True,
         time_indices=None,
+        merge_synchronized_slots: bool = False,
     ) -> Dict[str, torch.Tensor]:
         feats = self.encode_features(
             x,
@@ -573,10 +631,17 @@ class Arc(
         output = self.reconstruct(feats, x)
 
         if inference_track:
+            views_per_time = 1
+            if merge_synchronized_slots:
+                views_per_time = self._synchronized_views_per_time(
+                    time_indices, x.shape[1]
+                )
             track_list = []
             conf_list = []
             for query_idx in track_query_idx_list:
-                track, track_conf = self.track_for_query(feats, x, query_idx)
+                track, track_conf = self.track_for_query(
+                    feats, x, query_idx, views_per_time=views_per_time
+                )
                 track_list.append(track)
                 conf_list.append(track_conf)
 
@@ -635,13 +700,17 @@ class Arc(
             output["pose_enc_list"] = [pose_enc]
         return output
 
-    def track_for_query(self, feats, x: torch.Tensor, query_idx: int):
+    def track_for_query(self, feats, x: torch.Tensor, query_idx: int, *, views_per_time: int = 1):
         """One query frame's dense displacement field and its confidence.
 
         This is the body of the Q loop.  Its activations are the bulk of a
         training step's memory, and they are freed once this query's loss has
         been backwarded -- which is why a caller supervising several anchors
         drives this per query rather than asking for a stacked Q axis.
+
+        ``views_per_time > 1`` pools the motion decoder's keys by time index
+        (one output field per time instead of one per observation slot); 1,
+        the default, is exactly the per-slot path.
         """
 
         frames_chunk_size = 1 if self.training else 8
@@ -651,13 +720,25 @@ class Arc(
                 [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
                 dim=2,
             )[..., 1536:] # [cam, time, patch] in global feauture as required by MotionDecoder
-            track_tokens = self.motion_decoder(
-                feature, images=x, patch_start_idx=2, track_query_idx=query_idx
-            )
+            if views_per_time == 1:
+                track_tokens = self.motion_decoder(
+                    feature, images=x, patch_start_idx=2, track_query_idx=query_idx
+                )
+            else:
+                track_tokens = self.motion_decoder(
+                    feature, images=x, patch_start_idx=2, track_query_idx=query_idx,
+                    views_per_time=views_per_time,
+                )
             aggregated_track_tokens_list.append(track_tokens)
+        # Shape-only slice: DPTHead reads `images` for B, S, H, W and its
+        # frames-chunk slicing alone, never the pixels. The merged decoder
+        # emits one row per time, so the head must see a matching T-long
+        # observation axis; x[:, :T] is the cheapest tensor with that shape --
+        # WHICH frames it holds is irrelevant.
+        head_images = x if views_per_time == 1 else x[:, : x.shape[1] // views_per_time]
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             track, track_conf = self.track_head(
-                aggregated_track_tokens_list, images=x, patch_start_idx=1, frames_chunk_size=frames_chunk_size
+                aggregated_track_tokens_list, images=head_images, patch_start_idx=1, frames_chunk_size=frames_chunk_size
             )
         return track, track_conf
 
