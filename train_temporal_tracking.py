@@ -216,8 +216,9 @@ def compact_eligibility(eligibility: dict) -> dict:
     """The subset of an eligibility report worth carrying per step and per scene.
 
     Exactly what :attr:`StepOutcome.eligibility` documents. Shared between the
-    step's record and the eval's skip record so the two cannot drift into
-    reporting two different things under the name "the eligibility split".
+    step's record and both skip records -- the eval's ``skipped_scenes`` and the
+    loop's ``unsupervisable_steps`` -- so they cannot drift into reporting
+    different things under the name "the eligibility split".
     """
 
     return {
@@ -243,6 +244,25 @@ def scene_skip_cause(error: Exception) -> str:
     if "nothing to supervise" in text:
         return "no_recorded_tracks_present"
     return "other"
+
+
+class UnsupervisableSceneError(RuntimeError):
+    """A scene that LOADED but that no seated anchor can supervise in its window.
+
+    Raised by ``train_step`` before any GPU work and absorbed by
+    ``run_training``'s skip policy under its own bound,
+    ``--max_unsupervisable_fraction``. Deliberately not a SceneProviderError:
+    that one means the scene did not load (a data-root fault, tallied by cause,
+    bounded by a consecutive rule). This one is an anchor spec reaching nothing
+    -- a different tally, a different remedy, a fraction bound only. And no
+    longer a bare RuntimeError: the plan is deterministic, so a resume landed on
+    the same step and died again, and one such step cost the whole run.
+    """
+
+    def __init__(self, message: str, *, scene: str, eligibility: dict):
+        super().__init__(message)
+        self.scene = scene
+        self.eligibility = eligibility
 
 
 def check_scene_skip_rate(
@@ -287,6 +307,40 @@ def check_scene_skip_rate(
         f"({fraction:.1%} > --max_scene_skip_fraction {max_fraction:.1%}); "
         f"causes: {causes}. This is a broken data root or an over-restricted "
         "pool, not a few bad scenes"
+    )
+
+
+def check_unsupervisable_rate(
+    skipped: int,
+    *,
+    attempted: int,
+    max_fraction: float,
+    min_attempts: int = 50,
+) -> None:
+    """Abort when too many attempted steps loaded a scene nothing could supervise.
+
+    The training-time twin of the plan-time ``--max_unreplayable_fraction`` and
+    of :func:`check_scene_skip_rate`'s fraction rule, with the same floor: below
+    ``min_attempts`` the ratio is noise, and without the floor the first such
+    step among the first 49 would abort at 1/1 -- today's fatality back again.
+    Over steps ATTEMPTED in this invocation, not planned, so a resumed segment
+    reads its own rate. No consecutive rule: that rule is what a broken data
+    root looks like, and a broken root cannot produce this error, because every
+    scene counted here loaded.
+    """
+
+    if attempted < min_attempts or not skipped:
+        return
+    fraction = skipped / attempted
+    if fraction <= max_fraction:
+        return
+    raise RuntimeError(
+        f"{skipped} of {attempted} steps loaded a scene no anchor could supervise "
+        f"({fraction:.1%} > --max_unsupervisable_fraction {max_fraction:.1%}). "
+        "This is an anchor spec that does not fit the stream, not a few bad "
+        "scenes: anchoring at another time reaches queries that do not start at "
+        "the window's first frame; anchoring in another camera reaches queries "
+        "occluded in the first"
     )
 
 
@@ -548,17 +602,24 @@ def train_step(
     )
     total_samples = sum(sample_counts)
     if total_samples == 0:
-        # Fatal before any GPU work, deliberately: a scene like this was fatal
-        # before multi-anchor too, just later (inside the loss) and without the
-        # split that says why. Not a SceneProviderError, so the loop's skip
-        # policy cannot absorb it as one bad scene.
-        raise RuntimeError(
+        # Raised before any GPU work, and typed so run_training skips and
+        # counts it under its own bound (--max_unsupervisable_fraction) rather
+        # than dying on it: the plan is deterministic, so a fatal raise here
+        # used to kill every resume at the same step. Still not a
+        # SceneProviderError -- this scene loaded, so it must feed neither the
+        # load tally nor the consecutive-load rule. Nothing above this line
+        # needs undoing on the skip: the mode switches and the window-start
+        # zero_grad/peak reset are exactly what the next executed micro-step
+        # repeats, since a skipped step does not advance window_executed.
+        raise UnsupervisableSceneError(
             "No anchor contributes a supervised sample, so there is nothing to "
             "train on. The eligibility split says why: of "
             f"{eligibility['total_query_count']} queries, rejected="
             f"{eligibility['rejected']}. Anchoring at another time reaches "
             "queries that do not start at the window's first frame; anchoring "
-            "in another camera reaches queries occluded in the first."
+            "in another camera reaches queries occluded in the first.",
+            scene=plan.seq_name,
+            eligibility=compact_eligibility(eligibility),
         )
     anchor_weights = [count / total_samples for count in sample_counts]
     # The anchors this step runs, with their shares. A seated anchor with no
@@ -653,6 +714,7 @@ def train_step(
                 scene,
                 anchor_index,
                 views_per_time=views_per_time,
+                merge=merge_synchronized_slots,
             )
             expected_observation_axis = (
                 merged_time_count if merge_synchronized_slots else scene.num_observations
@@ -851,10 +913,13 @@ def evaluate_held_out(
     that forgot it would silently produce that unthresholded form.
 
     A held-out scene whose anchor set reaches nothing is **skipped and recorded**,
-    never fatal -- the opposite disposition to ``train_step``'s, deliberately. One
-    unsupervisable held-out scene must not end a 4-5 segment run, and the skip is
-    reported in ``skipped_scenes`` with the split that says why, so a later reader
-    can tell a scene that was skipped from one that scored zero.
+    never fatal. ``train_step`` skips and records the same condition, but under a
+    rate bound (``--max_unsupervisable_fraction``); the eval needs none, because
+    the held-out set is fixed and the preflight already refuses one that is
+    wholly unsupervisable. One unsupervisable held-out scene must not end a 4-5
+    segment run, and the skip is reported in ``skipped_scenes`` with the split
+    that says why, so a later reader can tell a scene that was skipped from one
+    that scored zero.
     """
 
     from arc.training import (
@@ -1687,6 +1752,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument(
+        "--max_unsupervisable_fraction",
+        type=float,
+        default=0.02,
+        help=(
+            "Abort if more than this share of attempted steps load a scene no "
+            "seated anchor can supervise (default: %(default)s). One such scene "
+            "is degenerate; a stream of them is an anchor spec that does not fit "
+            "the data, and the run would otherwise advance for days recording no "
+            "gradient"
+        ),
+    )
+    training.add_argument(
         "--max_consecutive_scene_skips",
         type=int,
         default=10,
@@ -1846,6 +1923,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min_views must be at least 1")
     if not 0 <= args.max_unreplayable_fraction <= 1:
         raise ValueError("--max_unreplayable_fraction must be in [0, 1]")
+    if not 0 <= args.max_unsupervisable_fraction <= 1:
+        raise ValueError("--max_unsupervisable_fraction must be in [0, 1]")
     if args.max_records is not None and args.max_records < 1:
         raise ValueError("--max_records must be positive")
     if args.observation_budget < args.min_views:
@@ -1904,17 +1983,6 @@ def _validate_args(args: argparse.Namespace) -> None:
             "the merged head emits one displacement field per time index, so "
             "there are no synchronized slot pairs for the consistency term to "
             "compare; drop one of the two flags"
-        )
-    # A single-camera window would take the per-slot branch (one slot per time
-    # IS the per-slot layout), flipping head geometry per step inside a stream
-    # whose checkpoint records the merged one -- exactly what the refused
-    # resume tier exists to prevent.
-    if args.merge_synchronized_slots and args.min_views < 2:
-        raise ValueError(
-            "--merge_synchronized_slots needs --min_views >= 2: a "
-            "single-camera window has one slot per time index, so the merged "
-            "head falls back to the per-slot branch and the run records a "
-            "head geometry it did not train under"
         )
     # Refused HERE, at parse time, and not where the plans are built: that call
     # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
@@ -2386,7 +2454,9 @@ def run_training(
     # whether an anchor set saturates eligibility on the real stream is read
     # off run_summary.json instead of extrapolated from the one-scene overfit.
     # steps_counted is the denominator; injected step functions that report no
-    # eligibility (and skipped scene loads) contribute nothing.
+    # eligibility contribute nothing, and neither does a skipped step -- a lost
+    # scene, or one no anchor could supervise, whose split is recorded in
+    # unsupervisable_steps instead of folded in here.
     eligibility_totals = {
         "steps_counted": 0,
         "total_query_count": 0,
@@ -2419,6 +2489,14 @@ def run_training(
     last_saved_step = None
     scene_load_skips: Counter = Counter()
     consecutive_skips = 0
+    # Steps whose scene loaded but no seated anchor could supervise, one record
+    # each with the split that says why. Kept apart from scene_load_skips: the
+    # remedy for those is the data root, for these the anchor spec.
+    unsupervisable_steps: list[dict] = []
+    # Steps tried in THIS invocation, the denominator both skip guards and the
+    # end-of-run print share. Bound before the loop so a run that starts at
+    # its horizon still reports 0.
+    attempted = 0
     # The window arithmetic, bound once. Every CLI count stays in micro-steps;
     # the optimizer's horizon is derived by ceil so a partial final window
     # counts as the one step it takes. At accum=1 both ceils are the identity.
@@ -2458,6 +2536,7 @@ def run_training(
         learning_rates = apply_learning_rate(optimizer, base_learning_rates, scale)
 
         plan = plans[step % len(plans)]
+        attempted = step - start_step + 1
         # Drop this loop's own reference before the cache loads the next scene, or
         # the old one stays alive across the load and two are resident at the peak.
         scene = None
@@ -2473,7 +2552,7 @@ def run_training(
             print(f"step={step} scene={plan.seq_name} skipped: {error}")
             check_scene_skip_rate(
                 scene_load_skips,
-                attempted=step - start_step + 1,
+                attempted=attempted,
                 consecutive=consecutive_skips,
                 max_fraction=args.max_scene_skip_fraction,
                 max_consecutive=args.max_consecutive_scene_skips,
@@ -2492,28 +2571,54 @@ def run_training(
         # the one curve this trainer exists to produce, with nothing in the
         # output saying why. The eval scores the model against held-out scenes
         # and does not depend on this step's scene at all.
+        outcome = None
         if scene is not None:
+            # The scene LOADED, whatever happens next: the consecutive-load
+            # streak ends here even if the step below turns out unsupervisable.
             consecutive_skips = 0
-            outcome = step_fn(
-                model=model,
-                scene=scene,
-                plan=plan,
-                optimizer=optimizer,
-                scaler=scaler,
-                precision=args.precision,
-                huber_delta_m=args.huber_delta_m,
-                grad_clip=args.grad_clip,
-                confidence_weight=args.confidence_weight,
-                confidence_alpha=args.resolved_confidence_alpha,
-                sync_weight=args.sync_weight,
-                velocity_weight=args.velocity_weight,
-                learning_rates=learning_rates,
-                step=step,
-                accum_steps=accum,
-                window_start=(window_executed == 0),
-                window_end=window_end,
-                merge_synchronized_slots=args.merge_synchronized_slots,
-            )
+            try:
+                outcome = step_fn(
+                    model=model,
+                    scene=scene,
+                    plan=plan,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    precision=args.precision,
+                    huber_delta_m=args.huber_delta_m,
+                    grad_clip=args.grad_clip,
+                    confidence_weight=args.confidence_weight,
+                    confidence_alpha=args.resolved_confidence_alpha,
+                    sync_weight=args.sync_weight,
+                    velocity_weight=args.velocity_weight,
+                    learning_rates=learning_rates,
+                    step=step,
+                    accum_steps=accum,
+                    window_start=(window_executed == 0),
+                    window_end=window_end,
+                    merge_synchronized_slots=args.merge_synchronized_slots,
+                )
+            except UnsupervisableSceneError as error:
+                # Skipped like a scene that failed to load, and for the same
+                # reason the counter still ADVANCES (see above). Its own tally
+                # and its own guard: this scene loaded, so it is neither a
+                # broken root nor a run of load failures. Raised before any
+                # forward, so the window's accumulated gradient is untouched and
+                # window_executed stays put.
+                unsupervisable_steps.append(
+                    {
+                        "step": step,
+                        "scene": error.scene,
+                        "reason": "no_supervised_sample",
+                        "eligibility": error.eligibility,
+                    }
+                )
+                print(f"step={step} scene={plan.seq_name} skipped: {error}")
+                check_unsupervisable_rate(
+                    len(unsupervisable_steps),
+                    attempted=attempted,
+                    max_fraction=args.max_unsupervisable_fraction,
+                )
+        if outcome is not None:
             window_executed += 1
             # Pin what the first executed step resolved, so every later step
             # descends toward the same optimum. Written back onto args because
@@ -2593,12 +2698,12 @@ def run_training(
                 f"{breakdown_log}"
             )
         elif window_end and window_executed > 0:
-            # The window's closing micro-step lost its scene, but earlier
-            # micro-steps already accumulated gradient: close the window now or
-            # it leaks into the next one. The norms have no history row to live
-            # on -- a skipped step writes none -- so they are dropped.
-            # Unreachable at accum=1, where a skipped step leaves
-            # window_executed at 0.
+            # The window's closing micro-step was skipped -- its scene lost, or
+            # loaded but unsupervisable -- but earlier micro-steps already
+            # accumulated gradient: close the window now or it leaks into the
+            # next one. The norms have no history row to live on -- a skipped
+            # step writes none -- so they are dropped. Unreachable at accum=1,
+            # where a skipped step leaves window_executed at 0.
             finish_window_fn(
                 model=model,
                 optimizer=optimizer,
@@ -2700,6 +2805,10 @@ def run_training(
             args=args,
         )
 
+    # Once, at the end, the way the held-out preflight reports its count. A zero
+    # is a positive statement: every attempted step had something to train on.
+    print(f"unsupervisable_steps={len(unsupervisable_steps)}/{attempted}")
+
     return {
         "start_step": start_step,
         "completed_steps": completed_steps,
@@ -2707,6 +2816,11 @@ def run_training(
         "interrupted_by": interrupted,
         "scene_cache": {"hits": cache.hits, "misses": cache.misses},
         "scene_load_skips": dict(sorted(scene_load_skips.items())),
+        # Steps whose scene loaded but no seated anchor could supervise, each
+        # with the split that says why -- the eval's skipped_scenes shape plus
+        # the step. A list rather than a count beside one: the count is its
+        # length, and two facts cannot disagree.
+        "unsupervisable_steps": unsupervisable_steps,
         "eligibility_totals": eligibility_totals,
         "realized_anchor_counts": {
             "steps_counted": anchor_count_steps,
@@ -3296,6 +3410,7 @@ def main() -> None:
         "interrupted_by": result["interrupted_by"],
         "scene_cache": result["scene_cache"],
         "scene_load_skips": result["scene_load_skips"],
+        "unsupervisable_steps": result["unsupervisable_steps"],
         # This invocation's executed steps, like history and evaluations: a
         # resumed run's totals restart with it.
         "eligibility_totals": result["eligibility_totals"],

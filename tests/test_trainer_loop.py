@@ -224,6 +224,10 @@ def _loop_args(tmp_path, **overrides):
         eval_every=0,
         max_scene_skip_fraction=0.02,
         max_consecutive_scene_skips=10,
+        # Read by the loop's skip branch for a scene that loaded but no anchor
+        # could supervise; 0.02 is the parser's default. A guard threshold, so
+        # NOT stored by _checkpoint_settings, like the two above.
+        max_unsupervisable_fraction=0.02,
         # _checkpoint_settings reads these at every checkpoint write and resume.
         min_views=2,
         max_time_indices=32,
@@ -1067,12 +1071,12 @@ class _FakeArc(nn.Module):
             "pose_enc": torch.zeros(1, self.observations, 9),
         }
 
-    def track_for_query(self, feats, images, query_idx, views_per_time=1):
+    def track_for_query(self, feats, images, query_idx, views_per_time=1, merge=False):
         # (track, confidence) tuple, shaped (1,S,H,W,3) / (1,S,H,W) exactly as
-        # the real head returns them -- anchor_tracks adds the Q=1 axis. At
-        # views_per_time > 1 the axis is S // views_per_time rows, one per
-        # time, mirroring the merged head.
-        rows = self.observations // views_per_time
+        # the real head returns them -- anchor_tracks adds the Q=1 axis. Under
+        # merge the axis is S // views_per_time rows, one per time, mirroring
+        # the merged head; off, views_per_time is inert, as in the real one.
+        rows = self.observations // views_per_time if merge else self.observations
         track = torch.ones(1, rows, self.height, self.width, 3) * feats[0]
         # Deliberately NOT constant. A flat confidence makes every occlusion test
         # vacuous: the fused (T,N) channel comes out uniform, so `occ` is all-True
@@ -1111,7 +1115,13 @@ class _FakeArc(nn.Module):
         views_per_time = self.views_per_time if merge_synchronized_slots else 1
         tracks, confidences = zip(
             *(
-                self.track_for_query(feats, images, slot, views_per_time=views_per_time)
+                self.track_for_query(
+                    feats,
+                    images,
+                    slot,
+                    views_per_time=views_per_time,
+                    merge=merge_synchronized_slots,
+                )
                 for slot in query_slots
             )
         )
@@ -2679,28 +2689,35 @@ def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
     assert set(loaded.files) == set(PREDICTION_KEYS)
 
 
-def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
-    """An anchor set that reaches nothing must raise, citing the split.
+def test_a_zero_supervision_scene_raises_the_typed_skip_before_any_gpu_work(
+    tmp_path, monkeypatch
+):
+    """An anchor set that reaches nothing raises the typed skip, citing the split.
 
     Anchoring only at time 2 while every fixture query starts at time 0 rejects
     everything at query_time_mismatch. This was fatal before multi-anchor too --
-    deep inside the loss, after the forward; now it raises before any GPU work,
-    and it must NOT be a SceneProviderError, which the loop's skip policy would
-    absorb as one bad scene.
+    deep inside the loss, after the forward -- and then a bare RuntimeError that
+    killed every resume at the same step. Now it is UnsupervisableSceneError, so
+    run_training can skip and count it under --max_unsupervisable_fraction; still
+    NOT a SceneProviderError, whose tally and consecutive rule mean "the scene
+    did not load". And it must fire before any forward: the loop treats the step
+    as inert, so nothing may have moved.
     """
 
     scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 2),))
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
+    optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
+    before = [parameter.detach().clone() for parameter in model.parameters()]
 
-    with pytest.raises(RuntimeError, match="No anchor contributes") as excinfo:
+    with pytest.raises(
+        train_cli.UnsupervisableSceneError, match="No anchor contributes"
+    ) as excinfo:
         train_cli.train_step(
             model=model,
             scene=scene,
             plan=plan_record(_record(seq_name="0000"), budget=48, stride=2),
-            optimizer=torch.optim.AdamW(
-                [{"params": list(model.parameters()), "lr": 1e-3}]
-            ),
+            optimizer=optimizer,
             scaler=torch.amp.GradScaler("cuda", enabled=False),
             precision="32",
             huber_delta_m=0.05,
@@ -2715,8 +2732,176 @@ def test_a_zero_supervision_scene_fails_the_step_loudly(tmp_path, monkeypatch):
             window_start=True,
             window_end=True,
         )
-    assert "query_time_mismatch" in str(excinfo.value)
-    assert not isinstance(excinfo.value, SceneProviderError)
+    error = excinfo.value
+    assert "query_time_mismatch" in str(error)
+    assert not isinstance(error, SceneProviderError)
+    # What the loop records: the scene by name, and the compact split.
+    assert error.scene == "0000"
+    split = error.eligibility
+    assert set(split) == {"total_query_count", "eligible_query_count", "rejected"}
+    assert split["eligible_query_count"] == 0
+    assert split["rejected"]["query_time_mismatch"] == split["total_query_count"] > 0
+    # Inert: no forward, no backward, no optimizer step.
+    for parameter, snapshot in zip(model.parameters(), before):
+        assert torch.equal(parameter, snapshot)
+    assert len(optimizer.state) == 0
+
+
+_NO_SUPERVISION_SPLIT = {
+    "total_query_count": 3,
+    "eligible_query_count": 0,
+    "rejected": {"query_time_mismatch": 3},
+}
+
+
+def _unsupervisable_at(steps, recorded):
+    """A recording step that raises the typed skip at the given step numbers."""
+
+    base = _recording_step(recorded)
+
+    def step_fn(**kwargs):
+        if kwargs["step"] in steps:
+            raise train_cli.UnsupervisableSceneError(
+                "No anchor contributes a supervised sample, so there is nothing "
+                "to train on",
+                scene=kwargs["plan"].seq_name,
+                eligibility=dict(_NO_SUPERVISION_SPLIT),
+            )
+        return base(**kwargs)
+
+    return step_fn
+
+
+def test_too_many_unsupervisable_steps_abort_the_run(tmp_path):
+    """The bound, at the function and through the loop.
+
+    Same floor and inclusive comparison as check_scene_skip_rate: below 50
+    attempted steps the ratio is noise, and exactly the threshold passes. No
+    consecutive rule -- 49 in a row under the floor is not an abort, because a
+    streak of these is not what a broken data root looks like: every one of
+    them loaded.
+    """
+
+    train_cli.check_unsupervisable_rate(49, attempted=49, max_fraction=0.02)
+    train_cli.check_unsupervisable_rate(1, attempted=50, max_fraction=0.02)
+    train_cli.check_unsupervisable_rate(0, attempted=1000, max_fraction=0.0)
+    with pytest.raises(
+        RuntimeError,
+        match=r"2 of 50 steps .*4\.0% > --max_unsupervisable_fraction 2\.0%",
+    ):
+        train_cli.check_unsupervisable_rate(2, attempted=50, max_fraction=0.02)
+
+    train_cli._STOP_REQUESTED.clear()
+    model = _toy_model()
+    with pytest.raises(RuntimeError, match="--max_unsupervisable_fraction") as excinfo:
+        train_cli.run_training(
+            model=model,
+            optimizer=torch.optim.AdamW(
+                [{"params": list(model.parameters()), "lr": 1e-3}]
+            ),
+            scaler=torch.amp.GradScaler("cuda", enabled=False),
+            plans=_plans(50),
+            args=_loop_args(tmp_path, num_steps=50),
+            scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+            step_fn=_unsupervisable_at({1, 49}, []),
+            output_dir=tmp_path,
+        )
+    # Step 1 sat under the floor; step 49 is the 50th attempt, and 2/50 crosses 2%.
+    assert "2 of 50 steps" in str(excinfo.value)
+
+
+def test_the_unsupervisable_counter_is_separate_from_scene_load_skips(tmp_path):
+    """Two tallies, two remedies -- and a loaded step ends the load streak.
+
+    Loads fail at steps 1 and 3 around an unsupervisable step 2, under
+    --max_consecutive_scene_skips 2. Tallied as a load failure, or merely left
+    out of the streak's reset, step 2 or 3 would be the second consecutive
+    failure and abort; tallied on its own, the run completes with each key
+    holding exactly its own entries. Keyed on plan.step, not seq_name: _plans
+    reuses "0000" at steps 0 and 3.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    recorded = []
+    plans = _plans(4)
+
+    def provider(plan):
+        if plan.step in (1, 3):
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the pool at '/root' (0 scenes)"
+            )
+        return SimpleNamespace(name=plan.seq_name)
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}]),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4, max_consecutive_scene_skips=2),
+        scene_provider=provider,
+        step_fn=_unsupervisable_at({2}, recorded),
+        output_dir=tmp_path,
+    )
+
+    assert result["completed_steps"] == 4
+    assert [entry.step for entry in recorded] == [0]
+    assert result["scene_load_skips"] == {"scene_absent": 2}
+    assert [entry["step"] for entry in result["unsupervisable_steps"]] == [2]
+    assert result["unsupervisable_steps"][0]["scene"] == plans[2].seq_name
+    assert result["unsupervisable_steps"][0]["reason"] == "no_supervised_sample"
+
+
+def test_a_step_with_no_eligible_query_is_skipped_and_recorded(
+    tmp_path, monkeypatch, capsys
+):
+    """The real raise meets the real catch: one unsupervisable scene costs one step.
+
+    Step 1's scene anchors at time 2, which every fixture query rejects at
+    query_time_mismatch; the other steps get a supervisable scene. The step is
+    skipped and its number is NOT backfilled (the curve stays aligned step for
+    step), the record carries the scene and the real split, and the tally is
+    its own -- scene_load_skips stays empty, because the scene loaded.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    # The bad scene first: _step_scene monkeypatches _predicted_pointmaps to
+    # the scene it builds, and the good scene's pointmaps must be the ones in
+    # force when the executed steps reach the loss. The bad scene never reaches
+    # a forward, so it needs none.
+    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    good = _step_scene(tmp_path / "good", monkeypatch)
+    height, width = good.views[0]["img"].shape[-2:]
+    model = _FakeArc(good.num_observations, height, width)
+    plans = _plans(4)
+
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=plans,
+        args=_loop_args(tmp_path, num_steps=4),
+        scene_provider=lambda plan: bad if plan.step == 1 else good,
+        output_dir=tmp_path / "out",
+    )
+
+    assert result["completed_steps"] == 4
+    assert [outcome.step for outcome in result["history"]] == [0, 2, 3]
+    assert result["scene_load_skips"] == {}
+    [record] = result["unsupervisable_steps"]
+    assert record["step"] == 1
+    assert record["scene"] == plans[1].seq_name
+    assert record["reason"] == "no_supervised_sample"
+    split = record["eligibility"]
+    assert split["eligible_query_count"] == 0
+    assert split["rejected"]["query_time_mismatch"] == split["total_query_count"] > 0
+    output = capsys.readouterr().out
+    assert (
+        f"step=1 scene={plans[1].seq_name} skipped: No anchor contributes" in output
+    )
+    assert "unsupervisable_steps=1/4" in output
 
 
 # ------------------------------------------- the confidence and sync terms ---
@@ -3407,21 +3592,35 @@ def test_sync_weight_with_merged_slots_is_refused_at_parse_time(tmp_path):
     train_cli._validate_args(_validator_args(tmp_path, merge_synchronized_slots=True))
 
 
-def test_merged_slots_need_a_multi_camera_window(tmp_path):
-    """--min_views 1 admits a single-camera window, whose one slot per time IS
-    the per-slot layout -- the merged head would fall back to the per-slot
-    branch on those steps, flipping head geometry per step inside a stream
-    whose checkpoint records merge_synchronized_slots=True."""
+def test_merged_slots_no_longer_need_two_views(tmp_path):
+    """At one camera the merged head still runs the merged branch -- the keys
+    are that slot's camera token plus its own patches -- so head geometry no
+    longer flips per step and the old --min_views >= 2 refusal has no premise
+    left. Whether monocular rows join the stream is a submit-time decision."""
 
-    with pytest.raises(
-        ValueError, match="--merge_synchronized_slots needs --min_views >= 2"
-    ):
-        train_cli._validate_args(
-            _validator_args(tmp_path, merge_synchronized_slots=True, min_views=1)
-        )
+    train_cli._validate_args(
+        _validator_args(tmp_path, merge_synchronized_slots=True, min_views=1)
+    )
     train_cli._validate_args(
         _validator_args(tmp_path, merge_synchronized_slots=True, min_views=2)
     )
+
+
+def test_the_unsupervisable_fraction_is_range_checked_at_parse_time(tmp_path):
+    """A share outside [0, 1] would silently disable the bound or fire it on
+    the first skip; refused by name, like --max_unreplayable_fraction."""
+
+    for value in (1.5, -0.1):
+        with pytest.raises(
+            ValueError, match=r"--max_unsupervisable_fraction must be in \[0, 1\]"
+        ):
+            train_cli._validate_args(
+                _validator_args(tmp_path, max_unsupervisable_fraction=value)
+            )
+    for value in (0.0, 1.0):
+        train_cli._validate_args(
+            _validator_args(tmp_path, max_unsupervisable_fraction=value)
+        )
 
 
 def test_dropped_confidence_samples_are_warned_once_and_totalled(tmp_path, capsys):
@@ -5157,6 +5356,67 @@ def test_a_wholly_skipped_window_takes_no_optimizer_step(tmp_path):
     )
 
     assert closed == [], "an all-skipped window has no gradient to step on"
+
+
+def test_an_unsupervisable_closing_micro_step_still_closes_its_window(tmp_path):
+    """Like a lost scene: window [2,3] at N=2 accumulates at step 2 and finds
+    step 3 unsupervisable, so run_training must fire the boundary work once.
+
+    The raise lands before any forward, so the window's gradient is exactly
+    step 2's -- and it must be stepped on, not carried into the next window.
+    """
+
+    train_cli._STOP_REQUESTED.clear()
+    closed: list[int] = []
+
+    def recording_finish(**kwargs):
+        closed.append(1)
+        return {}
+
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, grad_accum=2),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=_unsupervisable_at({3}, []),
+        finish_window_fn=recording_finish,
+        output_dir=tmp_path,
+    )
+
+    assert closed == [1], "the half-accumulated window must be closed exactly once"
+    assert result["completed_steps"] == 4
+    assert [entry["step"] for entry in result["unsupervisable_steps"]] == [3]
+
+
+def test_a_window_of_unsupervisable_micro_steps_takes_no_optimizer_step(tmp_path):
+    """No executed micro-step, no gradient, no boundary work -- exactly the
+    wholly-skipped window above, with the skips coming from the step instead
+    of the loader."""
+
+    train_cli._STOP_REQUESTED.clear()
+    closed: list[int] = []
+    model = _toy_model()
+    result = train_cli.run_training(
+        model=model,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        plans=_plans(4),
+        args=_loop_args(tmp_path, num_steps=4, grad_accum=2),
+        scene_provider=lambda plan: SimpleNamespace(name=plan.seq_name),
+        step_fn=_unsupervisable_at({2, 3}, []),
+        output_dir=tmp_path,
+        finish_window_fn=lambda **kwargs: closed.append(1),
+    )
+
+    assert closed == [], "an all-skipped window has no gradient to step on"
+    assert [entry["step"] for entry in result["unsupervisable_steps"]] == [2, 3]
 
 
 def test_a_checkpoint_predating_grad_accum_resumes_at_one(tmp_path):

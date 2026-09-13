@@ -127,18 +127,30 @@ class _FakeMotionDecoder(nn.Module):
         super().__init__()
         self.query_indices = []
         self.seen_time_tokens = []
-        # Recorded so the merge tests can assert what Arc derived; the real
-        # decoder emits S // views_per_time rows, mirrored below, and the
-        # default of 1 keeps every pre-merge test's behaviour unchanged.
+        # Recorded so the merge tests can assert what Arc derived and which
+        # branch it asked for; the real decoder emits S // views_per_time rows
+        # under merge and S rows otherwise, mirrored below, and the defaults
+        # keep every pre-merge test's behaviour unchanged.
         self.seen_views_per_time = []
+        self.seen_merge = []
 
-    def forward(self, tokens, images, patch_start_idx, track_query_idx, views_per_time=1):
+    def forward(
+        self,
+        tokens,
+        images,
+        patch_start_idx,
+        track_query_idx,
+        views_per_time=1,
+        merge=False,
+    ):
         self.query_indices.append(track_query_idx)
         self.seen_time_tokens.append(tokens[:, :, 1].detach().clone())
         self.seen_views_per_time.append(views_per_time)
+        self.seen_merge.append(merge)
         B, S, _, C = tokens.shape
+        rows = S // views_per_time if merge else S
         return torch.full(
-            (B, S // views_per_time, 2, C),
+            (B, rows, 2, C),
             float(track_query_idx),
             device=tokens.device,
             dtype=tokens.dtype,

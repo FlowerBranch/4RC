@@ -354,20 +354,32 @@ def encode_and_reconstruct(model, views):
     return images, feats, model.reconstruct(feats, images)
 
 
-def anchor_tracks(model, feats, images, scene, anchor_index, *, views_per_time: int = 1):
+def anchor_tracks(
+    model,
+    feats,
+    images,
+    scene,
+    anchor_index,
+    *,
+    views_per_time: int = 1,
+    merge: bool = False,
+):
     """One anchor's dense field, shaped as the Q=1 raw dict the loss expects.
 
-    At ``views_per_time > 1`` the dict's observation axis is one field per
-    time index (the merged head); ``track_query_idx`` stays the S-grid slot
-    index either way -- it names the anchor, not a row of the output.
+    Under ``merge`` the dict's observation axis is one field per time index
+    (the merged head, at any ``views_per_time`` including 1);
+    ``track_query_idx`` stays the S-grid slot index either way -- it names the
+    anchor, not a row of the output.
     """
 
     slot = scene.anchor_observation_slots[anchor_index]
-    if views_per_time == 1:
+    # Branched so the flag-off call keeps its exact spelling: injected fakes
+    # bind today's three-positional surface.
+    if not merge:
         track, track_conf = model.track_for_query(feats, images, slot)
     else:
         track, track_conf = model.track_for_query(
-            feats, images, slot, views_per_time=views_per_time
+            feats, images, slot, views_per_time=views_per_time, merge=True
         )
     return {
         "track_multi": track[:, None],

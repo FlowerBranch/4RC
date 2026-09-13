@@ -114,6 +114,86 @@ def test_views_per_time_one_is_bit_identical_to_the_pre_flag_decoder(use_adaln):
     assert torch.equal(explicit, reference)
 
 
+@pytest.mark.parametrize("use_adaln", [True, False])
+def test_merge_false_is_bit_identical_at_every_views_per_time(use_adaln):
+    """`merge`, not `views_per_time`, selects the branch: off, V is inert.
+
+    Would catch the reroute leaving a `views_per_time == 1` test anywhere on
+    the per-slot path -- which is what made a single-camera merged step fall
+    back to per-slot geometry. Every V that divides S must give the pre-flag
+    output bit for bit, with merge=False spelled out and with it omitted.
+    """
+
+    decoder = _tiny_decoder(use_adaln)
+    tokens, images = _decoder_inputs(views_per_time=2, time_count=3)
+
+    with torch.no_grad():
+        reference = _pre_flag_decoder_reference(
+            decoder, tokens, images, patch_start_idx=2, track_query_idx=0
+        )
+        for views_per_time in (1, 2, 3, 6):
+            explicit = decoder(
+                tokens,
+                images=images,
+                patch_start_idx=2,
+                track_query_idx=0,
+                views_per_time=views_per_time,
+                merge=False,
+            )
+            omitted = decoder(
+                tokens,
+                images=images,
+                patch_start_idx=2,
+                track_query_idx=0,
+                views_per_time=views_per_time,
+            )
+            assert torch.equal(explicit, reference), views_per_time
+            assert torch.equal(omitted, reference), views_per_time
+
+
+@pytest.mark.parametrize("use_adaln", [True, False])
+def test_the_merged_head_runs_at_one_camera(use_adaln):
+    """V=1 under the merge is the merged branch, not a fallback.
+
+    The pooled key row for time t is [camera_token(t), patches(t)] -- the
+    per-slot keys prefixed by that slot's camera token -- and the query row is
+    the slot's own time token over the anchor's patches. So the output has the
+    per-slot SHAPE and differs from the per-slot OUTPUT, which is what proves
+    the merged branch ran. This is what lets --merge_synchronized_slots admit
+    monocular rows without flipping head geometry per step.
+    """
+
+    decoder = _tiny_decoder(use_adaln)
+    time_count, patch_count, width = 5, 4, 64
+    tokens, images = _decoder_inputs(views_per_time=1, time_count=time_count)
+
+    query, kv = merge_time_grouped_tokens(
+        tokens, patch_start_idx=2, track_query_idx=0, views_per_time=1
+    )
+    assert query.shape == (1, time_count, 1 + patch_count, width)
+    assert kv.shape == (1, time_count, 1 + patch_count, width)
+    for time in range(time_count):
+        assert torch.equal(kv[0, time, 0], tokens[0, time, 0])
+        assert torch.equal(kv[0, time, 1:], tokens[0, time, 2:])
+        assert torch.equal(query[0, time, 0], tokens[0, time, 1])
+        assert torch.equal(query[0, time, 1:], tokens[0, 0, 2:])
+
+    with torch.no_grad():
+        merged = decoder(
+            tokens,
+            images=images,
+            patch_start_idx=2,
+            track_query_idx=0,
+            views_per_time=1,
+            merge=True,
+        )
+        per_slot = decoder(tokens, images=images, patch_start_idx=2, track_query_idx=0)
+
+    assert merged.shape == (1, time_count, 1 + patch_count, width)
+    assert per_slot.shape == merged.shape
+    assert not torch.equal(merged, per_slot)
+
+
 # ------------------------------------------------ the merged branch ---
 
 
@@ -132,12 +212,24 @@ def test_the_merged_decoder_emits_one_row_per_time(use_adaln):
 
     with torch.no_grad():
         merged = decoder(
-            tokens, images=images, patch_start_idx=2, track_query_idx=0, views_per_time=2
+            tokens,
+            images=images,
+            patch_start_idx=2,
+            track_query_idx=0,
+            views_per_time=2,
+            merge=True,
         )
 
     assert merged.shape == (1, 3, 1 + 4, 64)
     with pytest.raises(ValueError, match="does not divide"):
-        decoder(tokens, images=images, patch_start_idx=2, track_query_idx=0, views_per_time=4)
+        decoder(
+            tokens,
+            images=images,
+            patch_start_idx=2,
+            track_query_idx=0,
+            views_per_time=4,
+            merge=True,
+        )
 
 
 def test_the_merged_branch_runs_without_positions():
@@ -162,7 +254,12 @@ def test_the_merged_branch_runs_without_positions():
 
     with torch.no_grad():
         merged = decoder(
-            tokens, images=images, patch_start_idx=2, track_query_idx=0, views_per_time=2
+            tokens,
+            images=images,
+            patch_start_idx=2,
+            track_query_idx=0,
+            views_per_time=2,
+            merge=True,
         )
         per_slot = decoder(tokens, images=images, patch_start_idx=2, track_query_idx=0)
 
@@ -265,6 +362,7 @@ def test_arc_derives_views_per_time_from_the_time_indices():
     assert output["track_multi"].shape == (1, 1, 4, 2, 2, 3)
     assert output["conf_track_multi"].shape == (1, 1, 4, 2, 2)
     assert model.motion_decoder.seen_views_per_time == [2, 2, 2, 2]
+    assert model.motion_decoder.seen_merge == [True] * 4
 
     model = _merged_fake_arc()
     output = model(
@@ -273,6 +371,21 @@ def test_arc_derives_views_per_time_from_the_time_indices():
     )
     assert output["track_multi"].shape == (1, 1, 8, 2, 2, 3)
     assert model.motion_decoder.seen_views_per_time == [1, 1, 1, 1]
+    assert model.motion_decoder.seen_merge == [False] * 4
+
+    # A monocular window: one camera observes every time once, so V=1 -- and
+    # the merged branch must still be the one asked for, keys prefixed by the
+    # camera token, rather than a fall-through to the per-slot path that would
+    # flip head geometry inside a stream whose checkpoint records the merge.
+    model = _merged_fake_arc()
+    output = model(
+        _metadata_views([0, 1, 2, 3, 4, 5, 6, 7]),
+        force_no_output_conversion=True,
+        merge_synchronized_slots=True,
+    )
+    assert output["track_multi"].shape == (1, 1, 8, 2, 2, 3)
+    assert model.motion_decoder.seen_views_per_time == [1, 1, 1, 1]
+    assert model.motion_decoder.seen_merge == [True] * 4
 
     # The shuffled-index eval arm reverses every non-primary camera's indices;
     # positional pooling stays physically correct, so it must be ACCEPTED.

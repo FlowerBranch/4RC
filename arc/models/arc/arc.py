@@ -639,9 +639,16 @@ class Arc(
             track_list = []
             conf_list = []
             for query_idx in track_query_idx_list:
-                track, track_conf = self.track_for_query(
-                    feats, x, query_idx, views_per_time=views_per_time
-                )
+                # Branched so the flag-off call keeps its exact spelling:
+                # injected fakes bind today's surface.
+                if merge_synchronized_slots:
+                    track, track_conf = self.track_for_query(
+                        feats, x, query_idx, views_per_time=views_per_time, merge=True
+                    )
+                else:
+                    track, track_conf = self.track_for_query(
+                        feats, x, query_idx, views_per_time=views_per_time
+                    )
                 track_list.append(track)
                 conf_list.append(track_conf)
 
@@ -700,7 +707,15 @@ class Arc(
             output["pose_enc_list"] = [pose_enc]
         return output
 
-    def track_for_query(self, feats, x: torch.Tensor, query_idx: int, *, views_per_time: int = 1):
+    def track_for_query(
+        self,
+        feats,
+        x: torch.Tensor,
+        query_idx: int,
+        *,
+        views_per_time: int = 1,
+        merge: bool = False,
+    ):
         """One query frame's dense displacement field and its confidence.
 
         This is the body of the Q loop.  Its activations are the bulk of a
@@ -708,9 +723,11 @@ class Arc(
         been backwarded -- which is why a caller supervising several anchors
         drives this per query rather than asking for a stacked Q axis.
 
-        ``views_per_time > 1`` pools the motion decoder's keys by time index
-        (one output field per time instead of one per observation slot); 1,
-        the default, is exactly the per-slot path.
+        ``merge`` pools the motion decoder's keys by time index (one output
+        field per time instead of one per observation slot), at any
+        ``views_per_time`` including 1; False, the default, is exactly the
+        per-slot path. ``views_per_time`` is the merged head's geometry, the
+        camera-major slot count per time.
         """
 
         frames_chunk_size = 1 if self.training else 8
@@ -720,22 +737,22 @@ class Arc(
                 [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
                 dim=2,
             )[..., 1536:] # [cam, time, patch] in global feauture as required by MotionDecoder
-            if views_per_time == 1:
+            if not merge:
                 track_tokens = self.motion_decoder(
                     feature, images=x, patch_start_idx=2, track_query_idx=query_idx
                 )
             else:
                 track_tokens = self.motion_decoder(
                     feature, images=x, patch_start_idx=2, track_query_idx=query_idx,
-                    views_per_time=views_per_time,
+                    views_per_time=views_per_time, merge=True,
                 )
             aggregated_track_tokens_list.append(track_tokens)
         # Shape-only slice: DPTHead reads `images` for B, S, H, W and its
         # frames-chunk slicing alone, never the pixels. The merged decoder
         # emits one row per time, so the head must see a matching T-long
         # observation axis; x[:, :T] is the cheapest tensor with that shape --
-        # WHICH frames it holds is irrelevant.
-        head_images = x if views_per_time == 1 else x[:, : x.shape[1] // views_per_time]
+        # WHICH frames it holds is irrelevant. At V=1 the slice is all of x.
+        head_images = x if not merge else x[:, : x.shape[1] // views_per_time]
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             track, track_conf = self.track_head(
                 aggregated_track_tokens_list, images=head_images, patch_start_idx=1, frames_chunk_size=frames_chunk_size

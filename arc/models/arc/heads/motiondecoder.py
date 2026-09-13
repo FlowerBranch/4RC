@@ -148,17 +148,25 @@ class MotionDecoder(nn.Module):
         track_query_idx = 0,
         *,
         views_per_time: int = 1,
+        merge: bool = False,
     ) -> torch.Tensor:
         """
         Args:
             tokens: [B, S, N, C], laid out [camera_token, time_token, patches...]
                 at the production call site (patch_start_idx=2)
             patch_start_idx: index where patches start
-            views_per_time: 1, the default, is exactly today's per-slot path --
-                every slot's row attends over that slot's own patches. At V > 1
-                the S = V*T camera-major slots pool into one key set per time
-                index and the decoder emits one row per time; see
-                merge_time_grouped_tokens.
+            views_per_time: how many camera-major slots share each time index
+                (S = V*T). Read only under ``merge``; the per-slot path ignores
+                it beyond the divisibility check.
+            merge: False, the default, is exactly today's per-slot path --
+                every slot's row attends over that slot's own patches, whatever
+                views_per_time says. True pools the V slots of each time index
+                into one key set and emits one row per time; see
+                merge_time_grouped_tokens. Well-defined at V=1 too, where the
+                pooled key row is [camera_token(t), patches(t)] -- the per-slot
+                keys prefixed by the camera token -- so a single-camera window
+                under the merge runs the same head geometry as a multi-camera
+                one instead of silently falling back to the per-slot branch.
         """
         B, S, _, C = tokens.shape
         _, _, _, H, W = images.shape
@@ -172,7 +180,7 @@ class MotionDecoder(nn.Module):
                 f"{S} observation slots"
             )
 
-        if views_per_time == 1:
+        if not merge:
             out_rows = S
 
             query_patches = patches[:, track_query_idx:track_query_idx+1, :, :]
