@@ -284,6 +284,12 @@ def _loop_args(tmp_path, **overrides):
         # it; 1 is the parser's default and the every-step-is-a-window contract
         # every existing test assumes.
         grad_accum=1,
+        # Eval-only diagnostic: the held-out tracks anchored at ground truth.
+        # Changes no gradient, so NOT stored by _checkpoint_settings and in
+        # neither resume tier, like the guard thresholds; run_training threads
+        # it into evaluate_held_out, so every loop test needs it present. Off is
+        # the parser's default and the behaviour every existing test assumes.
+        oracle_query_anchor=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1425,6 +1431,162 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     assert loaded["gt_vis_any"].shape[0] == 4
 
 
+def test_evaluate_held_out_threads_the_oracle_anchor(tmp_path, monkeypatch):
+    """The flag reaches the eval's gather and never train_step's.
+
+    Both functions import ``gather_query_anchor_points`` from the package at
+    call time, so the package namespace is the one interception point -- the
+    same seam the sync-weight recorder uses. The eval is asserted on its
+    recorded kwarg AND on the marker it writes, because the marker is what a
+    later reader has; train_step is asserted on the kwarg's absence, since a
+    step that so much as spelled it would be one keystroke from supervising
+    against the oracle.
+    """
+
+    import arc.training as training_package
+
+    seen: list[dict] = []
+    real_gather = training_package.gather_query_anchor_points
+
+    def recording(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return real_gather(*args, **kwargs)
+
+    monkeypatch.setattr(training_package, "gather_query_anchor_points", recording)
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    for step, enabled in ((1, True), (2, False)):
+        metrics = train_cli.evaluate_held_out(
+            model=model,
+            plans=[plan],
+            scene_provider=lambda _plan: scene,
+            precision="32",
+            huber_delta_m=0.05,
+            step=step,
+            output_dir=tmp_path / "out",
+            query_anchors=["0:0"],
+            confidence_alpha=_EVAL_ALPHA,
+            oracle_query_anchor=enabled,
+        )
+        # One gather per scene: both arms and the writer reuse its result.
+        assert len(seen) == step
+        assert seen[-1] == {"oracle_query_anchor": enabled}
+        assert metrics["oracle_query_anchor"] is enabled
+        written = json.loads(
+            (tmp_path / "out" / "eval" / f"step-{step}" / "metrics.json").read_text()
+        )
+        assert written["oracle_query_anchor"] is enabled
+
+    # A separate root: _write_scene refuses to overwrite the eval's dump.
+    step_scene = _step_scene(tmp_path / "step", monkeypatch)
+    height, width = step_scene.views[0]["img"].shape[-2:]
+    step_model = _FakeArc(step_scene.num_observations, height, width)
+    train_cli.train_step(
+        model=step_model,
+        scene=step_scene,
+        plan=plan,
+        optimizer=torch.optim.AdamW(
+            [{"params": list(step_model.parameters()), "lr": 1e-3}]
+        ),
+        scaler=torch.amp.GradScaler("cuda", enabled=False),
+        precision="32",
+        huber_delta_m=0.05,
+        grad_clip=1.0,
+        confidence_weight=0.0,
+        confidence_alpha=None,
+        sync_weight=0.0,
+        velocity_weight=0.0,
+        learning_rates=[1e-3],
+        step=0,
+        accum_steps=1,
+        window_start=True,
+        window_end=True,
+    )
+    assert len(seen) == 3
+    # No such keyword at all: the step's call site is verbatim.
+    assert "oracle_query_anchor" not in seen[-1]
+
+
+@pytest.mark.parametrize("merge", (False, True))
+def test_the_oracle_anchor_moves_only_the_predicted_track(tmp_path, monkeypatch, merge):
+    """Only ``pred`` moves, and by exactly the anchor's own error.
+
+    The same displacement field re-anchored at ground truth shifts every
+    timestep of a track by alignment(gt - predicted anchor); the bundle's other
+    arrays -- ``query_points`` above all, which was ground truth already -- are
+    byte-identical. Two mechanisms carry the delta through the writer, one per
+    parametrization, and they are NOT the same one: on the per-slot path
+    ``_prediction_arrays`` fuses each time's cameras by a confidence-weighted
+    mean, and the delta is constant across a query's cameras, so a normalised
+    weighted mean of it is the delta itself; under the merge there is no fusion
+    at all -- the transpose branch passes the merged head's single per-time
+    row straight through, so the delta arrives unweighted.
+    """
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+    )
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(
+        scene.num_observations, height, width, views_per_time=2 if merge else 1
+    )
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    bundles = {}
+    for step, enabled in ((1, False), (2, True)):
+        train_cli.evaluate_held_out(
+            model=model,
+            plans=[plan],
+            scene_provider=lambda _plan: scene,
+            precision="32",
+            huber_delta_m=0.05,
+            step=step,
+            output_dir=tmp_path / "out",
+            query_anchors=["0:0"],
+            confidence_alpha=_EVAL_ALPHA,
+            merge_synchronized_slots=merge,
+            oracle_query_anchor=enabled,
+        )
+        bundles[enabled] = dict(
+            np.load(tmp_path / "out" / "eval" / f"step-{step}" / "pred" / "0000.npz")
+        )
+    off, on = bundles[False], bundles[True]
+
+    # The fixture patches _predicted_pointmaps, so {} serves the fit and the
+    # predicted gather exactly as the eval's own raw output did.
+    correspondences, _ = build_anchor_correspondences(scene)
+    alignment, _ = fit_scene_sim3({}, scene)
+    predicted_anchor = gather_query_anchor_points({}, scene, correspondences)
+    ground_truth = scene.trajectories_world[
+        correspondences.query_times, correspondences.trajectory_indices
+    ]
+    expected = (
+        alignment.apply_vectors(ground_truth - predicted_anchor)
+        * float(scene.track_upscaling_factor)
+    ).numpy()
+
+    # Not vacuous: the pointmap is read at the rounded pixel, so two of the
+    # three fixture queries carry a nonzero anchor error.
+    assert np.abs(expected).max() > 0
+    np.testing.assert_allclose(
+        on["pred"] - off["pred"],
+        # Every timestep shifts by the same per-query delta.
+        np.broadcast_to(expected[None], on["pred"].shape),
+        atol=1e-5,
+    )
+    for key in PREDICTION_KEYS:
+        if key != "pred":
+            assert np.array_equal(on[key], off[key]), key
+
+
 def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkeypatch):
     """The end-to-end twin of the schema regression test.
 
@@ -1795,6 +1957,23 @@ def test_the_val_flag_pair_is_checked_by_the_argument_validator(tmp_path):
     with pytest.raises(ValueError, match="--val_scenes_file needs --val_data_root"):
         train_cli._validate_args(args)
 
+    args.val_data_root = "/held/out/dir"
+    train_cli._validate_args(args)
+
+
+def test_the_oracle_anchor_needs_a_held_out_set(tmp_path):
+    """--oracle_query_anchor touches only the held-out eval, so without a
+    held-out set it is silently inert -- and run_summary.json would still
+    record it, filing a run as oracle-anchored when nothing was measured."""
+
+    args = _validator_args(tmp_path, oracle_query_anchor=True)
+
+    with pytest.raises(
+        ValueError, match="--oracle_query_anchor needs --val_scenes_file"
+    ):
+        train_cli._validate_args(args)
+
+    args.val_scenes_file = "val.json"
     args.val_data_root = "/held/out/dir"
     train_cli._validate_args(args)
 
@@ -3364,6 +3543,22 @@ def test_a_resume_restores_the_pinned_alpha_rather_than_re_resolving_it(tmp_path
     )
 
 
+def test_the_oracle_anchor_is_not_a_resume_setting(tmp_path):
+    """Eval-only and gradient-free, so it defines no stream: stored nowhere in
+    the checkpoint and compared by neither tier, like the guard thresholds. A
+    segment may switch it on to price a checkpoint and off again to train."""
+
+    stored = train_cli._checkpoint_settings(
+        _loop_args(tmp_path, oracle_query_anchor=True)
+    )
+    assert "oracle_query_anchor" not in stored
+    assert "oracle_query_anchor" not in train_cli._RESUME_SETTINGS_REFUSED
+    assert "oracle_query_anchor" not in train_cli._RESUME_SETTINGS_WARNED
+    train_cli.check_resume_settings(
+        stored, _loop_args(tmp_path, oracle_query_anchor=False)
+    )
+
+
 def test_a_resume_that_changes_a_loss_weight_is_refused(tmp_path):
     """A segment that changes the objective and keeps counting steps reports one
     curve over two of them -- and the reported `loss` stays the position-only
@@ -3507,6 +3702,26 @@ def test_merged_slots_are_recorded_in_the_plan_summary_settings(tmp_path):
         )
         settings = train_cli._plan_summary(tally, args)["settings"]
         assert settings["merge_synchronized_slots"] is enabled
+
+
+def test_the_oracle_anchor_is_recorded_in_the_plan_summary_settings(tmp_path):
+    """An oracle-anchored curve is an upper bound on the geometry, not a
+    measurement of the model, so an archived summary must say which one it is."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    for enabled in (False, True):
+        args = _validator_args(
+            tmp_path, manifest="m.jsonl", oracle_query_anchor=enabled
+        )
+        settings = train_cli._plan_summary(tally, args)["settings"]
+        assert settings["oracle_query_anchor"] is enabled
 
 
 def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):

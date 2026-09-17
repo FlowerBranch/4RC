@@ -878,6 +878,7 @@ def evaluate_held_out(
     confidence_alpha: float | None,
     emit_predictions: bool = True,
     merge_synchronized_slots: bool = False,
+    oracle_query_anchor: bool = False,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
@@ -920,6 +921,15 @@ def evaluate_held_out(
     segment run, and the skip is reported in ``skipped_scenes`` with the split
     that says why, so a later reader can tell a scene that was skipped from one
     that scored zero.
+
+    ``oracle_query_anchor`` re-anchors every track at the query point's
+    ground-truth world position (see :func:`gather_query_anchor_points`) and is
+    recorded in the metrics next to ``query_anchors`` for the reason that spec
+    is: an oracle-anchored curve is an upper bound on the geometry, not a
+    measurement of the model, and must never be read as one.  The same anchors
+    feed both arms and the written bundle, so ``pred`` moves and nothing else
+    does -- ``query_points`` was ground truth already.  Eval-only by
+    construction: ``train_step`` has no such parameter.
     """
 
     from arc.training import (
@@ -978,7 +988,12 @@ def evaluate_held_out(
             with torch.no_grad(), autocast_context(precision):
                 raw = model(scene.views, force_no_output_conversion=True, **forward_kwargs)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
-                anchors = gather_query_anchor_points(raw, scene, correspondences)
+                anchors = gather_query_anchor_points(
+                    raw,
+                    scene,
+                    correspondences,
+                    oracle_query_anchor=oracle_query_anchor,
+                )
                 result = sparse_tracking_loss(
                     tracking_only(raw),
                     scene,
@@ -1091,6 +1106,11 @@ def evaluate_held_out(
     metrics = {
         "step": step,
         "query_anchors": list(query_anchors),
+        # Whether the tracks were anchored at ground truth rather than at the
+        # model's reconstruction. Recorded for the reason the spec above is: an
+        # oracle-anchored curve is an upper bound on the geometry, not a
+        # measurement of the model, and must never be read against a real one.
+        "oracle_query_anchor": bool(oracle_query_anchor),
         "scenes": len(per_scene),
         "position_loss": sum(losses) / len(losses) if losses else None,
         "metric_error_m": sum(errors) / len(errors) if errors else None,
@@ -1869,6 +1889,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--plan_only (default: %(default)s)"
         ),
     )
+    evaluation.add_argument(
+        "--oracle_query_anchor",
+        action="store_true",
+        help=(
+            "Eval-only diagnostic: anchor every held-out track at the query "
+            "point's ground-truth world position instead of the model's own "
+            "reconstruction of it, leaving the trained model and its predicted "
+            "displacement field untouched. Prices how much of the held-out "
+            "error is the anchor's geometry rather than the motion. Read the "
+            "result as an UPPER BOUND on what ground-truth depth would buy, not "
+            "an estimate of it: the tracked point's true position is at least "
+            "as good as unprojecting ground-truth depth through ground-truth "
+            "cameras at that pixel. Changes no gradient and is not stored in "
+            "the checkpoint, so a resume may toggle it freely; the eval's "
+            "metrics.json and run_summary.json record it. Needs "
+            "--val_scenes_file, since it touches nothing else"
+        ),
+    )
     return parser
 
 
@@ -1998,6 +2036,16 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--val_scenes_file needs --val_data_root: the held-out scenes live in "
             "their own directory, and it cannot be derived from the manifest, "
             "whose rows name the training directory"
+        )
+    # Same parse-time refusal, same reason. The flag touches only the held-out
+    # eval, so without a held-out set it is silently inert -- while
+    # run_summary.json would still record it, filing a run as oracle-anchored
+    # when nothing was measured.
+    if args.oracle_query_anchor and not args.val_scenes_file:
+        raise ValueError(
+            "--oracle_query_anchor needs --val_scenes_file: the oracle anchor "
+            "only ever reaches the held-out eval, so without a held-out set the "
+            "flag changes nothing and would label a run it never measured"
         )
 
     anchor_slots = parse_query_anchor_slots(args.query_anchors)
@@ -2166,6 +2214,10 @@ def _plan_summary(tally, args) -> dict:
             # test the way the weights are; recorded because the two curves are
             # not comparable and the summary must say which one this is.
             "merge_synchronized_slots": bool(args.merge_synchronized_slots),
+            # Whether the held-out tracks were anchored at ground truth. An
+            # oracle-anchored curve is an upper bound on the geometry, not a
+            # measurement of the model, so it is not comparable with a real one.
+            "oracle_query_anchor": bool(args.oracle_query_anchor),
             "confidence_alpha": args.confidence_alpha,
             # What alpha the run actually trained under, as opposed to what was
             # asked for: None under 'auto' until a step resolves it, which is why
@@ -2737,6 +2789,7 @@ def run_training(
                 # write `conf` with no `occ`.
                 confidence_alpha=args.resolved_confidence_alpha,
                 merge_synchronized_slots=args.merge_synchronized_slots,
+                oracle_query_anchor=args.oracle_query_anchor,
             )
             evaluations.append(metrics)
             print(

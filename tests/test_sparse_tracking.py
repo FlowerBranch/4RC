@@ -2433,6 +2433,118 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
         gather_query_anchor_points(raw, dumped_scene, stray)
 
 
+def test_the_oracle_anchor_returns_the_ground_truth_query_positions(tmp_path):
+    """With the oracle on, the anchor IS the tracked point's true position.
+
+    Queries at t=2 rather than t=0, so the time index is load-bearing: the
+    fixture moves every point 0.1 m per frame, and an anchor read off
+    ``trajectories_world[0]`` would be 20 cm out.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 2),),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    assert correspondences.count == 3
+
+    anchors = gather_query_anchor_points(
+        {}, scene, correspondences, oracle_query_anchor=True
+    )
+
+    expected = scene.trajectories_world[
+        correspondences.query_times, correspondences.trajectory_indices
+    ]
+    assert torch.equal(anchors, expected)
+    assert anchors.shape == (correspondences.count, 3)
+    assert anchors.dtype == torch.float32
+    assert anchors.device == scene.trajectories_world.device
+    assert not anchors.requires_grad
+    # Not the time-0 positions: the query time selected the row.
+    assert not torch.equal(
+        anchors, scene.trajectories_world[0, correspondences.trajectory_indices]
+    )
+
+
+def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
+    """The oracle path never touches the reconstruction.
+
+    An empty prediction dict is the sharpest way to say so: off, the gather
+    reaches ``_predicted_pointmaps`` and dies on the missing alignment fields;
+    on, it returns the ground truth from the scene alone. The stray-slot
+    contract is the same either way -- the slot check sits ahead of both paths.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+
+    with pytest.raises(KeyError, match="missing alignment fields"):
+        gather_query_anchor_points({}, dumped_scene, correspondences)
+
+    anchors = gather_query_anchor_points(
+        {}, dumped_scene, correspondences, oracle_query_anchor=True
+    )
+    assert torch.equal(
+        anchors,
+        dumped_scene.trajectories_world[
+            correspondences.query_times, correspondences.trajectory_indices
+        ],
+    )
+
+    stray = SparseCorrespondences(
+        trajectory_indices=correspondences.trajectory_indices,
+        query_slots=torch.ones_like(correspondences.query_slots),
+        query_times=correspondences.query_times,
+        rows=correspondences.rows,
+        columns=correspondences.columns,
+    )
+    with pytest.raises(ValueError, match="exceeds the adapter's query observations"):
+        gather_query_anchor_points({}, dumped_scene, stray, oracle_query_anchor=True)
+
+
+def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
+    """Off, and off by default, is the predicted path unchanged.
+
+    The bare call and an explicit ``oracle_query_anchor=False`` both return the
+    pointmap gather at the query pixels -- the snapshot the test above pins.
+    The parameter is keyword-only with a False default, which is what keeps the
+    overfit's three positional call sites and ``train_step``'s byte-identical
+    without touching them.
+    """
+
+    import inspect
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    height, width = dumped_scene.views[0]["img"].shape[-2:]
+    pointmaps = torch.arange(
+        dumped_scene.num_observations * height * width * 3,
+        dtype=torch.float32,
+    ).reshape(1, dumped_scene.num_observations, height, width, 3)
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+    raw = {"track_query_idx": dumped_scene.track_query_observation_slots}
+    snapshot = pointmaps[0, 0, correspondences.rows, correspondences.columns]
+
+    assert torch.equal(
+        gather_query_anchor_points(raw, dumped_scene, correspondences), snapshot
+    )
+    assert torch.equal(
+        gather_query_anchor_points(
+            raw, dumped_scene, correspondences, oracle_query_anchor=False
+        ),
+        snapshot,
+    )
+
+    parameter = inspect.signature(gather_query_anchor_points).parameters[
+        "oracle_query_anchor"
+    ]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False
+
+
 def test_sparse_loss_rejects_queries_that_are_not_declared_anchors(dumped_scene):
     """The query-vs-anchor check lives where the tracks are scored.
 

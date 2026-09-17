@@ -814,6 +814,8 @@ def gather_query_anchor_points(
     raw_predictions: dict,
     scene: DumpedKubricScene,
     correspondences: SparseCorrespondences,
+    *,
+    oracle_query_anchor: bool = False,
 ) -> torch.Tensor:
     """Gather the detached query pointmap term used by ``_postprocess_output``.
 
@@ -828,6 +830,22 @@ def gather_query_anchor_points(
     :meth:`SparseCorrespondences.select_query_slot` has every ``query_slot`` at
     0 and would silently gather anchor 0's pointmaps; slice this function's
     result with :meth:`SparseCorrespondences.anchor_rows` instead.
+
+    ``oracle_query_anchor=True`` is an **eval-only diagnostic**.  It returns each
+    query's ground-truth world position,
+    ``scene.trajectories_world[query_times, trajectory_indices]``, and reads
+    nothing from ``raw_predictions`` at all: the trained model and its
+    displacement field are untouched, only the point that field is anchored at
+    moves.  Read the result as an **upper bound** on what ground-truth depth
+    would buy, not an estimate of it -- the tracked point's true position is at
+    least as good as unprojecting ground-truth depth through ground-truth
+    cameras at that pixel.  It must never reach ``train_step``: supervising
+    against an oracle anchor trains a different model, and this exists to price
+    the anchor's geometry error on models that already exist.  Same ``(count,
+    3)`` float32 contract as the predicted path, but returned on
+    ``trajectories_world``'s device rather than the model's; every consumer
+    re-homes it with ``torch.as_tensor(..., device=tracks.device)``, so the
+    difference is inert.
     """
 
     anchor_slots = scene.track_query_observation_slots.cpu()
@@ -838,6 +856,28 @@ def gather_query_anchor_points(
             raise ValueError(
                 "Correspondence query slot exceeds the adapter's query observations"
             )
+    if oracle_query_anchor:
+        trajectories = scene.trajectories_world
+        time_count, trajectory_count = trajectories.shape[:2]
+        # sparse_tracking_loss runs the same two checks; repeated here because
+        # this path indexes the trajectories before the loss ever sees them.
+        if correspondences.trajectory_indices.min().item() < 0 or (
+            correspondences.trajectory_indices.max().item() >= trajectory_count
+        ):
+            raise ValueError(
+                "Sparse correspondence contains an out-of-range trajectory index"
+            )
+        if correspondences.query_times.min().item() < 0 or (
+            correspondences.query_times.max().item() >= time_count
+        ):
+            raise ValueError(
+                "Sparse correspondence contains an out-of-range query time"
+            )
+        anchors = trajectories[
+            correspondences.query_times.to(trajectories.device),
+            correspondences.trajectory_indices.to(trajectories.device),
+        ]
+        return anchors.detach().to(torch.float32)
     pointmaps = _predicted_pointmaps(raw_predictions)
     if pointmaps.shape[1] != scene.num_observations:
         raise ValueError(
