@@ -816,8 +816,18 @@ def gather_query_anchor_points(
     correspondences: SparseCorrespondences,
     *,
     oracle_query_anchor: bool = False,
-) -> torch.Tensor:
-    """Gather the detached query pointmap term used by ``_postprocess_output``.
+    ground_truth_query_anchor: bool = False,
+) -> tuple[torch.Tensor, str]:
+    """Gather the detached query anchor used by ``_postprocess_output``.
+
+    Returns ``(points, frame)``: a detached ``(count, 3)`` float32 tensor plus
+    the frame those points live in -- ``"model"`` (the reconstruction's own
+    gauge, the frame ``fit_scene_sim3`` maps FROM) or ``"world"`` (the dump's
+    stored frame, the one it maps INTO).  The frame is part of the value
+    rather than a property of some flag because
+    :func:`compose_predicted_metric` branches on it: a world-frame anchor
+    pushed through ``alignment.apply_points`` would be carried into world a
+    second time.
 
     Reads only ``depth`` and ``pose_enc``, so one reconstruction forward serves
     every anchor: the pointmaps cover all S observations, and an anchor is just
@@ -845,9 +855,34 @@ def gather_query_anchor_points(
     3)`` float32 contract as the predicted path, but returned on
     ``trajectories_world``'s device rather than the model's; every consumer
     re-homes it with ``torch.as_tensor(..., device=tracks.device)``, so the
-    difference is inert.
+    difference is inert.  Frame ``"world"``.
+
+    ``ground_truth_query_anchor=True`` is the second **eval-only diagnostic**:
+    ground-truth depth unprojected through the ground-truth camera at the
+    anchor pixel -- what MVTracker actually receives -- via
+    :func:`_metric_pointmap_at_anchor`, one call per distinct anchor slot.
+    Unlike the oracle it keeps the pixel quantisation and the depth-map
+    sampling, so the pair brackets what ground-truth depth would buy.  Every
+    gathered pixel is valid by construction --
+    :func:`build_anchor_correspondences` gates on the same depth map
+    (``anchor_depth_gate``) -- and an invalid one raises rather than dropping
+    the row, because a dropped row would silently unmatch this curve from the
+    predicted-anchor one.  An empty correspondence set returns an empty
+    ``(0, 3)`` tensor here where the other two paths die inside a torch
+    reduction; unreachable from ``evaluate_held_out``, which skips a
+    zero-count scene before any gather.  Frame ``"world"``, on CPU, under the
+    same never-in-``train_step`` rule as the oracle.  The two diagnostics are
+    mutually exclusive: the trainer refuses them together at parse time, and
+    the raise below covers callers that bypass it.
     """
 
+    if oracle_query_anchor and ground_truth_query_anchor:
+        raise ValueError(
+            "oracle_query_anchor and ground_truth_query_anchor cannot be "
+            "combined: each replaces the query anchor with a different "
+            "ground-truth reading (the trainer refuses this at parse time; "
+            "this raise covers callers that bypass it)"
+        )
     anchor_slots = scene.track_query_observation_slots.cpu()
     if correspondences.query_slots.numel():
         if correspondences.query_slots.min().item() < 0:
@@ -877,7 +912,45 @@ def gather_query_anchor_points(
             correspondences.query_times.to(trajectories.device),
             correspondences.trajectory_indices.to(trajectories.device),
         ]
-        return anchors.detach().to(torch.float32)
+        return anchors.detach().to(torch.float32), "world"
+    if ground_truth_query_anchor:
+        query_slots = correspondences.query_slots.cpu()
+        observation_slots = anchor_slots[query_slots]
+        rows = correspondences.rows.cpu().numpy()
+        columns = correspondences.columns.cpu().numpy()
+        anchors = torch.empty((correspondences.count, 3), dtype=torch.float32)
+        # One unprojection per DISTINCT anchor slot (1 to 6 in practice),
+        # never all S observations.
+        for slot in sorted(set(observation_slots.tolist())):
+            selected = (observation_slots == slot).nonzero(as_tuple=True)[0]
+            world_points, valid = _metric_pointmap_at_anchor(scene, slot)
+            height, width = valid.shape
+            slot_rows = rows[selected.numpy()]
+            slot_columns = columns[selected.numpy()]
+            if (
+                slot_rows.min() < 0
+                or slot_rows.max() >= height
+                or slot_columns.min() < 0
+                or slot_columns.max() >= width
+            ):
+                raise ValueError(
+                    "Sparse correspondence is outside the pointmap grid"
+                )
+            valid_here = valid[slot_rows, slot_columns]
+            if not valid_here.all():
+                raise ValueError(
+                    f"Ground-truth depth is invalid at {int((~valid_here).sum())} "
+                    f"of {int(selected.numel())} anchor pixels of observation "
+                    f"slot {slot}; build_anchor_correspondences gates on this "
+                    "same depth map (anchor_depth_gate), so a violation means "
+                    "the correspondences do not belong to this scene. Refusing "
+                    "rather than dropping rows: a dropped row would silently "
+                    "unmatch this curve from the predicted-anchor one"
+                )
+            anchors[selected] = torch.from_numpy(
+                world_points[slot_rows, slot_columns]
+            ).to(torch.float32)
+        return anchors, "world"
     pointmaps = _predicted_pointmaps(raw_predictions)
     if pointmaps.shape[1] != scene.num_observations:
         raise ValueError(
@@ -901,7 +974,7 @@ def gather_query_anchor_points(
         correspondences.rows.to(pointmaps.device),
         correspondences.columns.to(pointmaps.device),
     ]
-    return anchors.detach()
+    return anchors.detach(), "model"
 
 
 # The stages a query passes through at one anchor, in the order they are
@@ -1322,6 +1395,51 @@ def build_anchor_correspondences(
     )
 
 
+def compose_predicted_metric(
+    query_anchor_points: torch.Tensor,
+    predicted_displacement: torch.Tensor,
+    alignment: DetachedSim3,
+    *,
+    anchor_frame: str,
+    metric_factor: float,
+) -> torch.Tensor:
+    """Anchor + displacement -> metric positions, branching on the anchor frame.
+
+    ``"model"`` is the archived spelling, verbatim: every stored curve was
+    scored with ``apply_points(anchor + displacement) * factor``, and the two
+    algebraically equal forms are not bit-identical.  ``"world"`` uses the
+    affinity of Sim(3) -- ``apply_points(a + d) == apply_points(a) +
+    apply_vectors(d)`` -- so an anchor already in the destination frame is
+    never transformed a second time; only the model-gauge displacement is
+    mapped.  One function for both consumers (the loss and the prediction
+    writer) so the two cannot drift, and the one place the frame vocabulary
+    is checked.  ``anchor_frame`` has no default on purpose: a silently
+    assumed frame is the bug class this function exists to close.  This
+    composes and nothing else: callers pass device/dtype-homed tensors and
+    alignment, and their own shape/finiteness checks run before it; the
+    metric factor multiplies outside the Sim(3), never folded into the scale.
+    """
+
+    if anchor_frame == "model":
+        return (
+            alignment.apply_points(
+                query_anchor_points[:, None, :] + predicted_displacement
+            )
+            * metric_factor
+        )
+    if anchor_frame == "world":
+        return (
+            (
+                query_anchor_points[:, None, :]
+                + alignment.apply_vectors(predicted_displacement)
+            )
+            * metric_factor
+        )
+    raise ValueError(
+        f"anchor_frame must be 'model' or 'world', got {anchor_frame!r}"
+    )
+
+
 def sparse_tracking_loss(
     raw_predictions: dict,
     scene: DumpedKubricScene,
@@ -1329,6 +1447,7 @@ def sparse_tracking_loss(
     alignment: DetachedSim3,
     query_anchor_points: torch.Tensor,
     *,
+    query_anchor_frame: str = "model",
     huber_delta_m: float = 0.05,
     confidence_weight: float = 0.0,
     confidence_alpha: float | None = None,
@@ -1341,6 +1460,12 @@ def sparse_tracking_loss(
 
     This assembles predictions, targets and masks; every scalar it reports is
     computed by ``losses.py`` and ``diagnostics.py``.
+
+    ``query_anchor_frame`` is the frame half of
+    :func:`gather_query_anchor_points`'s return, threaded here so
+    :func:`compose_predicted_metric` can compose a world-frame anchor without
+    a second model->world transform.  ``"model"`` is the archived default;
+    the composition helper owns the valid-frame check.
 
     ``confidence_weight`` defaults to 0, which skips the confidence term entirely --
     not multiplied by zero, but never built -- so the position-only path is exactly
@@ -1491,11 +1616,12 @@ def sparse_tracking_loss(
 
     alignment = alignment.to(device=device, dtype=torch.float32)
     metric_factor = float(scene.track_upscaling_factor)
-    predicted_metric = (
-        alignment.apply_points(
-            query_anchor_points[:, None, :] + predicted_displacement
-        )
-        * metric_factor
+    predicted_metric = compose_predicted_metric(
+        query_anchor_points,
+        predicted_displacement,
+        alignment,
+        anchor_frame=query_anchor_frame,
+        metric_factor=metric_factor,
     )
     target_metric = target_positions * metric_factor
 

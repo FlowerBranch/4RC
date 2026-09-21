@@ -678,7 +678,9 @@ def train_step(
         # set must never reach gather_query_anchor_points itself — its
         # query_slots are renumbered to 0 and would silently gather anchor 0's
         # pointmaps for every anchor.
-        anchors = gather_query_anchor_points(recon, scene, correspondences)
+        anchors, anchor_frame = gather_query_anchor_points(
+            recon, scene, correspondences
+        )
         if len(active_anchors) == 1:
             # One anchor needs no cut: its backward is the only one and runs
             # straight through the encoder, exactly the pre-multi-anchor graph.
@@ -742,6 +744,7 @@ def train_step(
                 per_anchor_correspondences[anchor_index],
                 alignment,
                 anchors[per_anchor_rows[anchor_index].to(anchors.device)],
+                query_anchor_frame=anchor_frame,
                 huber_delta_m=huber_delta_m,
                 confidence_weight=confidence_weight,
                 confidence_alpha=step_alpha,
@@ -879,6 +882,7 @@ def evaluate_held_out(
     emit_predictions: bool = True,
     merge_synchronized_slots: bool = False,
     oracle_query_anchor: bool = False,
+    ground_truth_query_anchor: bool = False,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
@@ -930,6 +934,13 @@ def evaluate_held_out(
     feed both arms and the written bundle, so ``pred`` moves and nothing else
     does -- ``query_points`` was ground truth already.  Eval-only by
     construction: ``train_step`` has no such parameter.
+
+    ``ground_truth_query_anchor`` re-anchors at ground-truth depth unprojected
+    through the ground-truth camera at the anchor pixel -- what MVTracker
+    actually receives -- so the oracle/ground-truth pair brackets what
+    ground-truth depth would buy.  Recorded in the metrics beside the oracle
+    marker; mutually exclusive with it (refused at parse time and inside the
+    gather); eval-only by the same construction.
     """
 
     from arc.training import (
@@ -988,11 +999,12 @@ def evaluate_held_out(
             with torch.no_grad(), autocast_context(precision):
                 raw = model(scene.views, force_no_output_conversion=True, **forward_kwargs)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
-                anchors = gather_query_anchor_points(
+                anchors, anchor_frame = gather_query_anchor_points(
                     raw,
                     scene,
                     correspondences,
                     oracle_query_anchor=oracle_query_anchor,
+                    ground_truth_query_anchor=ground_truth_query_anchor,
                 )
                 result = sparse_tracking_loss(
                     tracking_only(raw),
@@ -1000,6 +1012,7 @@ def evaluate_held_out(
                     correspondences,
                     alignment,
                     anchors,
+                    query_anchor_frame=anchor_frame,
                     huber_delta_m=huber_delta_m,
                     merge_synchronized_slots=merge_synchronized_slots,
                 )
@@ -1036,6 +1049,7 @@ def evaluate_held_out(
                         correspondences,
                         alignment,
                         anchors,
+                        query_anchor_frame=anchor_frame,
                         huber_delta_m=huber_delta_m,
                         merge_synchronized_slots=merge_synchronized_slots,
                     )
@@ -1066,6 +1080,7 @@ def evaluate_held_out(
                         alignment,
                         anchors,
                         confidence_alpha,
+                        anchor_frame=anchor_frame,
                         merge_synchronized_slots=merge_synchronized_slots,
                     )
                     # None, not 0.0, on a run with no operating point: the bundle
@@ -1111,6 +1126,10 @@ def evaluate_held_out(
         # oracle-anchored curve is an upper bound on the geometry, not a
         # measurement of the model, and must never be read against a real one.
         "oracle_query_anchor": bool(oracle_query_anchor),
+        # Its realisable sibling: ground-truth depth sampled at the anchor
+        # pixel, what MVTracker actually receives. The pair brackets what
+        # ground-truth depth would buy; neither is comparable with a real curve.
+        "ground_truth_query_anchor": bool(ground_truth_query_anchor),
         "scenes": len(per_scene),
         "position_loss": sum(losses) / len(losses) if losses else None,
         "metric_error_m": sum(errors) / len(errors) if errors else None,
@@ -1162,6 +1181,7 @@ def evaluate_held_out(
 def _prediction_arrays(
     raw, scene, correspondences, alignment, anchors, confidence_alpha,
     *,
+    anchor_frame: str = "model",
     merge_synchronized_slots: bool = False,
 ):
     """Assemble one scene's bundle in the scorers' schema.
@@ -1195,9 +1215,16 @@ def _prediction_arrays(
     resolved one). It sets the reference threshold in ``build_prediction_arrays``;
     it is not read per sample and nothing about it depends on this eval's ground
     truth.
+
+    ``anchor_frame`` is the frame half of :func:`gather_query_anchor_points`'s
+    return, mirroring the loss's ``query_anchor_frame``; both route through
+    :func:`arc.training.compose_predicted_metric`, so the writer and the loss
+    cannot compose the same anchors differently. ``"model"`` is the archived
+    default.
     """
 
     from arc.training import (
+        compose_predicted_metric,
         gather_at_correspondences,
         sparse_targets,
         sparse_targets_per_time,
@@ -1225,12 +1252,12 @@ def _prediction_arrays(
     displacement = gather_at_correspondences(
         raw["track_multi"], correspondences.to(device)
     )
-    predicted = (
-        alignment.to(device=device, dtype=torch.float32).apply_points(
-            torch.as_tensor(anchors, device=device, dtype=torch.float32)[:, None, :]
-            + displacement
-        )
-        * metric
+    predicted = compose_predicted_metric(
+        torch.as_tensor(anchors, device=device, dtype=torch.float32),
+        displacement,
+        alignment.to(device=device, dtype=torch.float32),
+        anchor_frame=anchor_frame,
+        metric_factor=metric,
     )
     target = positions * metric
 
@@ -1907,6 +1934,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--val_scenes_file, since it touches nothing else"
         ),
     )
+    evaluation.add_argument(
+        "--ground_truth_query_anchor",
+        action="store_true",
+        help=(
+            "Eval-only diagnostic: anchor every held-out track at ground-truth "
+            "depth unprojected through the ground-truth camera at the anchor "
+            "pixel -- what MVTracker actually receives -- instead of the "
+            "model's own reconstruction of it. Unlike --oracle_query_anchor, "
+            "a ceiling with no pixel quantisation or depth-map sampling, this "
+            "keeps both, so the pair brackets what ground-truth depth would "
+            "buy. Changes no gradient and is not stored in the checkpoint, so "
+            "a resume may toggle it freely; the eval's metrics.json and "
+            "run_summary.json record it. Needs --val_scenes_file and cannot "
+            "be combined with --oracle_query_anchor"
+        ),
+    )
     return parser
 
 
@@ -2046,6 +2089,23 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--oracle_query_anchor needs --val_scenes_file: the oracle anchor "
             "only ever reaches the held-out eval, so without a held-out set the "
             "flag changes nothing and would label a run it never measured"
+        )
+    # Same parse-time refusal as its sibling, same reason.
+    if args.ground_truth_query_anchor and not args.val_scenes_file:
+        raise ValueError(
+            "--ground_truth_query_anchor needs --val_scenes_file: the "
+            "ground-truth depth anchor only ever reaches the held-out eval, so "
+            "without a held-out set the flag changes nothing and would label a "
+            "run it never measured"
+        )
+    # One eval writes one curve, and each flag replaces the same anchor with a
+    # different ground-truth reading -- a curve cannot record both.
+    if args.oracle_query_anchor and args.ground_truth_query_anchor:
+        raise ValueError(
+            "--oracle_query_anchor cannot be combined with "
+            "--ground_truth_query_anchor: each replaces the query anchor with "
+            "a different ground-truth reading and the eval writes one curve; "
+            "drop one of the two flags"
         )
 
     anchor_slots = parse_query_anchor_slots(args.query_anchors)
@@ -2218,6 +2278,10 @@ def _plan_summary(tally, args) -> dict:
             # oracle-anchored curve is an upper bound on the geometry, not a
             # measurement of the model, so it is not comparable with a real one.
             "oracle_query_anchor": bool(args.oracle_query_anchor),
+            # Its realisable sibling: ground-truth depth at the anchor pixel,
+            # what MVTracker actually receives. Also not comparable with a
+            # real curve; the pair brackets what ground-truth depth would buy.
+            "ground_truth_query_anchor": bool(args.ground_truth_query_anchor),
             "confidence_alpha": args.confidence_alpha,
             # What alpha the run actually trained under, as opposed to what was
             # asked for: None under 'auto' until a step resolves it, which is why
@@ -2790,6 +2854,7 @@ def run_training(
                 confidence_alpha=args.resolved_confidence_alpha,
                 merge_synchronized_slots=args.merge_synchronized_slots,
                 oracle_query_anchor=args.oracle_query_anchor,
+                ground_truth_query_anchor=args.ground_truth_query_anchor,
             )
             evaluations.append(metrics)
             print(

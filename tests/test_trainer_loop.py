@@ -290,6 +290,9 @@ def _loop_args(tmp_path, **overrides):
         # it into evaluate_held_out, so every loop test needs it present. Off is
         # the parser's default and the behaviour every existing test assumes.
         oracle_query_anchor=False,
+        # Its realisable sibling, same eval-only / non-resume shape; off is
+        # the parser's default and the behaviour every existing test assumes.
+        ground_truth_query_anchor=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1311,12 +1314,23 @@ def test_the_headroom_guard_is_inert_without_cuda_and_names_the_step_with_it(mon
 # ------------------------------------------------------ the eval, end to end ---
 
 
-def _cpu_eval_scene(tmp_path, monkeypatch):
-    """A real two-camera window plus identity alignment, ready for the eval.
+def _cpu_eval_scene(tmp_path, monkeypatch, *, gauge="identity"):
+    """A real two-camera window plus a planted alignment, ready for the eval.
 
     Two cameras is required rather than tidy: at one camera
     ``shuffled_index_views`` returns ``None`` early and the index-advantage arm
     never runs, which is where one of the two bugs this test exists for lives.
+
+    ``gauge`` plants the fitted alignment. ``"identity"`` hands fit_scene_sim3
+    the scene's own metric pointmap so the fit is exact and archived numerics
+    stand -- every pre-existing caller. ``"scaled"`` plants the exact
+    similarity preimage under scale 2.25, a 25-degree rotation about z and
+    translation (0.3, -0.2, 1.1), so the fit recovers that gauge essentially
+    exactly. Scale AND rotation AND translation are all non-trivial on
+    purpose: apply_points and apply_vectors differ only by the translation
+    term, so a t=0 gauge cannot discriminate the points-vs-vectors half of a
+    composition bug. 2.25 discriminates; it is not representative of the live
+    regime, whose fitted scale medians 18.94 (range 6.87-39.02).
     """
 
     import arc.training.sparse_tracking as sparse_module
@@ -1330,8 +1344,23 @@ def _cpu_eval_scene(tmp_path, monkeypatch):
     target, _ = sparse_module._metric_pointmap_at_anchor(
         scene, scene.query_observation_slot
     )
-    pointmaps = torch.from_numpy(target).float().expand(
-        1, scene.num_observations, *target.shape
+    if gauge == "identity":
+        source = target
+    elif gauge == "scaled":
+        angle = np.deg2rad(25.0)
+        rotation = np.array(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0],
+                [np.sin(angle), np.cos(angle), 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        source = ((target - np.array([0.3, -0.2, 1.1])) @ rotation) / 2.25
+    else:
+        raise ValueError(f"gauge must be 'identity' or 'scaled', got {gauge!r}")
+    pointmaps = torch.from_numpy(source).float().expand(
+        1, scene.num_observations, *source.shape
     ).contiguous()
     monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
     return scene
@@ -1431,16 +1460,21 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     assert loaded["gt_vis_any"].shape[0] == 4
 
 
-def test_evaluate_held_out_threads_the_oracle_anchor(tmp_path, monkeypatch):
-    """The flag reaches the eval's gather and never train_step's.
+@pytest.mark.parametrize(
+    "flag", ("oracle_query_anchor", "ground_truth_query_anchor")
+)
+def test_evaluate_held_out_threads_the_anchor_diagnostics(
+    tmp_path, monkeypatch, flag
+):
+    """Each flag reaches the eval's gather and never train_step's.
 
     Both functions import ``gather_query_anchor_points`` from the package at
     call time, so the package namespace is the one interception point -- the
     same seam the sync-weight recorder uses. The eval is asserted on its
-    recorded kwarg AND on the marker it writes, because the marker is what a
-    later reader has; train_step is asserted on the kwarg's absence, since a
-    step that so much as spelled it would be one keystroke from supervising
-    against the oracle.
+    recorded kwargs AND on the marker it writes, because the marker is what a
+    later reader has; train_step is asserted on both kwargs' absence, since a
+    step that so much as spelled one would be one keystroke from supervising
+    against ground truth.
     """
 
     import arc.training as training_package
@@ -1459,6 +1493,11 @@ def test_evaluate_held_out_threads_the_oracle_anchor(tmp_path, monkeypatch):
     model = _FakeArc(scene.num_observations, height, width)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
 
+    other = (
+        "ground_truth_query_anchor"
+        if flag == "oracle_query_anchor"
+        else "oracle_query_anchor"
+    )
     for step, enabled in ((1, True), (2, False)):
         metrics = train_cli.evaluate_held_out(
             model=model,
@@ -1470,16 +1509,24 @@ def test_evaluate_held_out_threads_the_oracle_anchor(tmp_path, monkeypatch):
             output_dir=tmp_path / "out",
             query_anchors=["0:0"],
             confidence_alpha=_EVAL_ALPHA,
-            oracle_query_anchor=enabled,
+            **{flag: enabled},
         )
-        # One gather per scene: both arms and the writer reuse its result.
+        # One gather per scene: both arms and the writer reuse its result. The
+        # eval's one call site always spells both kwargs; the flag picks values.
         assert len(seen) == step
-        assert seen[-1] == {"oracle_query_anchor": enabled}
-        assert metrics["oracle_query_anchor"] is enabled
+        assert seen[-1] == {
+            "oracle_query_anchor": flag == "oracle_query_anchor" and enabled,
+            "ground_truth_query_anchor": (
+                flag == "ground_truth_query_anchor" and enabled
+            ),
+        }
+        assert metrics[flag] is enabled
+        assert metrics[other] is False
         written = json.loads(
             (tmp_path / "out" / "eval" / f"step-{step}" / "metrics.json").read_text()
         )
-        assert written["oracle_query_anchor"] is enabled
+        assert written[flag] is enabled
+        assert written[other] is False
 
     # A separate root: _write_scene refuses to overwrite the eval's dump.
     step_scene = _step_scene(tmp_path / "step", monkeypatch)
@@ -1509,22 +1556,32 @@ def test_evaluate_held_out_threads_the_oracle_anchor(tmp_path, monkeypatch):
     assert len(seen) == 3
     # No such keyword at all: the step's call site is verbatim.
     assert "oracle_query_anchor" not in seen[-1]
+    assert "ground_truth_query_anchor" not in seen[-1]
 
 
+@pytest.mark.parametrize("gauge", ("identity", "scaled"))
 @pytest.mark.parametrize("merge", (False, True))
-def test_the_oracle_anchor_moves_only_the_predicted_track(tmp_path, monkeypatch, merge):
+def test_the_oracle_anchor_moves_only_the_predicted_track(
+    tmp_path, monkeypatch, merge, gauge
+):
     """Only ``pred`` moves, and by exactly the anchor's own error.
 
     The same displacement field re-anchored at ground truth shifts every
-    timestep of a track by alignment(gt - predicted anchor); the bundle's other
-    arrays -- ``query_points`` above all, which was ground truth already -- are
-    byte-identical. Two mechanisms carry the delta through the writer, one per
-    parametrization, and they are NOT the same one: on the per-slot path
-    ``_prediction_arrays`` fuses each time's cameras by a confidence-weighted
-    mean, and the delta is constant across a query's cameras, so a normalised
-    weighted mean of it is the delta itself; under the merge there is no fusion
-    at all -- the transpose branch passes the merged head's single per-time
-    row straight through, so the delta arrives unweighted.
+    timestep of a track by gt - alignment(predicted anchor): the corrected
+    composition carries only the model-gauge displacement through the Sim(3),
+    so the displacement cancels between the arms and what remains is the
+    anchor's own error, measured in the world frame.  The archived
+    apply_vectors(gt - anchor) spelling equals this only when gt is a fixed
+    point of the Sim(3) -- the scaled gauge parametrization is where the two
+    part, by O(|gt|).  The bundle's other arrays -- ``query_points`` above
+    all, which was ground truth already -- are byte-identical.  Two mechanisms
+    carry the delta through the writer, one per merge parametrization, and
+    they are NOT the same one: on the per-slot path ``_prediction_arrays``
+    fuses each time's cameras by a confidence-weighted mean, and the delta is
+    constant across a query's cameras, so a normalised weighted mean of it is
+    the delta itself; under the merge there is no fusion at all -- the
+    transpose branch passes the merged head's single per-time row straight
+    through, so the delta arrives unweighted.
     """
 
     from arc.training import (
@@ -1533,7 +1590,7 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(tmp_path, monkeypatch,
         gather_query_anchor_points,
     )
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(tmp_path, monkeypatch, gauge=gauge)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(
         scene.num_observations, height, width, views_per_time=2 if merge else 1
@@ -1564,12 +1621,18 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(tmp_path, monkeypatch,
     # predicted gather exactly as the eval's own raw output did.
     correspondences, _ = build_anchor_correspondences(scene)
     alignment, _ = fit_scene_sim3({}, scene)
-    predicted_anchor = gather_query_anchor_points({}, scene, correspondences)
+    predicted_anchor, predicted_frame = gather_query_anchor_points(
+        {}, scene, correspondences
+    )
+    assert predicted_frame == "model"
+    if gauge == "scaled":
+        # Non-identity on purpose: the fitted gauge is the planted similarity.
+        assert alignment.scale.item() == pytest.approx(2.25, rel=1e-4)
     ground_truth = scene.trajectories_world[
         correspondences.query_times, correspondences.trajectory_indices
     ]
     expected = (
-        alignment.apply_vectors(ground_truth - predicted_anchor)
+        (ground_truth - alignment.apply_points(predicted_anchor))
         * float(scene.track_upscaling_factor)
     ).numpy()
 
@@ -1580,11 +1643,81 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(tmp_path, monkeypatch,
         on["pred"] - off["pred"],
         # Every timestep shifts by the same per-query delta.
         np.broadcast_to(expected[None], on["pred"].shape),
-        atol=1e-5,
+        # The scaled leg's off arm rides a 2.25-scale round trip in fp32.
+        atol=1e-5 if gauge == "identity" else 1e-4,
     )
     for key in PREDICTION_KEYS:
         if key != "pred":
             assert np.array_equal(on[key], off[key]), key
+
+
+def test_the_ground_truth_anchor_matches_an_exact_reconstruction(
+    tmp_path, monkeypatch
+):
+    """gt-anchored equals off when the reconstruction is exact; oracle differs.
+
+    The scaled fixture's pointmaps are the exact gauge image of the anchor's
+    GT-depth unprojection, so the off curve's anchor contribution
+    apply_points(pointmap[row, col]) IS the pixel's unprojection up to the
+    fit residual, and the gt-anchor curve plants that unprojection directly;
+    both arms then add the same transformed displacement.  The oracle curve
+    stays away by the pixel quantisation, which proves the gt-equals-off
+    identity is geometric and not the flag failing to reach the writer.  At
+    scale 2.25 the pre-fix composition would push the world-frame gt anchor
+    through apply_points and land scene magnitudes from the off curve.
+    """
+
+    scene = _cpu_eval_scene(tmp_path, monkeypatch, gauge="scaled")
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(scene.num_observations, height, width)
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    bundles = {}
+    metrics = {}
+    for step, kwargs in (
+        (1, {}),
+        (2, {"ground_truth_query_anchor": True}),
+        (3, {"oracle_query_anchor": True}),
+    ):
+        metrics[step] = train_cli.evaluate_held_out(
+            model=model,
+            plans=[plan],
+            scene_provider=lambda _plan: scene,
+            precision="32",
+            huber_delta_m=0.05,
+            step=step,
+            output_dir=tmp_path / "out",
+            query_anchors=["0:0"],
+            confidence_alpha=_EVAL_ALPHA,
+            **kwargs,
+        )
+        bundles[step] = dict(
+            np.load(tmp_path / "out" / "eval" / f"step-{step}" / "pred" / "0000.npz")
+        )
+    off, gt, oracle = bundles[1], bundles[2], bundles[3]
+
+    np.testing.assert_allclose(gt["pred"], off["pred"], atol=1e-4)
+    assert not np.allclose(oracle["pred"], off["pred"], atol=1e-4)
+    for key in PREDICTION_KEYS:
+        if key != "pred":
+            assert np.array_equal(gt[key], off[key]), key
+            assert np.array_equal(oracle[key], off[key]), key
+
+    # The bundle rides _prediction_arrays' anchor_frame; these two ride the
+    # loss calls' query_anchor_frame, one per eval arm. metric_error_m reduces
+    # over the main arm alone and position_loss_shuffled is all the shuffled
+    # arm feeds, so neither assertion covers the other. Not an equality: fp32
+    # leaves a residual up to ~4e-6 at these magnitudes, and 1e-4 keeps an
+    # order of magnitude of headroom.
+    off_metrics, gt_metrics = metrics[1], metrics[2]
+    assert abs(gt_metrics["metric_error_m"] - off_metrics["metric_error_m"]) < 1e-4
+    assert (
+        abs(
+            gt_metrics["position_loss_shuffled"]
+            - off_metrics["position_loss_shuffled"]
+        )
+        < 1e-4
+    )
 
 
 def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkeypatch):
@@ -1978,6 +2111,47 @@ def test_the_oracle_anchor_needs_a_held_out_set(tmp_path):
     train_cli._validate_args(args)
 
 
+def test_the_ground_truth_anchor_needs_a_held_out_set(tmp_path):
+    """Same guard as its sibling: the flag touches only the held-out eval, so
+    without a held-out set it is silently inert while run_summary.json would
+    still file the run as ground-truth-anchored."""
+
+    args = _validator_args(tmp_path, ground_truth_query_anchor=True)
+
+    with pytest.raises(
+        ValueError, match="--ground_truth_query_anchor needs --val_scenes_file"
+    ):
+        train_cli._validate_args(args)
+
+    args.val_scenes_file = "val.json"
+    args.val_data_root = "/held/out/dir"
+    train_cli._validate_args(args)
+
+
+def test_the_anchor_diagnostics_are_refused_together_at_parse_time(tmp_path):
+    """One eval writes one curve, and a curve cannot be anchored two ways."""
+
+    args = _validator_args(
+        tmp_path,
+        oracle_query_anchor=True,
+        ground_truth_query_anchor=True,
+        val_scenes_file="val.json",
+        val_data_root="/held/out/dir",
+    )
+    with pytest.raises(ValueError, match="cannot be combined with"):
+        train_cli._validate_args(args)
+
+    for flag in ("oracle_query_anchor", "ground_truth_query_anchor"):
+        train_cli._validate_args(
+            _validator_args(
+                tmp_path,
+                val_scenes_file="val.json",
+                val_data_root="/held/out/dir",
+                **{flag: True},
+            )
+        )
+
+
 def test_the_depth_clip_defaults_to_the_paired_runs_value_and_is_a_float():
     """The flag exists so the mirrored value is visible, not buried in a dict.
 
@@ -2293,13 +2467,14 @@ def _combined_reference_loss(reference, scene):
     correspondences, _ = build_anchor_correspondences(scene)
     raw = reference(scene.views, force_no_output_conversion=True)
     alignment, _ = fit_scene_sim3(raw, scene)
-    anchors = gather_query_anchor_points(raw, scene, correspondences)
+    anchors, anchor_frame = gather_query_anchor_points(raw, scene, correspondences)
     return sparse_tracking_loss(
         tracking_only(raw),
         scene,
         correspondences,
         alignment,
         anchors,
+        query_anchor_frame=anchor_frame,
         huber_delta_m=0.05,
         collect_diagnostics=False,
     )
@@ -2754,7 +2929,9 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
     counts = anchor_sample_counts(scene, correspondences, 2)
     images, feats, recon = encode_and_reconstruct(reference, scene.views)
     reference_alignment, _ = fit_scene_sim3(recon, scene)
-    anchor_points = gather_query_anchor_points(recon, scene, correspondences)
+    anchor_points, anchor_frame = gather_query_anchor_points(
+        recon, scene, correspondences
+    )
     expected_loss = None
     for anchor_index in range(2):
         raw = anchor_tracks(reference, feats, images, scene, anchor_index)
@@ -2764,6 +2941,7 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
             correspondences.select_query_slot(anchor_index),
             reference_alignment,
             anchor_points[correspondences.anchor_rows(anchor_index)],
+            query_anchor_frame=anchor_frame,
             huber_delta_m=0.05,
             collect_diagnostics=False,
         )
@@ -3559,6 +3737,27 @@ def test_the_oracle_anchor_is_not_a_resume_setting(tmp_path):
     )
 
 
+def test_the_ground_truth_anchor_is_not_a_resume_setting(tmp_path):
+    """Same shape as its sibling: eval-only and gradient-free, so it defines
+    no stream -- stored nowhere in the checkpoint, compared by neither tier,
+    absent from the absent-defaults map.  A segment may switch it on to price
+    a checkpoint and off again to train."""
+
+    stored = train_cli._checkpoint_settings(
+        _loop_args(tmp_path, ground_truth_query_anchor=True)
+    )
+    assert "ground_truth_query_anchor" not in stored
+    assert "ground_truth_query_anchor" not in train_cli._RESUME_SETTINGS_REFUSED
+    assert "ground_truth_query_anchor" not in train_cli._RESUME_SETTINGS_WARNED
+    assert (
+        "ground_truth_query_anchor"
+        not in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS
+    )
+    train_cli.check_resume_settings(
+        stored, _loop_args(tmp_path, ground_truth_query_anchor=False)
+    )
+
+
 def test_a_resume_that_changes_a_loss_weight_is_refused(tmp_path):
     """A segment that changes the objective and keeps counting steps reports one
     curve over two of them -- and the reported `loss` stays the position-only
@@ -3722,6 +3921,26 @@ def test_the_oracle_anchor_is_recorded_in_the_plan_summary_settings(tmp_path):
         )
         settings = train_cli._plan_summary(tally, args)["settings"]
         assert settings["oracle_query_anchor"] is enabled
+
+
+def test_the_ground_truth_anchor_is_recorded_in_the_plan_summary_settings(tmp_path):
+    """A ground-truth-anchored curve is one side of the geometry bracket, not
+    a measurement of the model, so an archived summary must say which it is."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    for enabled in (False, True):
+        args = _validator_args(
+            tmp_path, manifest="m.jsonl", ground_truth_query_anchor=enabled
+        )
+        settings = train_cli._plan_summary(tally, args)["settings"]
+        assert settings["ground_truth_query_anchor"] is enabled
 
 
 def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):

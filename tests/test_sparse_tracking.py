@@ -25,6 +25,7 @@ from arc.training import (
     adjacent_pair_indices,
     SparseTrackingLossResult,
     build_anchor_correspondences,
+    compose_predicted_metric,
     fit_scene_sim3,
     gather_query_anchor_points,
     load_dumped_kubric_scene,
@@ -1569,7 +1570,7 @@ def test_query_anchor_gather_follows_the_observation_slot(tmp_path):
     original = module._predicted_pointmaps
     try:
         module._predicted_pointmaps = lambda raw: pointmaps
-        anchors = gather_query_anchor_points(
+        anchors, anchor_frame = gather_query_anchor_points(
             {"track_query_idx": scene.track_query_observation_slots},
             scene,
             correspondences,
@@ -1579,6 +1580,7 @@ def test_query_anchor_gather_follows_the_observation_slot(tmp_path):
 
     expected_value = float(scene.query_observation_slot + 1)
     assert torch.allclose(anchors, torch.full_like(anchors, expected_value))
+    assert anchor_frame == "model"
 
 
 def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
@@ -2052,7 +2054,7 @@ def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch
     monkeypatch.setattr(
         overfit_cli,
         "gather_query_anchor_points",
-        lambda raw, scene, correspondences: refit_anchors,
+        lambda raw, scene, correspondences: (refit_anchors, "model"),
     )
     monkeypatch.setattr(
         overfit_cli,
@@ -2400,7 +2402,7 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
         "track_query_idx": dumped_scene.track_query_observation_slots,
     }
 
-    anchors = gather_query_anchor_points(
+    anchors, anchor_frame = gather_query_anchor_points(
         raw,
         dumped_scene,
         correspondences,
@@ -2414,12 +2416,13 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
     ]
     torch.testing.assert_close(anchors, expected)
     assert not anchors.requires_grad
+    assert anchor_frame == "model"
     # The anchor gather reads reconstruction only -- depth and pose_enc -- so
     # one shared forward serves every anchor. It indexes by the adapter's anchor
     # list, never by a forward's track_query_idx, which is why a dict carrying
     # no track queries at all still works.
     torch.testing.assert_close(
-        gather_query_anchor_points({}, dumped_scene, correspondences),
+        gather_query_anchor_points({}, dumped_scene, correspondences)[0],
         expected,
     )
     stray = SparseCorrespondences(
@@ -2453,7 +2456,7 @@ def test_the_oracle_anchor_returns_the_ground_truth_query_positions(tmp_path):
     correspondences, _ = build_anchor_correspondences(scene)
     assert correspondences.count == 3
 
-    anchors = gather_query_anchor_points(
+    anchors, frame = gather_query_anchor_points(
         {}, scene, correspondences, oracle_query_anchor=True
     )
 
@@ -2463,6 +2466,7 @@ def test_the_oracle_anchor_returns_the_ground_truth_query_positions(tmp_path):
     assert torch.equal(anchors, expected)
     assert anchors.shape == (correspondences.count, 3)
     assert anchors.dtype == torch.float32
+    assert frame == "world"
     assert anchors.device == scene.trajectories_world.device
     assert not anchors.requires_grad
     # Not the time-0 positions: the query time selected the row.
@@ -2485,7 +2489,7 @@ def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
     with pytest.raises(KeyError, match="missing alignment fields"):
         gather_query_anchor_points({}, dumped_scene, correspondences)
 
-    anchors = gather_query_anchor_points(
+    anchors, frame = gather_query_anchor_points(
         {}, dumped_scene, correspondences, oracle_query_anchor=True
     )
     assert torch.equal(
@@ -2494,6 +2498,7 @@ def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
             correspondences.query_times, correspondences.trajectory_indices
         ],
     )
+    assert frame == "world"
 
     stray = SparseCorrespondences(
         trajectory_indices=correspondences.trajectory_indices,
@@ -2509,11 +2514,13 @@ def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
 def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
     """Off, and off by default, is the predicted path unchanged.
 
-    The bare call and an explicit ``oracle_query_anchor=False`` both return the
-    pointmap gather at the query pixels -- the snapshot the test above pins.
-    The parameter is keyword-only with a False default, which is what keeps the
-    overfit's three positional call sites and ``train_step``'s byte-identical
-    without touching them.
+    The bare call, an explicit ``oracle_query_anchor=False`` and an explicit
+    ``ground_truth_query_anchor=False`` all return ``(points, frame)`` with
+    the pointmap gather at the query pixels and frame ``"model"`` -- the
+    snapshot the test above pins.  Both parameters are keyword-only with a
+    False default, which is what keeps the overfit's three positional call
+    sites and ``train_step``'s numerics byte-identical: their calls stay
+    bare, and only the mechanical tuple unpack changed.
     """
 
     import inspect
@@ -2528,21 +2535,253 @@ def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
     raw = {"track_query_idx": dumped_scene.track_query_observation_slots}
     snapshot = pointmaps[0, 0, correspondences.rows, correspondences.columns]
 
-    assert torch.equal(
-        gather_query_anchor_points(raw, dumped_scene, correspondences), snapshot
+    bare = gather_query_anchor_points(raw, dumped_scene, correspondences)
+    assert torch.equal(bare[0], snapshot) and bare[1] == "model"
+    for kwargs in (
+        {"oracle_query_anchor": False},
+        {"ground_truth_query_anchor": False},
+    ):
+        points, frame = gather_query_anchor_points(
+            raw, dumped_scene, correspondences, **kwargs
+        )
+        assert torch.equal(points, snapshot) and frame == "model"
+
+    for name in ("oracle_query_anchor", "ground_truth_query_anchor"):
+        parameter = inspect.signature(gather_query_anchor_points).parameters[name]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is False
+
+
+def test_a_world_frame_anchor_is_composed_in_world_not_double_transformed(
+    dumped_scene, monkeypatch
+):
+    """The geometric test that would have caught the double transform.
+
+    The planted pointmaps are the exact similarity preimage of the anchor's
+    metric pointmap, so the fitted gauge is known and far from identity
+    (scale 2.25, rotation and translation both nonzero), and the model-gauge
+    anchors and the oracle anchors describe the same physical points up to a
+    deliberate 2 cm perturbation.  The displacement field is exact in the
+    model gauge, so the world-frame arm must cancel to zero while the
+    predicted arm carries exactly the perturbation's image, scale * |eps| *
+    tuf.  Under the pre-fix composition the world arm computed
+    apply_points(gt + d), off by |s*R*gt + t - gt| * tuf -- scene magnitudes
+    rather than centimetres; at the identity gauge every older fixture
+    planted, the two compositions coincide, which is why the bug survived.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    dumped_scene.track_upscaling_factor = 2.5
+
+    target, _ = sparse_module._metric_pointmap_at_anchor(dumped_scene, 0)
+    angle = np.deg2rad(25.0)
+    rotation = np.array(
+        [
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
     )
-    assert torch.equal(
-        gather_query_anchor_points(
-            raw, dumped_scene, correspondences, oracle_query_anchor=False
-        ),
-        snapshot,
+    source = ((target - np.array([0.3, -0.2, 1.1])) @ rotation) / 2.25
+    pointmaps = torch.zeros(
+        1, dumped_scene.num_observations, target.shape[0], target.shape[1], 3
+    )
+    pointmaps[0, 0] = torch.from_numpy(source).float()
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+    raw_fit = {
+        "depth_conf": torch.ones(
+            1, dumped_scene.num_observations, target.shape[0], target.shape[1]
+        )
+    }
+    alignment, _ = fit_scene_sim3(raw_fit, dumped_scene, confidence_percentile=0)
+    assert alignment.scale.item() == pytest.approx(2.25, rel=1e-4)
+
+    oracle_anchors, oracle_frame = gather_query_anchor_points(
+        {}, dumped_scene, correspondences, oracle_query_anchor=True
+    )
+    assert oracle_frame == "world"
+    # The same physical points in the model gauge, plus a deliberate error so
+    # "oracle strictly closer" cannot pass as a tie.
+    eps = torch.full((correspondences.count, 3), 0.02)
+    model_anchors = (
+        (oracle_anchors - alignment.translation) @ alignment.rotation
+    ) / alignment.scale + eps
+
+    height, width = dumped_scene.views[0]["img"].shape[-2:]
+    tracks = torch.zeros(1, 1, dumped_scene.num_observations, height, width, 3)
+    for item, trajectory_index in enumerate(
+        correspondences.trajectory_indices.tolist()
+    ):
+        row = int(correspondences.rows[item])
+        column = int(correspondences.columns[item])
+        query_time = int(correspondences.query_times[item])
+        for slot, original_time in enumerate(dumped_scene.slot_times.tolist()):
+            motion = (
+                dumped_scene.trajectories_world[original_time, trajectory_index]
+                - dumped_scene.trajectories_world[query_time, trajectory_index]
+            )
+            # apply_vectors of this is exactly the ground-truth world motion.
+            tracks[0, 0, slot, row, column] = (
+                motion @ alignment.rotation
+            ) / alignment.scale
+    raw = {
+        "track_multi": tracks,
+        "track_query_idx": dumped_scene.track_query_observation_slots,
+    }
+
+    predicted = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        alignment,
+        model_anchors,
+        query_anchor_frame="model",
+    )
+    oracle = sparse_tracking_loss(
+        raw,
+        dumped_scene,
+        correspondences,
+        alignment,
+        oracle_anchors,
+        query_anchor_frame="world",
     )
 
-    parameter = inspect.signature(gather_query_anchor_points).parameters[
-        "oracle_query_anchor"
-    ]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default is False
+    # Every predicted-arm sample is off by exactly the perturbation's image,
+    # scale * |eps| * tuf (a rotation preserves the norm), identical for
+    # every sample, so the masked mean equals it whatever the mask.
+    expected_error = (
+        float(alignment.scale.item())
+        * float(torch.linalg.vector_norm(eps[0]))
+        * float(dumped_scene.track_upscaling_factor)
+    )
+    assert predicted.metric_error.item() == pytest.approx(expected_error, rel=1e-3)
+    assert oracle.metric_error.item() < 1e-4
+    assert oracle.metric_error.item() < predicted.metric_error.item()
+
+    with pytest.raises(ValueError, match="anchor_frame must be"):
+        compose_predicted_metric(
+            oracle_anchors,
+            torch.zeros_like(oracle_anchors)[:, None, :],
+            alignment,
+            anchor_frame="stored",
+            metric_factor=1.0,
+        )
+
+
+def test_the_ground_truth_anchor_unprojects_the_anchor_depth(tmp_path):
+    """--ground_truth_query_anchor is the pixel's GT-depth unprojection.
+
+    Two anchors on purpose -- track 1 is invisible to camera 0 at t=0, so
+    the correspondences span two distinct anchor slots and the per-slot loop
+    is load-bearing: an all-S materialisation with wrong slot bookkeeping,
+    a slot-0-for-everything gather, or a second unprojection all change the
+    camera-1 row's exact value.  The empty raw dict proves no prediction is
+    read.  Against the oracle the pair differs (pixel quantisation is real),
+    but the along-ray half of the difference is bounded by the very
+    depth_error_m that anchor_depth_gate admitted -- the gathered anchor
+    sits on the rounded pixel's ray with camera-z equal to the depth map's
+    value there; nothing is claimed about the lateral component.
+    """
+
+    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
+    scene = load_dumped_kubric_scene(
+        tmp_path,
+        "0000",
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        query_anchors=((0, 0), (1, 0)),
+        size=56,
+    )
+    correspondences, _ = build_anchor_correspondences(scene)
+    assert correspondences.count == 3
+    anchor_slots = scene.track_query_observation_slots[correspondences.query_slots]
+    assert len(set(anchor_slots.tolist())) == 2
+
+    anchors, frame = gather_query_anchor_points(
+        {}, scene, correspondences, ground_truth_query_anchor=True
+    )
+    oracle, oracle_frame = gather_query_anchor_points(
+        {}, scene, correspondences, oracle_query_anchor=True
+    )
+
+    assert frame == "world" and oracle_frame == "world"
+    assert anchors.shape == (3, 3)
+    assert anchors.dtype == torch.float32
+    assert anchors.device.type == "cpu"
+    assert not anchors.requires_grad
+    for item in range(correspondences.count):
+        slot = int(anchor_slots[item])
+        world_points, _ = sparse_module._metric_pointmap_at_anchor(scene, slot)
+        expected = torch.from_numpy(
+            world_points[
+                int(correspondences.rows[item]), int(correspondences.columns[item])
+            ]
+        ).to(torch.float32)
+        assert torch.equal(anchors[item], expected)
+
+    assert not torch.equal(anchors, oracle)
+    # 0.10 m is anchor_depth_tolerance_m; the eligibility comparison's own
+    # 1e-5 slack is in STORED units, so it scales with tuf.
+    tuf = float(scene.track_upscaling_factor)
+    for item in range(correspondences.count):
+        slot = int(anchor_slots[item])
+        observation = scene.observations[slot]
+        world_to_camera = scene.extrinsics_world_to_camera[
+            observation.camera, observation.original_time
+        ].double()
+
+        def camera_z(point):
+            return float(
+                (world_to_camera[:3, :3] @ point.double() + world_to_camera[:3, 3])[2]
+            )
+
+        assert (
+            abs(camera_z(anchors[item]) - camera_z(oracle[item])) * tuf
+            <= 0.10 + 1e-5 * tuf
+        )
+
+
+def test_the_ground_truth_anchor_refuses_an_invalid_depth_pixel(
+    dumped_scene, monkeypatch
+):
+    """Raise, never drop: a dropped row would shrink the correspondence set
+    out from under the comparison curve.  Eligibility gated on this same
+    depth map, so an invalid pixel here means the correspondences do not
+    belong to this scene."""
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    real = sparse_module._metric_pointmap_at_anchor
+
+    def invalidating(scene, slot):
+        world_points, valid = real(scene, slot)
+        valid = valid.copy()
+        valid[int(correspondences.rows[0]), int(correspondences.columns[0])] = False
+        return world_points, valid
+
+    monkeypatch.setattr(sparse_module, "_metric_pointmap_at_anchor", invalidating)
+
+    with pytest.raises(ValueError, match="anchor_depth_gate"):
+        gather_query_anchor_points(
+            {}, dumped_scene, correspondences, ground_truth_query_anchor=True
+        )
+
+
+def test_the_anchor_diagnostics_are_refused_together(dumped_scene):
+    """Each flag replaces the same anchor with a different ground-truth
+    reading; the raise inside the gather covers callers that bypass the
+    trainer's parse-time refusal."""
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        gather_query_anchor_points(
+            {},
+            dumped_scene,
+            correspondences,
+            oracle_query_anchor=True,
+            ground_truth_query_anchor=True,
+        )
 
 
 def test_sparse_loss_rejects_queries_that_are_not_declared_anchors(dumped_scene):
@@ -3881,7 +4120,7 @@ def test_evaluate_scores_the_shuffled_arm_against_the_initial_references(
     monkeypatch.setattr(
         overfit_cli,
         "gather_query_anchor_points",
-        lambda raw, scene, correspondences: torch.zeros(3, 3),
+        lambda raw, scene, correspondences: (torch.zeros(3, 3), "model"),
     )
     monkeypatch.setattr(
         overfit_cli,

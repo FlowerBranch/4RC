@@ -699,6 +699,7 @@ def _evaluate(
     confidence_weight=0.0,
     confidence_alpha=None,
     *,
+    initial_query_anchor_frame="model",
     sync_weight=0.0,
     velocity_weight=0.0,
     sync_metric_scale,
@@ -725,7 +726,7 @@ def _evaluate(
     with torch.no_grad(), _autocast_context(precision):
         raw = model(scene.views, force_no_output_conversion=True)
         alignment, alignment_report = fit_scene_sim3(raw, scene)
-        query_anchors = gather_query_anchor_points(
+        query_anchors, query_anchor_frame = gather_query_anchor_points(
             raw,
             scene,
             correspondences,
@@ -744,6 +745,7 @@ def _evaluate(
             correspondences,
             alignment,
             query_anchors,
+            query_anchor_frame=query_anchor_frame,
             huber_delta_m=huber_delta_m,
             confidence_weight=confidence_weight,
             confidence_alpha=confidence_alpha,
@@ -756,6 +758,7 @@ def _evaluate(
             correspondences,
             initial_alignment,
             initial_query_anchors,
+            query_anchor_frame=initial_query_anchor_frame,
             huber_delta_m=huber_delta_m,
             confidence_weight=confidence_weight,
             confidence_alpha=confidence_alpha,
@@ -772,6 +775,7 @@ def _evaluate(
                 correspondences,
                 initial_alignment,
                 initial_query_anchors,
+                query_anchor_frame=initial_query_anchor_frame,
                 huber_delta_m=huber_delta_m,
             )
             shuffled_loss = float(shuffled_result.loss.item())
@@ -1111,7 +1115,7 @@ def main() -> None:
         f"{anchor_sample_counts} (total {total_anchor_samples}); "
         f"active_anchors={len(active_anchors)}/{anchor_count}"
     )
-    initial_query_anchors = gather_query_anchor_points(
+    initial_query_anchors, initial_query_anchor_frame = gather_query_anchor_points(
         baseline_raw,
         scene,
         correspondences,
@@ -1127,6 +1131,7 @@ def main() -> None:
         correspondences,
         initial_alignment,
         initial_query_anchors,
+        query_anchor_frame=initial_query_anchor_frame,
         huber_delta_m=args.huber_delta_m,
         confidence_weight=args.confidence_weight,
         confidence_alpha=requested_alpha,
@@ -1226,6 +1231,7 @@ def main() -> None:
         correspondences,
         initial_alignment,
         initial_query_anchors,
+        query_anchor_frame=initial_query_anchor_frame,
         huber_delta_m=args.huber_delta_m,
         confidence_weight=args.confidence_weight,
         confidence_alpha=confidence_alpha,
@@ -1299,7 +1305,7 @@ def main() -> None:
         with _autocast_context(args.precision):
             images, feats, recon = _encode_and_reconstruct(model, scene.views)
             alignment, alignment_report = fit_scene_sim3(recon, scene)
-            query_anchors = gather_query_anchor_points(
+            query_anchors, query_anchor_frame = gather_query_anchor_points(
                 recon,
                 scene,
                 correspondences,
@@ -1342,6 +1348,7 @@ def main() -> None:
                     query_anchors[
                         per_anchor_rows[anchor_index].to(query_anchors.device)
                     ],
+                    query_anchor_frame=query_anchor_frame,
                     huber_delta_m=args.huber_delta_m,
                     confidence_weight=args.confidence_weight,
                     confidence_alpha=confidence_alpha,
@@ -1492,6 +1499,7 @@ def main() -> None:
         args.huber_delta_m,
         initial_alignment,
         initial_query_anchors,
+        initial_query_anchor_frame=initial_query_anchor_frame,
         confidence_weight=args.confidence_weight,
         confidence_alpha=confidence_alpha,
         sync_weight=args.sync_weight,
