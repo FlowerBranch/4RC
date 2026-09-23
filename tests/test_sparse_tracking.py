@@ -5478,7 +5478,14 @@ class _SummaryPathArc(Arc):
         )
         return report
 
-    def encode_features(self, images, ref_view_strategy="first", time_indices=None):
+    def encode_features(
+        self,
+        images,
+        ref_view_strategy="first",
+        time_indices=None,
+        depth_maps=None,
+        camera_vectors=None,
+    ):
         # Every trainable tensor must take gradient or main()'s own guards fire.
         return [
             self.motion_decoder.weight.sum()
@@ -5511,7 +5518,7 @@ class _SummaryPathArc(Arc):
         return track, confidence
 
     def forward(self, views, force_no_output_conversion=False):
-        images, track_query_idx, time_indices = self._preprocess_input(views)
+        images, track_query_idx, time_indices, _, _ = self._preprocess_input(views)
         feats = self.encode_features(images, time_indices=time_indices)
         output = self.reconstruct(feats, images)
         query_slots = [

@@ -39,7 +39,9 @@ def merge_time_grouped_tokens(
 
     tokens[:, :, 0] is the encoder's per-slot camera token -- a per-slot
     attention-evolved summary, NOT a camera identity (the encoder seats one
-    ref token on slot 0 and one shared src token on all others).  Unused by
+    ref token on slot 0 and one shared src token on all others; under
+    --camera_input the injected per-view pose encoding is ADDED into that
+    seat, so the summary then also carries true per-camera pose).  Unused by
     the per-slot path; CONCATENATED here as one extra key token per camera
     block, the way the time token enters the query -- adding it into the
     patches would cross a normalization boundary (patch outputs are normed,

@@ -159,6 +159,137 @@ def _meta_arc(freeze="none", max_time_indices=32, late_global_blocks=None):
     return model
 
 
+def test_injection_trainable_sets_match_the_meta_arc_modules():
+    """The per-injection constants are arithmetic from embed_dim and patch
+    size; this proves the arithmetic against the real modules, the way the
+    late-global per-block entry is proven against a meta-device Arc."""
+
+    pretrained = _meta_arc().backbone.pretrained
+    assert runtime.DEPTH_EMBED_TRAINABLE == (
+        2,
+        sum(parameter.numel() for parameter in pretrained.depth_patch_embed.parameters()),
+    )
+    assert runtime.CAMERA_PROJ_TRAINABLE == (
+        2,
+        sum(parameter.numel() for parameter in pretrained.camera_proj.parameters()),
+    )
+
+
+@pytest.mark.parametrize(
+    "depth_input, camera_input",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_assert_trainable_parameter_set_prices_each_injection_arm(
+    depth_input, camera_input
+):
+    """Matching freeze and assert flags pass; a mismatch in either direction
+    raises. This is the startup guard that catches a driver wiring only one
+    of its two call sites, and the pin for fork (b)'s one silent case: a
+    module that is fed but frozen trains nothing and no gradient guard can
+    see it, so the count mismatch here is what stops the run."""
+
+    model = _meta_arc()
+    model.set_freeze(
+        "temporal_tracking", depth_input=depth_input, camera_input=camera_input
+    )
+    report = runtime.assert_trainable_parameter_set(
+        model,
+        freeze_mode="temporal_tracking",
+        max_time_indices=32,
+        depth_input=depth_input,
+        camera_input=camera_input,
+    )
+    assert report["parameter_count"] == (
+        314_600_740
+        + runtime.DEPTH_EMBED_TRAINABLE[1] * int(depth_input)
+        + runtime.CAMERA_PROJ_TRAINABLE[1] * int(camera_input)
+    )
+
+    with pytest.raises(RuntimeError, match="parameter set"):
+        runtime.assert_trainable_parameter_set(
+            model,
+            freeze_mode="temporal_tracking",
+            max_time_indices=32,
+            depth_input=not depth_input,
+            camera_input=camera_input,
+        )
+    with pytest.raises(RuntimeError, match="parameter set"):
+        runtime.assert_trainable_parameter_set(
+            model,
+            freeze_mode="temporal_tracking",
+            max_time_indices=32,
+            depth_input=depth_input,
+            camera_input=not camera_input,
+        )
+
+
+@pytest.mark.parametrize(
+    "depth_input, camera_input",
+    [(True, False), (False, True), (True, True)],
+)
+def test_build_optimizer_places_injections_in_the_decoder_group(
+    depth_input, camera_input
+):
+    """Fresh zero-init capacity belongs at the full decoder rate, and under
+    the narrow preset the encoder group must stay empty with its reported
+    rate None -- the lazy encoder-group placement would silently change both
+    (landmine 3)."""
+
+    model = _meta_arc()
+    model.set_freeze(
+        "temporal_tracking", depth_input=depth_input, camera_input=camera_input
+    )
+
+    optimizer, learning_rates, encoder_parameters = runtime.build_optimizer(
+        model, lr=1e-3
+    )
+
+    assert encoder_parameters == []
+    assert learning_rates["encoder_blocks"] is None
+    decoder_group = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+    pretrained = model.backbone.pretrained
+    for enabled, module in (
+        (depth_input, pretrained.depth_patch_embed),
+        (camera_input, pretrained.camera_proj),
+    ):
+        if not enabled:
+            continue
+        for parameter in module.parameters():
+            assert id(parameter) in decoder_group
+
+
+def test_encode_and_reconstruct_threads_geometry_to_encode_features():
+    """Pins the runtime forwarding hop independently of zero init: recording
+    is weight-free, so a dropped kwarg fails here even though every output
+    would be bit-identical."""
+
+    depth_sentinel = torch.zeros(1, 2, 2, 4, 4)
+    camera_sentinel = torch.zeros(1, 2, 11)
+    recorded = {}
+
+    class _Recorder:
+        def _preprocess_input(self, views):
+            return (
+                torch.zeros(1, 2, 3, 4, 4),
+                [0],
+                None,
+                depth_sentinel,
+                camera_sentinel,
+            )
+
+        def encode_features(self, images, **kwargs):
+            recorded.update(kwargs)
+            return [images]
+
+        def reconstruct(self, feats, images):
+            return {}
+
+    runtime.encode_and_reconstruct(_Recorder(), [])
+
+    assert recorded["depth_maps"] is depth_sentinel
+    assert recorded["camera_vectors"] is camera_sentinel
+
+
 @pytest.mark.parametrize(
     "freeze_mode, late_global_blocks",
     [

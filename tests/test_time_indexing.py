@@ -81,6 +81,15 @@ class _PassThroughTimeTransformer(DinoVisionTransformer):
         self.time_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.time_index_embedding = nn.Embedding(max_time_indices, embed_dim)
         nn.init.zeros_(self.time_index_embedding.weight)
+        # Mirrors the real constructor's zero-init camera projection so
+        # camera-vector tests through this stub reach the reorder and the
+        # add-into-the-token path. Depth deliberately has no counterpart: the
+        # prepare_tokens_with_masks override below stubs token prep entirely
+        # (swallowing depth_maps via **kwargs), so depth tests use the real
+        # small encoder instead.
+        self.camera_proj = nn.Linear(11, embed_dim)
+        nn.init.zeros_(self.camera_proj.weight)
+        nn.init.zeros_(self.camera_proj.bias)
 
     def prepare_tokens_with_masks(self, x, masks=None, cls_token=None, **kwargs):
         B, S = x.shape[:2]
@@ -98,9 +107,22 @@ class _FakeBackbone(nn.Module):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
         self.seen_time_indices = None
+        self.seen_depth_maps = None
+        self.seen_camera_vectors = None
 
-    def forward(self, x, ref_view_strategy="first", time_indices=None):
+    def forward(
+        self,
+        x,
+        ref_view_strategy="first",
+        time_indices=None,
+        depth_maps=None,
+        camera_vectors=None,
+    ):
         self.seen_time_indices = None if time_indices is None else time_indices.detach().clone()
+        self.seen_depth_maps = None if depth_maps is None else depth_maps.detach().clone()
+        self.seen_camera_vectors = (
+            None if camera_vectors is None else camera_vectors.detach().clone()
+        )
         B, S = x.shape[:2]
         feature_dim = 3072
         patch = torch.zeros(B, S, 1, feature_dim, device=x.device)
@@ -179,7 +201,14 @@ class _GradBackbone(nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.ones(()))
 
-    def forward(self, x, ref_view_strategy="first", time_indices=None):
+    def forward(
+        self,
+        x,
+        ref_view_strategy="first",
+        time_indices=None,
+        depth_maps=None,
+        camera_vectors=None,
+    ):
         B, S = x.shape[:2]
         feature_dim = 3072
         patch = torch.zeros(B, S, 1, feature_dim, device=x.device) + self.scale
@@ -212,6 +241,15 @@ class _TinyPretrained(nn.Module):
         if include_time_embedding:
             self.time_index_embedding = nn.Embedding(4, 2)
             nn.init.zeros_(self.time_index_embedding.weight)
+            # The post-release zero-init additions travel as one group: a
+            # legacy checkpoint predates all of them at once, so a stub either
+            # has every forgiven module or none.
+            self.depth_patch_embed = nn.Conv2d(2, 2, kernel_size=1)
+            nn.init.zeros_(self.depth_patch_embed.weight)
+            nn.init.zeros_(self.depth_patch_embed.bias)
+            self.camera_proj = nn.Linear(11, 2)
+            nn.init.zeros_(self.camera_proj.weight)
+            nn.init.zeros_(self.camera_proj.bias)
 
 
 class _TinyBackbone(nn.Module):
@@ -274,6 +312,13 @@ class _TinyUnsharedPretrained(nn.Module):
         if include_time_embedding:
             self.time_index_embedding = nn.Embedding(4, 2)
             nn.init.zeros_(self.time_index_embedding.weight)
+            # Same one-group rule as _TinyPretrained.
+            self.depth_patch_embed = nn.Conv2d(2, 2, kernel_size=1)
+            nn.init.zeros_(self.depth_patch_embed.weight)
+            nn.init.zeros_(self.depth_patch_embed.bias)
+            self.camera_proj = nn.Linear(11, 2)
+            nn.init.zeros_(self.camera_proj.weight)
+            nn.init.zeros_(self.camera_proj.bias)
 
 
 class _TinyUnsharedBackbone(nn.Module):
@@ -303,12 +348,14 @@ def _arc_shell(max_time_indices=8):
     return model
 
 
-def _run_pass_through(model, images, time_indices=None):
+def _run_pass_through(model, images, time_indices=None, depth_maps=None, camera_vectors=None):
     outputs, _ = model._get_intermediate_layers_not_chunked(
         images,
         n=[2],
         ref_view_strategy="middle",
         time_indices=time_indices,
+        depth_maps=depth_maps,
+        camera_vectors=camera_vectors,
     )
     return outputs[0][1]
 
@@ -342,20 +389,31 @@ def test_time_embedding_size_is_configurable_and_zero_initialized():
     assert torch.count_nonzero(model.time_index_embedding.weight) == 0
 
 
-def test_legacy_state_leaves_only_the_zero_time_embedding_missing():
+def test_legacy_state_leaves_only_the_zero_injection_gaps_missing():
     source = _configured_time_transformer()
+    dropped = (
+        "time_index_embedding.weight",
+        "depth_patch_embed.weight",
+        "depth_patch_embed.bias",
+        "camera_proj.weight",
+        "camera_proj.bias",
+    )
     legacy_state = {
         name: value.clone()
         for name, value in source.state_dict().items()
-        if name != "time_index_embedding.weight"
+        if name not in dropped
     }
     restored = _configured_time_transformer()
 
     incompatibility = restored.load_state_dict(legacy_state, strict=False)
 
-    assert incompatibility.missing_keys == ["time_index_embedding.weight"]
+    assert sorted(incompatibility.missing_keys) == sorted(dropped)
     assert incompatibility.unexpected_keys == []
     assert torch.count_nonzero(restored.time_index_embedding.weight) == 0
+    assert torch.count_nonzero(restored.depth_patch_embed.weight) == 0
+    assert torch.count_nonzero(restored.depth_patch_embed.bias) == 0
+    assert torch.count_nonzero(restored.camera_proj.weight) == 0
+    assert torch.count_nonzero(restored.camera_proj.bias) == 0
 
 
 def test_inference_parser_preserves_legacy_defaults_and_multi_query_values():
@@ -652,7 +710,7 @@ def test_24_observations_receive_12_repeated_times_without_camera_ids():
                 torch.tensor([0, 12, 23]),
             )
 
-    _, normalized_queries, normalized_times = _arc_shell(
+    _, normalized_queries, normalized_times, _, _ = _arc_shell(
         max_time_indices=32
     )._preprocess_input(imgs)
     assert normalized_queries == [0, 12, 23]
@@ -670,7 +728,7 @@ def test_absent_inference_times_do_not_add_model_metadata():
     )
 
     assert all("time_index" not in view for view in imgs)
-    _, query_indices, time_indices = _arc_shell()._preprocess_input(imgs)
+    _, query_indices, time_indices, _, _ = _arc_shell()._preprocess_input(imgs)
     assert query_indices == [0, 2]
     assert time_indices is None
 
@@ -685,7 +743,7 @@ def test_missing_time_metadata_keeps_legacy_path_and_multi_query_input():
         for _ in range(3)
     ]
 
-    _, query_indices, time_indices = model._preprocess_input(views)
+    _, query_indices, time_indices, _, _ = model._preprocess_input(views)
 
     assert query_indices == [0, 2]
     assert time_indices is None
@@ -906,6 +964,64 @@ def test_temporal_tracking_freeze_is_exact_and_reversible():
     assert model.get_trainable_parameter_report() == report
 
 
+def test_temporal_freeze_flags_train_exactly_the_enabled_injections():
+    """Landmine-4 fork (b): trainability is the flags' job, and only theirs.
+
+    Four arms over one always-constructed module pair. Counts are arithmetic
+    from the pinned table plus the per-injection terms -- never fresh
+    literals -- and the flags-off re-freeze must reproduce the pinned
+    231 / 314_600_740 exactly, which is what keeps the exact-and-reversible
+    test above green untouched.
+    """
+
+    import arc.training.runtime as runtime
+
+    model = _full_meta_arc()
+    base_names = None
+    for depth_input, camera_input in (
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ):
+        model.set_freeze(
+            "temporal_tracking",
+            depth_input=depth_input,
+            camera_input=camera_input,
+        )
+        report = model.get_trainable_parameter_report()
+        names = {name for name, _ in report["parameters"]}
+        if base_names is None:
+            base_names = names
+        expected_extra = set()
+        if depth_input:
+            expected_extra |= {
+                "backbone.pretrained.depth_patch_embed.weight",
+                "backbone.pretrained.depth_patch_embed.bias",
+            }
+        if camera_input:
+            expected_extra |= {
+                "backbone.pretrained.camera_proj.weight",
+                "backbone.pretrained.camera_proj.bias",
+            }
+        assert names == base_names | expected_extra
+        assert report["tensor_count"] == (
+            231
+            + runtime.DEPTH_EMBED_TRAINABLE[0] * int(depth_input)
+            + runtime.CAMERA_PROJ_TRAINABLE[0] * int(camera_input)
+        )
+        assert report["parameter_count"] == (
+            314_600_740
+            + runtime.DEPTH_EMBED_TRAINABLE[1] * int(depth_input)
+            + runtime.CAMERA_PROJ_TRAINABLE[1] * int(camera_input)
+        )
+
+    model.set_freeze("temporal_tracking")
+    report = model.get_trainable_parameter_report()
+    assert report["tensor_count"] == 231
+    assert report["parameter_count"] == 314_600_740
+
+
 def test_from_pretrained_accepts_only_the_legacy_time_embedding_gap(tmp_path):
     legacy_dir = tmp_path / "legacy"
     _save_safetensors_model(_LegacyTinyArc(), legacy_dir)
@@ -914,6 +1030,12 @@ def test_from_pretrained_accepts_only_the_legacy_time_embedding_gap(tmp_path):
 
     assert torch.count_nonzero(
         restored.backbone.pretrained.time_index_embedding.weight
+    ) == 0
+    assert torch.count_nonzero(
+        restored.backbone.pretrained.depth_patch_embed.weight
+    ) == 0
+    assert torch.count_nonzero(
+        restored.backbone.pretrained.camera_proj.weight
     ) == 0
 
     with pytest.raises(RuntimeError, match="time_index_embedding"):
@@ -1192,7 +1314,7 @@ def test_forward_recomposes_from_its_three_public_pieces():
     expected = whole(views, force_no_output_conversion=True)
 
     piecewise = build()
-    images, track_query_idx, time_indices = piecewise._preprocess_input(views)
+    images, track_query_idx, time_indices, _, _ = piecewise._preprocess_input(views)
     feats = piecewise.encode_features(images, time_indices=time_indices)
     actual = piecewise.reconstruct(feats, images)
     tracks = [
@@ -1896,7 +2018,60 @@ def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
         "freeze_mode": "temporal_tracking",
         "late_global_blocks": None,
         "max_time_indices": 4,
+        "depth_input": False,
+        "camera_input": False,
     }
+
+
+def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):
+    """The flags are derived from the stored key set -- the max_time_indices
+    design: the saver keys off requires_grad, so a geometry-arm patch carries
+    its injection tensors and its metadata cannot disagree with its weights.
+    Without the derivation the control arm loads while all three geometry
+    arms die on unexpected keys, which is kept below as the loud arm."""
+
+    for depth_input, camera_input in ((True, False), (False, True), (True, True)):
+        trained = _TinyHubArc(freeze="none")
+        trained.set_freeze(
+            "temporal_tracking",
+            depth_input=depth_input,
+            camera_input=camera_input,
+        )
+        with torch.no_grad():
+            if depth_input:
+                trained.backbone.pretrained.depth_patch_embed.weight.fill_(0.25)
+            if camera_input:
+                trained.backbone.pretrained.camera_proj.weight.fill_(0.75)
+        patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+        metadata = read_temporal_patch_metadata(patch)
+        assert metadata["depth_input"] is depth_input
+        assert metadata["camera_input"] is camera_input
+
+        restored = _TinyHubArc(freeze="none")
+        restored.set_freeze(
+            metadata["freeze_mode"],
+            late_global_blocks=metadata["late_global_blocks"],
+            depth_input=metadata["depth_input"],
+            camera_input=metadata["camera_input"],
+        )
+        load_temporal_tracking_checkpoint(restored, patch)
+        if depth_input:
+            assert (
+                torch.count_nonzero(
+                    restored.backbone.pretrained.depth_patch_embed.weight
+                )
+                > 0
+            )
+        if camera_input:
+            assert (
+                torch.count_nonzero(restored.backbone.pretrained.camera_proj.weight)
+                > 0
+            )
+
+        blind = _TinyHubArc(freeze="temporal_tracking")
+        with pytest.raises(RuntimeError, match="unexpected keys"):
+            load_temporal_tracking_checkpoint(blind, patch)
 
 
 def test_patch_save_requires_a_temporal_freeze_mode(tmp_path):

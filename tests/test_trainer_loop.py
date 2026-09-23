@@ -293,6 +293,12 @@ def _loop_args(tmp_path, **overrides):
         # Its realisable sibling, same eval-only / non-resume shape; off is
         # the parser's default and the behaviour every existing test assumes.
         ground_truth_query_anchor=False,
+        # The geometry-input training flags: stream-defining (REFUSED tier,
+        # absent-default False), read by _checkpoint_settings and
+        # _plan_summary, so every loop test needs them present. Off is the
+        # parser's default and the behaviour every existing test assumes.
+        depth_input=False,
+        camera_input=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -791,6 +797,78 @@ def test_main_seeds_the_table_between_the_freeze_and_the_optimizer():
     )
 
 
+def test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader():
+    """The fed-but-frozen pin, inspected rather than executed.
+
+    The seeding test above records the shipped precedent: a helper whose
+    only caller was the overfit harness let the trainer run a full job on a
+    zero table. The identical class here: a driver that wires the loader but
+    not the freeze runs a control arm that records depth_input=true, and no
+    gradient guard can see it -- frozen parameters receive no gradient. So
+    every set_freeze, assert_trainable_parameter_set and loader-construction
+    call in BOTH drivers must read the same args attributes.
+    """
+
+    import overfit_temporal_tracking as overfit_cli
+
+    def flag_reads(call):
+        pairs = set()
+        for keyword in call.keywords:
+            value = keyword.value
+            candidates = [value]
+            if isinstance(value, ast.IfExp):
+                # input_depth_max=args.kubric_max_depth if args.depth_input
+                # else None -- the flag sits in the conditional's test.
+                candidates.append(value.test)
+            for node in candidates:
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "args"
+                    and node.attr in ("depth_input", "camera_input")
+                ):
+                    pairs.add((keyword.arg, node.attr))
+        return pairs
+
+    def calls_by_name(module):
+        found = {}
+        for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", None) or getattr(
+                    node.func, "attr", None
+                )
+                found.setdefault(name, []).append(node)
+        return found
+
+    both = {("depth_input", "depth_input"), ("camera_input", "camera_input")}
+    for module, loader_name, loader_pairs in (
+        (
+            train_cli,
+            "MVTrackerSceneProvider",
+            {
+                ("input_depth", "depth_input"),
+                ("input_camera_vectors", "camera_input"),
+            },
+        ),
+        (
+            overfit_cli,
+            "load_dumped_kubric_scene",
+            {
+                ("input_depth_max", "depth_input"),
+                ("input_camera_vectors", "camera_input"),
+            },
+        ),
+    ):
+        found = calls_by_name(module)
+        for name in ("set_freeze", "assert_trainable_parameter_set"):
+            assert found.get(name), f"{module.__name__} has no {name} call"
+            for call in found[name]:
+                assert both <= flag_reads(call), (module.__name__, name)
+        assert found.get(loader_name), f"{module.__name__} has no {loader_name} call"
+        for call in found[loader_name]:
+            assert loader_pairs <= flag_reads(call), (module.__name__, loader_name)
+
+
 def test_the_init_flags_default_to_the_swept_band_and_reach_the_artifacts():
     """The default is deliberately 0.3, not the overfit harness's 0.1."""
 
@@ -847,20 +925,21 @@ def test_the_validator_rejects_an_unusable_init_scale_or_rate(tmp_path):
     )
 
 
-def _stub_scene(name, *, times=(0, 2)):
+def _stub_scene(name, *, times=(0, 2), geometry=False):
     """A scene carrying the view keys the cache fingerprints."""
 
-    return SimpleNamespace(
-        name=name,
-        views=[
-            {
-                "img": torch.zeros(1, 3, 4, 4),
-                "time_index": torch.tensor([index]),
-                "track_query_idx": torch.tensor([0]),
-            }
-            for index in range(len(times))
-        ],
-    )
+    views = []
+    for index in range(len(times)):
+        view = {
+            "img": torch.zeros(1, 3, 4, 4),
+            "time_index": torch.tensor([index]),
+            "track_query_idx": torch.tensor([0]),
+        }
+        if geometry:
+            view["depth_map"] = torch.zeros(1, 2, 4, 4)
+            view["camera_vector"] = torch.zeros(1, 11)
+        views.append(view)
+    return SimpleNamespace(name=name, views=views)
 
 
 def test_a_cache_hit_returns_the_same_scene_object_and_reloads_are_counted(tmp_path):
@@ -887,6 +966,43 @@ def test_a_cache_hit_returns_the_same_scene_object_and_reloads_are_counted(tmp_p
     # And coming back evicts, because the cache holds one window.
     cache.get(same)
     assert len(loads) == 3
+
+
+def test_the_fingerprint_notices_a_depth_rebind(tmp_path):
+    """Identity-fingerprinted, like img: a rebind trips the guard while an
+    in-place write must NOT. The converse arm is what actually pins the
+    branch -- a rebind changes identity and values alike, so without it a
+    value-fingerprinted map would pass and then list a full-resolution map
+    on every cache get, against the docstring's promise of "without touching
+    a pixel"."""
+
+    cache = train_cli.SceneCache(
+        lambda plan: _stub_scene(plan.seq_name, geometry=True), size=2
+    )
+    plan = plan_record(_record(seq_name="0001"), budget=48, stride=2)
+    scene = cache.get(plan)
+
+    scene.views[0]["depth_map"][0, 0, 0, 0] = 9.0
+    assert cache.get(plan) is scene
+
+    scene.views[0]["depth_map"] = scene.views[0]["depth_map"].clone()
+    with pytest.raises(RuntimeError, match="was mutated in place"):
+        cache.get(plan)
+
+
+def test_the_fingerprint_notices_a_written_camera_vector(tmp_path):
+    """Value-fingerprinted, like the index tensors: eleven entries are cheap
+    and an in-place write must trip the guard."""
+
+    cache = train_cli.SceneCache(
+        lambda plan: _stub_scene(plan.seq_name, geometry=True), size=2
+    )
+    plan = plan_record(_record(seq_name="0001"), budget=48, stride=2)
+    scene = cache.get(plan)
+
+    scene.views[1]["camera_vector"][0, 0] = 9.0
+    with pytest.raises(RuntimeError, match="was mutated in place"):
+        cache.get(plan)
 
 
 def test_a_step_that_mutates_a_cached_scene_is_caught_at_the_next_visit(tmp_path):
@@ -1059,9 +1175,16 @@ class _FakeArc(nn.Module):
         images = torch.zeros(1, self.observations, 3, self.height, self.width)
         # The real preprocessor reads the anchor slot list off the views; the
         # fake mirrors that so a multi-anchor scene reaches the Q loop.
-        return images, views[0]["track_query_idx"], None
+        return images, views[0]["track_query_idx"], None, None, None
 
-    def encode_features(self, images, ref_view_strategy="first", time_indices=None):
+    def encode_features(
+        self,
+        images,
+        ref_view_strategy="first",
+        time_indices=None,
+        depth_maps=None,
+        camera_vectors=None,
+    ):
         # Every trainable parameter must receive a gradient or train_step's own
         # guards fire -- which is part of what is being tested, so the "taps"
         # touch biases as well as weights.
@@ -1114,7 +1237,7 @@ class _FakeArc(nn.Module):
         return track, confidence
 
     def forward(self, views, force_no_output_conversion=False, merge_synchronized_slots=False):
-        images, track_query_idx, time_indices = self._preprocess_input(views)
+        images, track_query_idx, time_indices, _, _ = self._preprocess_input(views)
         feats = self.encode_features(images, time_indices=time_indices)
         output = self.reconstruct(feats, images)
         query_slots = [
@@ -3964,6 +4087,25 @@ def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):
         assert settings["encoder_local_checkpointing"] is enabled
 
 
+def test_the_geometry_inputs_are_recorded_in_the_plan_summary_settings(tmp_path):
+    """Zero-init makes a flag-off checkpoint loadable either way, so only the
+    summary can say which geometry a curve was trained on."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    for key in ("depth_input", "camera_input"):
+        for enabled in (False, True):
+            args = _validator_args(tmp_path, manifest="m.jsonl", **{key: enabled})
+            settings = train_cli._plan_summary(tally, args)["settings"]
+            assert settings[key] is enabled
+
+
 def test_unusable_loss_weights_are_refused_at_parse_time(tmp_path):
     for bad in (-1e-9, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="--confidence_weight"):
@@ -5903,6 +6045,34 @@ def test_a_resume_that_changes_the_merge_flag_is_refused(tmp_path):
         _loop_args(tmp_path, merge_synchronized_slots=True)
     )
     with pytest.raises(RuntimeError, match="carries merge_synchronized_slots=True"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+
+@pytest.mark.parametrize("flag", ("depth_input", "camera_input"))
+def test_a_checkpoint_predating_a_geometry_input_flag_resumes_with_it_off(
+    tmp_path, flag
+):
+    """Absence resolves to the only reachable value: before the flags existed
+    the injection parameters did not, so a pre-flag checkpoint resumes
+    silently with the inputs off and is refused with one on."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored[flag]
+
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="predates"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, **{flag: True}))
+
+
+@pytest.mark.parametrize("flag", ("depth_input", "camera_input"))
+def test_a_resume_that_changes_a_geometry_input_flag_is_refused(tmp_path, flag):
+    """Refused-tier, like merge_synchronized_slots: the flags decide which
+    parameters exist to train and what every step trains on, so a segment
+    that flips one continues the step counter over a different stream."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{flag: True}))
+    with pytest.raises(RuntimeError, match=f"carries {flag}=True"):
         train_cli.check_resume_settings(stored, _loop_args(tmp_path))
 
 

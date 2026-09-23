@@ -33,6 +33,24 @@ DEPTH_SIDECAR_NAME = "depth_full.npz"
 DEPTH_SIDECAR_KEY = "depth"
 DEPTH_SIDECAR_FLAG = "RCMV_DUMP_DEPTH=1"
 
+# The optional geometry-input view keys --depth_input / --camera_input attach.
+# Spelled to match Arc.DEPTH_KEY / Arc.CAMERA_VECTOR_KEY; duplicated rather
+# than imported so this loader stays import-light, and pinned against drift by
+# a test.
+DEPTH_INPUT_KEY = "depth_map"
+CAMERA_VECTOR_KEY = "camera_vector"
+
+
+def missing_depth_sidecar_message(needs: str, scene_name: str) -> str:
+    """The one copy of the sidecar refusal, shared by surface_depth_map and
+    the overfit driver's submit-time check so the two cannot drift."""
+    return (
+        f"{needs} needs per-frame depth, but {DEPTH_SIDECAR_NAME} is absent "
+        f"for scene '{scene_name}'. The sidecar is opt-in: re-run the dump "
+        f"with {DEPTH_SIDECAR_FLAG} to emit it. Without it only original "
+        "time 0 can be anchored, because meta.npz carries depth0 alone."
+    )
+
 # The packed frame layout. Present for a dump whose frames were packed, absent
 # for one that left them loose; nothing else distinguishes the two.
 FRAMES_ARCHIVE_NAME = "frames.zip"
@@ -184,11 +202,9 @@ class DumpedKubricScene:
         if self.depth is None:
             if original_time != 0:
                 raise ValueError(
-                    f"Anchoring at original time {original_time} needs per-frame "
-                    f"depth, but {DEPTH_SIDECAR_NAME} is absent for scene "
-                    f"'{self.name}'. The sidecar is opt-in: re-run the dump with "
-                    f"{DEPTH_SIDECAR_FLAG} to emit it. Without it only original "
-                    "time 0 can be anchored, because meta.npz carries depth0 alone."
+                    missing_depth_sidecar_message(
+                        f"Anchoring at original time {original_time}", self.name
+                    )
                 )
             return self.depth0[camera, 0]
         if not 0 <= original_time < self.depth.shape[1]:
@@ -571,6 +587,149 @@ def _as_numpy(value, dtype):
     return np.array(value, dtype=dtype, copy=True)
 
 
+def _attach_view_geometry(scene, *, input_depth_max, input_camera_vectors):
+    """Attach the geometry-input view keys the trainer's flags request.
+
+    Depth rides the SAME index gather every anchor pointmap takes
+    (``output_to_original_indices``) -- a gather, never interpolation, so a
+    depth discontinuity cannot be blended into a depth that exists nowhere.
+    ``input_depth_max`` is an INVALIDITY threshold, not a normalisation
+    ceiling: the live loader zeroes label depth beyond it unconditionally, so
+    a beyond-max pixel must read invalid here too, or the same metre would
+    encode as 1.0/valid from a dump and 0.0/invalid from the live path -- a
+    source fingerprint the model could learn instead of geometry. After
+    invalidation every valid depth is in (0, max], so channel 0 maps to
+    (0, 1] and the clip is a saturation guard at the boundary, and channel 1
+    is the validity. Metric scale is kept: no per-view normalisation.
+
+    The camera vector is the fork's own 9-dim pose encoding of the
+    camera-to-world pose (the scene stores world-to-camera; ``affine_inverse``
+    inverts it) with model-grid intrinsics, plus the principal point the
+    9-dim format discards -- it discards it only because ``cam_dec`` must
+    predict INTO the format, and a projection has no such obligation. The
+    model-grid intrinsics are derived exclusively through
+    ``ImageTransform.original_to_output`` so no second spelling of the
+    scale/crop affine exists; a test pins the construction against the direct
+    fields formula.
+    """
+
+    if input_depth_max is not None:
+        if not np.isfinite(input_depth_max) or input_depth_max <= 0:
+            raise ValueError(
+                f"input_depth_max must be finite and positive, got {input_depth_max}"
+            )
+        # Named for the actual need: without this, the surface_depth_map raise
+        # below would blame "Anchoring at original time N" for a failure the
+        # depth INPUT caused, while the submit-time twin names --depth_input.
+        if scene.depth is None and any(
+            observation.original_time != 0 for observation in scene.observations
+        ):
+            times = sorted(
+                {int(observation.original_time) for observation in scene.observations}
+            )
+            raise ValueError(
+                missing_depth_sidecar_message(
+                    f"--depth_input at original times {times}", scene.name
+                )
+            )
+        for observation, view in zip(scene.observations, scene.views):
+            depth = (
+                scene.surface_depth_map(observation.camera, observation.original_time)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            rows, columns = observation.image_transform.output_to_original_indices()
+            columns_grid, rows_grid = np.meshgrid(columns, rows)
+            sampled = depth[rows_grid, columns_grid]
+            invalid = (
+                ~np.isfinite(sampled)
+                | (sampled <= 1e-6)
+                | (sampled > input_depth_max)
+            )
+            ch0 = np.where(
+                invalid, 0.0, np.clip(sampled, 0.0, input_depth_max) / input_depth_max
+            )
+            view[DEPTH_INPUT_KEY] = torch.from_numpy(
+                np.stack([ch0, (~invalid).astype(np.float64)]).astype(np.float32)
+            )[None]
+
+    if input_camera_vectors:
+        from arc.models.arc.utils.transform import (
+            affine_inverse,
+            extri_intri_to_pose_encoding,
+        )
+
+        shared_transform = scene.observations[0].image_transform
+        output_height = shared_transform.output_height
+        output_width = shared_transform.output_width
+        model_intrinsics = []
+        world_to_camera_rows = []
+        principal_points = []
+        for observation in scene.observations:
+            transform = observation.image_transform
+            intrinsics = (
+                scene.intrinsics[observation.camera, observation.original_time]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float64)
+            )
+            principal = transform.original_to_output(
+                np.array([[intrinsics[0, 2], intrinsics[1, 2]]])
+            )[0]
+            fx_out = (
+                transform.original_to_output(
+                    np.array(
+                        [[intrinsics[0, 2] + intrinsics[0, 0], intrinsics[1, 2]]]
+                    )
+                )[0][0]
+                - principal[0]
+            )
+            fy_out = (
+                transform.original_to_output(
+                    np.array(
+                        [[intrinsics[0, 2], intrinsics[1, 2] + intrinsics[1, 1]]]
+                    )
+                )[0][1]
+                - principal[1]
+            )
+            model_intrinsics.append(
+                np.array(
+                    [
+                        [fx_out, 0.0, principal[0]],
+                        [0.0, fy_out, principal[1]],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=np.float64,
+                )
+            )
+            world_to_camera_rows.append(
+                scene.extrinsics_world_to_camera[
+                    observation.camera, observation.original_time
+                ].double()
+            )
+            principal_points.append(
+                (principal[0] / output_width, principal[1] / output_height)
+            )
+        camera_to_world = affine_inverse(torch.stack(world_to_camera_rows)[None])
+        pose9 = extri_intri_to_pose_encoding(
+            camera_to_world,
+            torch.from_numpy(np.stack(model_intrinsics))[None],
+            (output_height, output_width),
+        )
+        # Terms 0-8 are the pose encoding's own layout: translation, the xyzw
+        # quaternion (real part last), then the (h, w)-ORDERED fovs. Terms
+        # 9-10 switch convention to the (x, y)-ordered principal point,
+        # normalised by output width and height -- deliberate; both halves
+        # are asserted index by index in the tests.
+        principal_terms = torch.tensor(principal_points, dtype=torch.float64)[None]
+        vectors = torch.cat([pose9.double(), principal_terms], dim=-1).float()
+        for slot, view in enumerate(scene.views):
+            view[CAMERA_VECTOR_KEY] = vectors[:, slot]
+
+
 def build_scene(
     *,
     name: str,
@@ -591,6 +750,8 @@ def build_scene(
     size: int = 512,
     patch_size: int = 14,
     square_ok: bool = False,
+    input_depth_max: float | None = None,
+    input_camera_vectors: bool = False,
     verbose: bool = False,
     source: str = "<arrays>",
 ) -> DumpedKubricScene:
@@ -827,7 +988,7 @@ def build_scene(
             f"same processed shape, got {sorted(output_shapes)}"
         )
 
-    return DumpedKubricScene(
+    scene = DumpedKubricScene(
         name=name,
         views=views,
         observations=tuple(observations),
@@ -851,6 +1012,16 @@ def build_scene(
         depth_sidecar_path=depth_sidecar_path,
         track_upscaling_factor=track_upscaling_factor,
     )
+    # Attached post-construction so the helper reuses surface_depth_map and
+    # scene.observations instead of re-deriving the depth0/sidecar branch and
+    # the slot arithmetic.
+    if input_depth_max is not None or input_camera_vectors:
+        _attach_view_geometry(
+            scene,
+            input_depth_max=input_depth_max,
+            input_camera_vectors=input_camera_vectors,
+        )
+    return scene
 
 
 def scene_from_datapoint(
@@ -862,6 +1033,8 @@ def scene_from_datapoint(
     size: int = 512,
     patch_size: int = 14,
     square_ok: bool = False,
+    input_depth_max: float | None = None,
+    input_camera_vectors: bool = False,
     verbose: bool = False,
 ) -> DumpedKubricScene:
     """Build a scene from a live MVTracker ``Datapoint``, with no dump on disk.
@@ -937,6 +1110,8 @@ def scene_from_datapoint(
         size=size,
         patch_size=patch_size,
         square_ok=square_ok,
+        input_depth_max=input_depth_max,
+        input_camera_vectors=input_camera_vectors,
         verbose=verbose,
         source=f"<live sample {sample.seq_name}>",
     )
@@ -952,6 +1127,8 @@ def load_dumped_kubric_scene(
     size: int = 512,
     patch_size: int = 14,
     square_ok: bool = False,
+    input_depth_max: float | None = None,
+    input_camera_vectors: bool = False,
     verbose: bool = False,
 ) -> DumpedKubricScene:
     """Load one camera-major window from the existing evaluation dump.
@@ -1034,6 +1211,8 @@ def load_dumped_kubric_scene(
         size=size,
         patch_size=patch_size,
         square_ok=square_ok,
+        input_depth_max=input_depth_max,
+        input_camera_vectors=input_camera_vectors,
         verbose=verbose,
         source=str(scene_path),
     )

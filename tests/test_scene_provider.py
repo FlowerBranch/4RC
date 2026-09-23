@@ -1361,6 +1361,59 @@ def test_the_provider_resolves_relative_slots_against_the_steps_own_window(tmp_p
     assert primary.original_time == plan.times[0]
 
 
+def test_the_provider_attaches_geometry_view_keys_when_its_flags_are_on(tmp_path):
+    """The live training chain, EXECUTED: provider -> scene_from_datapoint ->
+    build_scene -> _attach_view_geometry.
+
+    The AST wiring test in test_trainer_loop pins the driver's call sites;
+    this pins that the chain actually delivers view dicts carrying the keys.
+    Severing any of its pass-through points -- the provider's kwargs, the
+    scene_from_datapoint forwarding, or the build_scene attach -- leaves the
+    rest of the suite green, because every other end-to-end loader test goes
+    through load_dumped_kubric_scene, the OVERFIT path. One flag per arm, so
+    the arms also pin that each flag attaches only its own key.
+    """
+
+    from test_scene_sources import _datapoint_from_dump
+    from arc.training.scene_provider import MVTrackerSceneProvider
+
+    scene_path = _write_scene(
+        tmp_path, time_count=4, view_count=2, depth_sidecar=True
+    )
+    plan = _anchor_plan()
+
+    class _Pool:
+        seq_names = ["0000"]
+
+        def __getitem__(self, index):
+            datapoint = _datapoint_from_dump(scene_path)
+            datapoint.sample_track_indices = [0, 1, 2]
+            return datapoint, True
+
+    for input_depth, input_camera in ((True, False), (False, True)):
+        provider = MVTrackerSceneProvider(
+            min_shared_queries=1,
+            input_depth=input_depth,
+            input_camera_vectors=input_camera,
+        )
+        provider._datasets[plan.data_root] = _Pool()
+
+        scene = provider(plan)
+
+        for view in scene.views:
+            height, width = view["img"].shape[-2:]
+            if input_depth:
+                assert view["depth_map"].shape == (1, 2, height, width)
+                assert view["depth_map"].dtype == torch.float32
+            else:
+                assert "depth_map" not in view
+            if input_camera:
+                assert view["camera_vector"].shape == (1, 11)
+                assert view["camera_vector"].dtype == torch.float32
+            else:
+                assert "camera_vector" not in view
+
+
 def test_an_anchor_slot_outside_the_plans_window_is_a_config_error_not_a_skip():
     """The step loop's skip policy absorbs SceneProviderError as one bad scene;
     a mis-sized anchor spec must kill the run instead, so it raises ValueError.

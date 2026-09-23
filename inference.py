@@ -254,10 +254,14 @@ def main():
         # set_freeze first, to the mode recorded in the patch: the loader
         # requires the match and keys the expected parameter set off
         # requires_grad. The recorded block count comes with it, since the
-        # late-global mode's name does not by itself fix that set.
+        # late-global mode's name does not by itself fix that set -- and the
+        # geometry flags likewise, derived from the patch's own key set, or a
+        # geometry-arm patch's injection tensors surface as unexpected keys.
         model.set_freeze(
             patch_metadata["freeze_mode"],
             late_global_blocks=patch_metadata["late_global_blocks"],
+            depth_input=patch_metadata["depth_input"],
+            camera_input=patch_metadata["camera_input"],
         )
         load_temporal_tracking_checkpoint(model, args.temporal_patch)
         late_global_note = (

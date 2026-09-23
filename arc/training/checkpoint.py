@@ -8,6 +8,8 @@ import torch
 
 
 _TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
+_DEPTH_EMBED_KEY = "backbone.pretrained.depth_patch_embed.weight"
+_CAMERA_PROJ_KEY = "backbone.pretrained.camera_proj.weight"
 
 
 def _trainable_parameters(model) -> dict[str, torch.nn.Parameter]:
@@ -96,13 +98,20 @@ def _parse_payload(path: str | Path) -> tuple[str, int | None, dict]:
 
 
 def read_temporal_patch_metadata(path: str | Path) -> dict:
-    """Freeze mode, block count and embedding table size, without a model.
+    """Freeze mode, block count, embedding table size and geometry flags,
+    without a model.
 
     ``max_time_indices`` is derived from the stored embedding tensor's row
     count rather than a separate field, so it cannot disagree with the
     weights; it is ``None`` when the patch carries no embedding.
     ``late_global_blocks`` is ``None`` for every mode whose name already
-    determines its parameter set.
+    determines its parameter set. ``depth_input`` and ``camera_input`` are
+    derived from the stored key set the same way: a geometry-arm patch
+    carries its injection tensors because the saver keys off
+    ``requires_grad``, a pre-flag or control patch simply lacks the keys and
+    reads ``False``, and neither can disagree with the weights. A loader
+    must pass both into ``set_freeze`` before loading, or the injection
+    tensors surface as unexpected keys.
     """
 
     freeze_mode, late_global_blocks, state_dict = _parse_payload(path)
@@ -115,6 +124,8 @@ def read_temporal_patch_metadata(path: str | Path) -> dict:
             if not isinstance(embedding, torch.Tensor)
             else int(embedding.shape[0])
         ),
+        "depth_input": _DEPTH_EMBED_KEY in state_dict,
+        "camera_input": _CAMERA_PROJ_KEY in state_dict,
     }
 
 

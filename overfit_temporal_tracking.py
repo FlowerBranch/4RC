@@ -30,6 +30,10 @@ from arc.training import (
     synchronized_consistency_stats,
     temporal_injection_report,
 )
+from arc.training.dumped_kubric import (
+    DEPTH_SIDECAR_NAME,
+    missing_depth_sidecar_message,
+)
 
 
 # The runtime helpers and the freeze-mask constants live in arc.training.runtime
@@ -120,6 +124,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"under the other freeze modes. k={MAX_LATE_GLOBAL_BLOCKS} is every "
             "global block and reproduces temporal_tracking_global_attention "
             "exactly."
+        ),
+    )
+    parser.add_argument(
+        "--depth_input",
+        action="store_true",
+        help=(
+            "Feed each observation's depth map to the encoder: resampled to "
+            "the model grid by the same index gather the anchor pointmaps "
+            "use, encoded as depth/--kubric_max_depth in (0, 1] plus a "
+            "validity channel, with non-finite, non-positive and "
+            "beyond---kubric_max_depth entries zeroed in both channels. "
+            "Metric scale kept; no per-view normalisation. Zero-initialised, "
+            "so off, the default, is exactly today's behaviour. Original "
+            "times other than 0 need the per-frame depth sidecar."
+        ),
+    )
+    parser.add_argument(
+        "--camera_input",
+        action="store_true",
+        help=(
+            "Feed each observation's ground-truth camera to the encoder: an "
+            "11-vector (camera-to-world pose encoding plus the model-grid "
+            "principal point) added into the camera token through a "
+            "zero-initialised projection. NOTE the injected pose also changes "
+            "the frozen camera decoder's OUTPUT and with it the Sim(3) and "
+            "the query anchor, so this harness's readout is "
+            "anchor-contaminated -- it is a wiring and signal check, never "
+            "architecture evidence. Off, the default, is exactly today's "
+            "behaviour."
+        ),
+    )
+    parser.add_argument(
+        "--kubric_max_depth",
+        type=float,
+        default=24.0,
+        help=(
+            "Metres beyond which --depth_input marks depth invalid, and at "
+            "which its normalised channel saturates. Mirrors the trainer's "
+            "flag of the same name; NOTE the trainer's live loader also "
+            "invalidates LABEL depth beyond it, which no dump replays -- the "
+            "shared value aligns the input encodings, not the labels "
+            "(default: %(default)s)"
         ),
     )
     parser.add_argument(
@@ -350,6 +396,20 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"--max_time_indices={args.max_time_indices}"
         )
 
+    # Submit-time twin of the load-time refusal in surface_depth_map, sharing
+    # its one message: a dumped scene without the per-frame sidecar can feed
+    # --depth_input only at original time 0, and finding that out after the
+    # model loads wastes a node allocation.
+    if args.depth_input and any(time != 0 for time in args.times):
+        sidecar = Path(args.data_root) / args.scene / DEPTH_SIDECAR_NAME
+        if not sidecar.is_file():
+            raise ValueError(
+                missing_depth_sidecar_message(
+                    f"--depth_input at original times {list(args.times)}",
+                    args.scene,
+                )
+            )
+
     _resolve_query_anchors(args)
 
     if args.parse_only or args.eligibility_only:
@@ -513,7 +573,9 @@ def _measure_temporal_injection(model, views: list[dict], precision: str):
     patch tokens move, and whether the deltas cluster by shared index.
     """
 
-    images, _, time_indices = model._preprocess_input(views)
+    # The geometry inputs are deliberately dropped: this diagnostic measures
+    # the time-token path with two backbone-only forwards over images alone.
+    images, _, time_indices, _, _ = model._preprocess_input(views)
     if time_indices is None:
         return None
     with torch.no_grad(), _autocast_context(precision):
@@ -962,6 +1024,8 @@ def main() -> None:
         cameras=args.cameras,
         times=args.times,
         query_anchors=_resolve_query_anchors(args),
+        input_depth_max=args.kubric_max_depth if args.depth_input else None,
+        input_camera_vectors=args.camera_input,
         verbose=True,
     )
     _validate_scene_layout(scene)
@@ -1006,13 +1070,20 @@ def main() -> None:
     late_global_note = (
         "" if late_global_blocks is None else f", k={late_global_blocks}"
     )
-    model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    model.set_freeze(
+        args.freeze_mode,
+        late_global_blocks=late_global_blocks,
+        depth_input=args.depth_input,
+        camera_input=args.camera_input,
+    )
     model.set_encoder_local_checkpointing(args.encoder_local_checkpointing)
     report = assert_trainable_parameter_set(
         model,
         freeze_mode=args.freeze_mode,
         max_time_indices=args.max_time_indices,
         late_global_blocks=late_global_blocks,
+        depth_input=args.depth_input,
+        camera_input=args.camera_input,
     )
     print(
         "trainable="
@@ -1543,9 +1614,14 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     # Re-assert the mode this run actually trained under: the saver keys the
     # patch's parameter set off requires_grad, so re-asserting a narrower mode
-    # here -- or the same mode at a smaller k -- would silently drop trained
-    # encoder tensors from the file.
-    model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    # here -- or the same mode at a smaller k, or without the geometry flags --
+    # would silently drop trained tensors from the file.
+    model.set_freeze(
+        args.freeze_mode,
+        late_global_blocks=late_global_blocks,
+        depth_input=args.depth_input,
+        camera_input=args.camera_input,
+    )
     checkpoint_path = save_temporal_tracking_checkpoint(
         model,
         output_dir / "temporal_tracking.pt",
@@ -1643,6 +1719,12 @@ def main() -> None:
         # None under the modes whose name already fixes their parameter set, so
         # an archived summary is never ambiguous about which mask ran.
         "late_global_blocks": late_global_blocks,
+        # Which geometry inputs the encoder received, and the metre threshold
+        # the depth channels were encoded against. Zero-init makes a flag-off
+        # checkpoint loadable either way, so only the summary can say.
+        "depth_input": bool(args.depth_input),
+        "camera_input": bool(args.camera_input),
+        "kubric_max_depth": float(args.kubric_max_depth),
         # Memory, not objective: it changes what the encoder retains for
         # backward, not what the run optimizes. Recorded next to gpu_name below
         # for the same reason -- it is part of what produced this run's step

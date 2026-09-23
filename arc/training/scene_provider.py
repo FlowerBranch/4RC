@@ -32,10 +32,14 @@ reaches ``compute_image_transform``, which is tested at both shapes.
 run sets ``augmentations.probability 0.8`` with ``rgb`` and ``depth`` true; the
 replay inherits ``0.0``/false/false, so upstream's ``augment_this_datapoint`` is
 never true and no sample is jittered.  That is a real difference and it is left
-in place deliberately.  4RC's view dicts carry no depth, so depth on this path
-feeds the Sim(3) fit and the anchor lifting -- it builds *labels*, and perturbing
-it would inject noise into the supervision targets rather than robustness into
-the inputs.  The crop settles the rest by precedent: it is gated by
+in place deliberately.  Without --depth_input, 4RC's view dicts carry no depth,
+so depth on this path feeds the Sim(3) fit and the anchor lifting -- it builds
+*labels*, and perturbing it would inject noise into the supervision targets
+rather than robustness into the inputs.  With --depth_input (and likewise
+--camera_input for the pose) the same per-frame depth ALSO becomes a model
+input, so the Sim(3) fit and the drift diagnostic stop being input-independent:
+the map the model reads and the map the targets are lifted from are one array.
+The crop settles the rest by precedent: it is gated by
 ``enable_cropping_augs`` alone rather than by the probability, so it perturbs
 every MVTracker sample more than rgb jitter would, and is already accepted as
 unreplayable.  What the pairing controls is which samples arrive in which order,
@@ -215,6 +219,8 @@ class MVTrackerSceneProvider:
         max_depth: float = 24.0,
         query_anchor_slots: Sequence[tuple[int, int]] = ((0, 0),),
         adaptive_query_anchors: bool = False,
+        input_depth: bool = False,
+        input_camera_vectors: bool = False,
     ):
         # There is deliberately no ``subset``: it was only ever a path component,
         # and after the override above it decides nothing. A held-out set is a
@@ -225,8 +231,15 @@ class MVTrackerSceneProvider:
         # Mirrors the paired run's `datasets.train.kubric_max_depth`, so it is a
         # constructor parameter rather than a literal in the override dict:
         # the value belongs to someone else's config and has to stay visible and
-        # overridable when that config moves.
+        # overridable when that config moves. Under --depth_input the same
+        # number is reused as BOTH the input channels' invalidity threshold
+        # (matching the invalidation MVTracker's loader applies to this
+        # provider's label depth, see the override-dict comment below) and the
+        # normaliser scale recorded in run_summary.json: one constant applied
+        # twice, with the input side pinned by a test.
         self.max_depth = max_depth
+        self.input_depth = input_depth
+        self.input_camera_vectors = input_camera_vectors
         # Now guards "this scene's own pool is too small to be worth a step",
         # not "too little of a recorded draw survived".
         self.min_shared_queries = min_shared_queries
@@ -523,4 +536,6 @@ class MVTrackerSceneProvider:
             query_anchors=self.resolve_query_anchors(plan),
             size=self.size,
             patch_size=self.patch_size,
+            input_depth_max=self.max_depth if self.input_depth else None,
+            input_camera_vectors=self.input_camera_vectors,
         )

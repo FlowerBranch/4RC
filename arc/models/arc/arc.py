@@ -31,6 +31,8 @@ class Arc(
 ):
     PATCH_SIZE = 14
     TIME_INDEX_KEY = "time_index"
+    DEPTH_KEY = "depth_map"
+    CAMERA_VECTOR_KEY = "camera_vector"
     MAX_TIME_INDICES = 32
     # Freeze presets that train the temporal-tracking stack; set_freeze is the
     # single authority on mode names.
@@ -41,6 +43,10 @@ class Arc(
     )
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
+        "backbone.pretrained.depth_patch_embed.weight",
+        "backbone.pretrained.depth_patch_embed.bias",
+        "backbone.pretrained.camera_proj.weight",
+        "backbone.pretrained.camera_proj.bias",
     )
     LEGACY_SAFETENSOR_ALIASES = {
         "head.scratch.output_conv2_aux.1.2.weight":
@@ -128,8 +134,19 @@ class Arc(
             batch_size=images.shape[0],
             device=images.device,
         )
+        depth_maps = self._preprocess_depth_maps(
+            views,
+            batch_size=images.shape[0],
+            spatial_shape=images.shape[-2:],
+            device=images.device,
+        )
+        camera_vectors = self._preprocess_camera_vectors(
+            views,
+            batch_size=images.shape[0],
+            device=images.device,
+        )
 
-        return images, track_query_idx_list, time_indices
+        return images, track_query_idx_list, time_indices, depth_maps, camera_vectors
 
     def _preprocess_time_indices(self, views, batch_size, device):
         has_time_index = [self.TIME_INDEX_KEY in view for view in views]
@@ -176,6 +193,99 @@ class Arc(
                 f"got range [{min_index}, {max_index}]"
             )
         return time_indices
+
+    def _preprocess_depth_maps(self, views, batch_size, spatial_shape, device):
+        has_depth = [self.DEPTH_KEY in view for view in views]
+        if not any(has_depth):
+            return None
+        if not all(has_depth):
+            raise ValueError(
+                f"Either every view must provide '{self.DEPTH_KEY}' or none may provide it"
+            )
+
+        height, width = spatial_shape
+        per_view_maps = []
+        for view_idx, view in enumerate(views):
+            value = view[self.DEPTH_KEY]
+            try:
+                value = torch.as_tensor(value, device=device)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"View {view_idx} '{self.DEPTH_KEY}' must contain floating-point values"
+                ) from exc
+
+            if not value.is_floating_point():
+                raise TypeError(
+                    f"View {view_idx} '{self.DEPTH_KEY}' must contain floating-point values"
+                )
+
+            if value.shape == (2, height, width):
+                value = value.unsqueeze(0).expand(batch_size, -1, -1, -1)
+            elif value.shape == (batch_size, 2, height, width):
+                pass
+            else:
+                raise ValueError(
+                    f"View {view_idx} '{self.DEPTH_KEY}' must have shape "
+                    f"(2, {height}, {width}) or ({batch_size}, 2, {height}, {width}), "
+                    f"got {tuple(value.shape)}"
+                )
+
+            per_view_maps.append(value.to(dtype=torch.float32))
+
+        depth_maps = torch.stack(per_view_maps, dim=1)
+        if not torch.isfinite(depth_maps).all():
+            # 0 * inf is nan: a non-finite entry defeats the zero-init weight
+            # and poisons the first backward. The loader is the sanitiser; the
+            # model refuses.
+            raise ValueError(
+                f"'{self.DEPTH_KEY}' must be finite; sanitise non-finite, "
+                "non-positive and beyond-threshold depth to zeros in BOTH "
+                "channels before the model"
+            )
+        return depth_maps
+
+    def _preprocess_camera_vectors(self, views, batch_size, device):
+        has_camera = [self.CAMERA_VECTOR_KEY in view for view in views]
+        if not any(has_camera):
+            return None
+        if not all(has_camera):
+            raise ValueError(
+                f"Either every view must provide '{self.CAMERA_VECTOR_KEY}' or none may provide it"
+            )
+
+        per_view_vectors = []
+        for view_idx, view in enumerate(views):
+            value = view[self.CAMERA_VECTOR_KEY]
+            try:
+                value = torch.as_tensor(value, device=device)
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f"View {view_idx} '{self.CAMERA_VECTOR_KEY}' must contain "
+                    "floating-point values"
+                ) from exc
+
+            if not value.is_floating_point():
+                raise TypeError(
+                    f"View {view_idx} '{self.CAMERA_VECTOR_KEY}' must contain "
+                    "floating-point values"
+                )
+
+            if value.shape == (11,):
+                value = value.unsqueeze(0).expand(batch_size, -1)
+            elif value.shape == (batch_size, 11):
+                pass
+            else:
+                raise ValueError(
+                    f"View {view_idx} '{self.CAMERA_VECTOR_KEY}' must have shape "
+                    f"(11,) or ({batch_size}, 11), got {tuple(value.shape)}"
+                )
+
+            per_view_vectors.append(value.to(dtype=torch.float32))
+
+        camera_vectors = torch.stack(per_view_vectors, dim=1)
+        if not torch.isfinite(camera_vectors).all():
+            raise ValueError(f"'{self.CAMERA_VECTOR_KEY}' must be finite")
+        return camera_vectors
 
     def _normalize_track_query_idx(self, track_query_idx, num_views):
         if isinstance(track_query_idx, torch.Tensor):
@@ -350,7 +460,7 @@ class Arc(
             if index % 2 == 1
         ]
 
-    def set_freeze(self, freeze, *, late_global_blocks=None):
+    def set_freeze(self, freeze, *, late_global_blocks=None, depth_input=False, camera_input=False):
         supported_modes = {"none", *self.TEMPORAL_FREEZE_MODES}
         if freeze not in supported_modes:
             raise ValueError(
@@ -404,6 +514,17 @@ class Arc(
             self.backbone.pretrained.time_index_embedding.requires_grad_(True)
             self.motion_decoder.requires_grad_(True)
             self.track_head.requires_grad_(True)
+            # The zero-init geometry injections train only when their flag
+            # says so: unfreeze is by NAME here or a module trains nothing,
+            # silently, under a healthy-looking loss curve. Under 'none' the
+            # blanket above already trains them, so the flags decide anything
+            # only under the temporal presets. camera_proj exists whenever the
+            # encoder has a camera token; Arc hard-codes alt_start=13, so the
+            # attribute access cannot miss through Arc.
+            if depth_input:
+                self.backbone.pretrained.depth_patch_embed.requires_grad_(True)
+            if camera_input:
+                self.backbone.pretrained.camera_proj.requires_grad_(True)
         for index in unfrozen_block_indices:
             self.backbone.pretrained.blocks[index].requires_grad_(True)
 
@@ -590,7 +711,9 @@ class Arc(
             profiling_info = {} if profiling else None
             start_time = time.time()
 
-        images, track_query_idx, time_indices = self._preprocess_input(views)
+        images, track_query_idx, time_indices, depth_maps, camera_vectors = (
+            self._preprocess_input(views)
+        )
 
         predictions = self._forward(
             images,
@@ -598,6 +721,8 @@ class Arc(
             inference_track=inference_track,
             time_indices=time_indices,
             merge_synchronized_slots=merge_synchronized_slots,
+            depth_maps=depth_maps,
+            camera_vectors=camera_vectors,
             **kwargs,
         )
         
@@ -618,11 +743,16 @@ class Arc(
         inference_track: bool = True,
         time_indices=None,
         merge_synchronized_slots: bool = False,
+        *,
+        depth_maps=None,
+        camera_vectors=None,
     ) -> Dict[str, torch.Tensor]:
         feats = self.encode_features(
             x,
             ref_view_strategy=ref_view_strategy,
             time_indices=time_indices,
+            depth_maps=depth_maps,
+            camera_vectors=camera_vectors,
         )
 
         track_query_idx_list = self._normalize_track_query_idx(track_query_idx, x.shape[1])
@@ -666,6 +796,9 @@ class Arc(
         x: torch.Tensor,
         ref_view_strategy: str = "first",
         time_indices=None,
+        *,
+        depth_maps=None,
+        camera_vectors=None,
     ):
         """Run the backbone once and return its tap list.
 
@@ -678,6 +811,8 @@ class Arc(
             x,
             ref_view_strategy=ref_view_strategy,
             time_indices=time_indices,
+            depth_maps=depth_maps,
+            camera_vectors=camera_vectors,
         )
         return feats
 

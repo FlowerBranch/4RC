@@ -36,9 +36,11 @@ from arc.training.sparse_tracking import (
 
 
 # Per freeze mode: (trainable tensor count, trainable parameters excluding the
-# time-index embedding, whose row count is a flag). Measured on a meta-device
-# Arc. A refactor that silently changes a freeze mask must fail here rather
-# than quietly costing GPU weeks.
+# time-index embedding, whose row count is a flag, and excluding the geometry
+# injections, whose trainability is a flag -- both enter as explicit separate
+# terms in assert_trainable_parameter_set). Measured on a meta-device Arc. A
+# refactor that silently changes a freeze mask must fail here rather than
+# quietly costing GPU weeks.
 EXPECTED_TRAINABLE_SETS = {
     "temporal_tracking": (231, 314_551_588),
     "temporal_tracking_global_attention": (483, 711_268_132),
@@ -56,6 +58,28 @@ DEFAULT_LATE_GLOBAL_BLOCKS = 4
 MAX_LATE_GLOBAL_BLOCKS = 14
 TIME_EMBEDDING_DIM = 1536
 TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
+# The encoder's own width, patch size and the injections' input widths,
+# mirrored like TIME_EMBEDDING_DIM so this module stays import-light; a test
+# pins them against the meta-device Arc's real modules. ENCODER_EMBED_DIM is
+# numerically TIME_EMBEDDING_DIM today but names a different fact: the
+# injections' sizes depend on the encoder width, not the time table's row
+# width.
+ENCODER_EMBED_DIM = 1536
+ENCODER_PATCH_SIZE = 14
+DEPTH_EMBED_CHANNELS = 2
+CAMERA_VECTOR_DIM = 11
+# (tensor count, parameter count) each zero-init injection adds when its flag
+# unfreezes it: one weight plus one bias, derived from embed_dim and patch
+# size rather than hand-counted.
+DEPTH_EMBED_TRAINABLE = (
+    2,
+    ENCODER_EMBED_DIM * DEPTH_EMBED_CHANNELS * ENCODER_PATCH_SIZE**2
+    + ENCODER_EMBED_DIM,
+)
+CAMERA_PROJ_TRAINABLE = (
+    2,
+    ENCODER_EMBED_DIM * CAMERA_VECTOR_DIM + ENCODER_EMBED_DIM,
+)
 
 
 def expected_trainable_set(freeze_mode, late_global_blocks):
@@ -83,6 +107,8 @@ def assert_trainable_parameter_set(
     freeze_mode: str,
     max_time_indices: int,
     late_global_blocks: int | None = None,
+    depth_input: bool = False,
+    camera_input: bool = False,
 ) -> dict:
     """Fail if the freeze mask is not exactly the set the mode promises.
 
@@ -104,6 +130,14 @@ def assert_trainable_parameter_set(
     expected_parameter_count = (
         expected_non_embedding + max_time_indices * TIME_EMBEDDING_DIM
     )
+    # Each injection is its own explicit term, like the embedding above, so
+    # all four flag arms derive from the one table.
+    if depth_input:
+        expected_tensors += DEPTH_EMBED_TRAINABLE[0]
+        expected_parameter_count += DEPTH_EMBED_TRAINABLE[1]
+    if camera_input:
+        expected_tensors += CAMERA_PROJ_TRAINABLE[0]
+        expected_parameter_count += CAMERA_PROJ_TRAINABLE[1]
     note = "" if late_global_blocks is None else f", k={late_global_blocks}"
     if (
         report["tensor_count"] != expected_tensors
@@ -181,6 +215,11 @@ def move_views_to_cuda(views: list[dict]) -> None:
     for view in views:
         for key in ("img", "time_index", "track_query_idx"):
             view[key] = view[key].to("cuda", non_blocking=True)
+        # Optional geometry inputs: present only when the run's flags attach
+        # them, so unlike the trio above their absence is not an error.
+        for key in ("depth_map", "camera_vector"):
+            if key in view:
+                view[key] = view[key].to("cuda", non_blocking=True)
 
 
 def shuffled_index_views(scene) -> list[dict] | None:
@@ -237,16 +276,37 @@ def build_optimizer(
         for parameter in model.backbone.pretrained.time_index_embedding.parameters()
         if parameter.requires_grad
     ]
+    # The zero-init geometry injections go in the decoder group at the full
+    # rate, deliberately: (a) they are fresh capacity that must grow out of
+    # zero, not pretrained features the 0.1x encoder rate exists to protect;
+    # (b) under the narrow temporal_tracking preset the encoder group must
+    # stay empty (its rate is reported as None), which an injection placed
+    # there would silently change. getattr because tiny test doubles carry no
+    # injections; a real trainable injection that escaped collection still
+    # trips the grouped != trainable refusal below.
+    injection_parameters = [
+        parameter
+        for module in (
+            getattr(model.backbone.pretrained, "depth_patch_embed", None),
+            getattr(model.backbone.pretrained, "camera_proj", None),
+        )
+        if module is not None
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
     head_parameters = [
         parameter
         for module in (model.motion_decoder, model.track_head)
         for parameter in module.parameters()
         if parameter.requires_grad
-    ]
+    ] + injection_parameters
     encoder_parameters = [
         parameter
         for name, parameter in model.backbone.named_parameters()
-        if parameter.requires_grad and "time_index_embedding" not in name
+        if parameter.requires_grad
+        and "time_index_embedding" not in name
+        and "depth_patch_embed" not in name
+        and "camera_proj" not in name
     ]
     learning_rates = {
         "decoder": lr,
@@ -349,8 +409,13 @@ def backward_through_cut(pairs) -> None:
 def encode_and_reconstruct(model, views):
     """The per-step work that does not depend on which frame is the query."""
 
-    images, _, time_indices = model._preprocess_input(views)
-    feats = model.encode_features(images, time_indices=time_indices)
+    images, _, time_indices, depth_maps, camera_vectors = model._preprocess_input(views)
+    feats = model.encode_features(
+        images,
+        time_indices=time_indices,
+        depth_maps=depth_maps,
+        camera_vectors=camera_vectors,
+    )
     return images, feats, model.reconstruct(feats, images)
 
 

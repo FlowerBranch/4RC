@@ -415,20 +415,22 @@ class SceneCache:
     def fingerprint(scene) -> tuple:
         """The mutable per-view state a step could plausibly rebind or write.
 
-        Deliberately cheap: identities and shapes of the big tensors, values of
-        the two tiny index tensors. It catches a rebind (``view[k] = ...``) and a
-        write to the indices, which is the class of mutation the step loop can
-        actually perform, without touching a pixel.
+        Deliberately cheap: identities and shapes of the big tensors (the image
+        and, when the run attaches it, the depth-input map), values of the tiny
+        index tensors and the 11-entry camera vector. It catches a rebind
+        (``view[k] = ...``) and a write to the small tensors, which is the class
+        of mutation the step loop can actually perform, without touching a
+        pixel.
         """
 
         state = []
         for view in getattr(scene, "views", []) or []:
             entry = []
-            for name in ("img", "time_index", "track_query_idx"):
+            for name in ("img", "depth_map", "time_index", "track_query_idx", "camera_vector"):
                 value = view.get(name) if hasattr(view, "get") else None
                 if value is None:
                     entry.append(None)
-                elif name == "img":
+                elif name in ("img", "depth_map"):
                     entry.append((id(value), tuple(value.shape), str(value.device)))
                 else:
                     entry.append(tuple(value.reshape(-1).tolist()))
@@ -1694,6 +1696,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument(
+        "--depth_input",
+        action="store_true",
+        help=(
+            "Feed each view's depth map to the encoder: resampled to the model "
+            "grid by the same index gather the anchor pointmaps use, encoded "
+            "as depth/--kubric_max_depth in (0, 1] plus a validity channel, "
+            "with non-finite, non-positive and beyond---kubric_max_depth "
+            "entries zeroed in both channels -- the same invalidation the "
+            "loader already applies to the label depth. Metric scale kept; no "
+            "per-view normalisation. Added to the RGB patch tokens through a "
+            "zero-initialised patch conv, so the released checkpoint loads "
+            "bit-identically and one checkpoint runs with the flag on or off. "
+            "Off, the default, is exactly today's behaviour."
+        ),
+    )
+    training.add_argument(
+        "--camera_input",
+        action="store_true",
+        help=(
+            "Feed each view's ground-truth camera to the encoder: an 11-vector "
+            "(camera-to-world pose encoding plus the model-grid principal "
+            "point) added into the camera token through a zero-initialised "
+            "projection; no new token slot. NOTE the injected pose also changes "
+            "the frozen camera decoder's OUTPUT (pose_enc -> predicted "
+            "pointmaps -> Sim(3) -> the query anchor), so this arm's gain does "
+            "not arrive purely through the track head: score it ALSO with "
+            "--ground_truth_query_anchor so the anchor path and the track-head "
+            "path separate. Off, the default, is exactly today's behaviour."
+        ),
+    )
+    training.add_argument(
         "--velocity_weight",
         type=float,
         default=0.0,
@@ -2274,6 +2307,13 @@ def _plan_summary(tally, args) -> dict:
             # test the way the weights are; recorded because the two curves are
             # not comparable and the summary must say which one this is.
             "merge_synchronized_slots": bool(args.merge_synchronized_slots),
+            # Which inputs the encoder received. Zero-init makes a flag-off
+            # checkpoint loadable either way, so only the summary can say which
+            # geometry a curve was trained on -- and the camera arm's curve is
+            # additionally anchor-contaminated (see --camera_input's help), so
+            # it must be read beside a --ground_truth_query_anchor run.
+            "depth_input": bool(args.depth_input),
+            "camera_input": bool(args.camera_input),
             # Whether the held-out tracks were anchored at ground truth. An
             # oracle-anchored curve is an upper bound on the geometry, not a
             # measurement of the model, so it is not comparable with a real one.
@@ -3006,6 +3046,11 @@ def _checkpoint_settings(args) -> dict:
         # grad_accum -- changing it mid-run continues the step counter over a
         # different function class entirely.
         "merge_synchronized_slots": bool(args.merge_synchronized_slots),
+        # Which inputs every step trains on, and which parameters exist to
+        # train at all. Refused like merge_synchronized_slots: flipping either
+        # mid-run continues the step counter over a different function class.
+        "depth_input": bool(args.depth_input),
+        "camera_input": bool(args.camera_input),
         "confidence_alpha": args.confidence_alpha,
         # Derived state rather than a flag, and so deliberately in NEITHER resume
         # tier: check_resume_settings iterates the two tuples only, so this rides
@@ -3124,6 +3169,8 @@ _RESUME_SETTINGS_REFUSED = (
     "sync_weight",
     "velocity_weight",
     "merge_synchronized_slots",
+    "depth_input",
+    "camera_input",
     "confidence_alpha",
     "precision",
     "grad_accum",
@@ -3177,6 +3224,13 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # absence resolves, pre-flag runs resume silently on the per-slot path, and
     # resuming one with the merge on is refused like any changed value.
     "merge_synchronized_slots": False,
+    # A checkpoint from before --depth_input / --camera_input could only have
+    # been written with the geometry inputs off: the injection parameters did
+    # not exist. So absence resolves, pre-flag runs resume silently with the
+    # inputs off, and resuming one with a flag on is refused like any changed
+    # value.
+    "depth_input": False,
+    "camera_input": False,
     # A checkpoint from before --val_seq_len could only have been written by a
     # run whose held-out window already fit the 24-frame clip: run_training
     # loads every held-out scene in its preflight, before step 0 and before the
@@ -3441,13 +3495,20 @@ def main() -> None:
     model = Arc.from_pretrained(
         args.checkpoint_dir, max_time_indices=args.max_time_indices
     ).to("cuda")
-    model.set_freeze(args.freeze_mode, late_global_blocks=late_global_blocks)
+    model.set_freeze(
+        args.freeze_mode,
+        late_global_blocks=late_global_blocks,
+        depth_input=args.depth_input,
+        camera_input=args.camera_input,
+    )
     model.set_encoder_local_checkpointing(args.encoder_local_checkpointing)
     report = assert_trainable_parameter_set(
         model,
         freeze_mode=args.freeze_mode,
         max_time_indices=args.max_time_indices,
         late_global_blocks=late_global_blocks,
+        depth_input=args.depth_input,
+        camera_input=args.camera_input,
     )
     print(
         f"trainable={report['tensor_count']} tensors / "
@@ -3482,6 +3543,8 @@ def main() -> None:
         max_depth=args.kubric_max_depth,
         query_anchor_slots=parse_query_anchor_slots(args.query_anchors),
         adaptive_query_anchors=args.adaptive_query_anchors,
+        input_depth=args.depth_input,
+        input_camera_vectors=args.camera_input,
     )
     val_plans = _val_plans(args)
     if val_plans:

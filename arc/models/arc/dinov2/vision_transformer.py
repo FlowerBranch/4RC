@@ -175,7 +175,30 @@ class DinoVisionTransformer(nn.Module):
         )
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Zero-init geometry injections. ALWAYS constructed, never gated on a
+        # training flag, so the state-dict key set is stable: one checkpoint
+        # runs with or without the inputs, and the released checkpoint loads
+        # with these as legacy missing keys (Arc.LEGACY_CHECKPOINT_MISSING_KEYS)
+        # -- the time_index_embedding contract. Consumption is gated on the
+        # caller passing the tensors; trainability on Arc.set_freeze's flags.
+        # fork_rng because Conv2d/Linear default init draws from the global RNG
+        # before the zeros overwrite it, and that draw would silently shift
+        # every later randn() against the pre-injection code: flag-off must be
+        # bit-identical including the seeded construction path. fork_rng with
+        # devices=[] preserves the CPU generator only, which covers every
+        # in-repo construction (CPU or meta device); a CUDA-default-device
+        # construction would still advance the CUDA stream.
+        with torch.random.fork_rng(devices=[]):
+            self.depth_patch_embed = nn.Conv2d(
+                2, embed_dim, kernel_size=patch_size, stride=patch_size
+            )
+        nn.init.zeros_(self.depth_patch_embed.weight)
+        nn.init.zeros_(self.depth_patch_embed.bias)
         if self.alt_start != -1:
+            with torch.random.fork_rng(devices=[]):
+                self.camera_proj = nn.Linear(11, embed_dim)
+            nn.init.zeros_(self.camera_proj.weight)
+            nn.init.zeros_(self.camera_proj.bias)
             self.camera_token = nn.Parameter(torch.randn(1, 2, embed_dim))
             if self.has_time_token:
                 self.time_token = nn.Parameter(torch.randn(1, 1, embed_dim))
@@ -278,10 +301,21 @@ class DinoVisionTransformer(nn.Module):
         cls_token = cls_token.reshape(B * S, -1, self.embed_dim)
         return cls_token
 
-    def prepare_tokens_with_masks(self, x, masks=None, cls_token=None, **kwargs):
+    def prepare_tokens_with_masks(self, x, masks=None, cls_token=None, *, depth_maps=None, **kwargs):
         B, S, nc, w, h = x.shape
         x = rearrange(x, "b s c h w -> (b s) c h w")
         x = self.patch_embed(x)
+        if depth_maps is not None:
+            # Added to the patch tokens BEFORE the cls concat and BEFORE the
+            # positional encoding: the sum is what a patch means downstream.
+            # A named keyword-only parameter, not a **kwargs read --
+            # _get_intermediate_layers_not_chunked must thread it explicitly
+            # at its call site, and the executed-branch test proves it cannot
+            # be silently swallowed by the ignored **kwargs.
+            depth_tokens = self.depth_patch_embed(
+                rearrange(depth_maps, "b s c h w -> (b s) c h w")
+            )
+            x = x + depth_tokens.flatten(2).transpose(1, 2)
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
         cls_token = self.prepare_cls_token(B, S)
@@ -345,6 +379,53 @@ class DinoVisionTransformer(nn.Module):
                 f"got range [{min_index}, {max_index}]"
             )
         return time_indices
+
+    def _validate_depth_maps(self, depth_maps, B, S, H, W, device):
+        if depth_maps is None:
+            return None
+        if not isinstance(depth_maps, torch.Tensor):
+            depth_maps = torch.as_tensor(depth_maps, device=device)
+        if not depth_maps.is_floating_point():
+            raise TypeError("depth_maps must be a floating-point tensor")
+        if depth_maps.shape != (B, S, 2, H, W):
+            raise ValueError(
+                f"depth_maps must have shape ({B}, {S}, 2, {H}, {W}), "
+                f"got {tuple(depth_maps.shape)}"
+            )
+        if not torch.isfinite(depth_maps).all():
+            # 0 * inf is nan: a non-finite entry defeats the zero-init weight
+            # and poisons the first backward, so it is refused rather than
+            # relied on to wash out.
+            raise ValueError(
+                "depth_maps must be finite; sanitise non-finite, non-positive "
+                "and beyond-threshold depth to zeros in BOTH channels before "
+                "the encoder"
+            )
+        return depth_maps.to(device=device, dtype=torch.float32)
+
+    def _validate_camera_vectors(self, camera_vectors, B, S, device):
+        if camera_vectors is None:
+            return None
+        if self.alt_start == -1:
+            # No camera token exists to add into: accepting the vectors here
+            # would validate them and then silently drop them, which under
+            # zero-init is indistinguishable from working code.
+            raise ValueError(
+                "camera_vectors were provided but this encoder has no camera "
+                "token (alt_start == -1)"
+            )
+        if not isinstance(camera_vectors, torch.Tensor):
+            camera_vectors = torch.as_tensor(camera_vectors, device=device)
+        if not camera_vectors.is_floating_point():
+            raise TypeError("camera_vectors must be a floating-point tensor")
+        if camera_vectors.shape != (B, S, 11):
+            raise ValueError(
+                f"camera_vectors must have shape ({B}, {S}, 11), "
+                f"got {tuple(camera_vectors.shape)}"
+            )
+        if not torch.isfinite(camera_vectors).all():
+            raise ValueError("camera_vectors must be finite")
+        return camera_vectors.to(device=device, dtype=torch.float32)
 
     def _prepare_time_tokens(self, B, S, time_indices):
         time_tokens = self.time_token.expand(B, S, -1)
@@ -415,7 +496,16 @@ class DinoVisionTransformer(nn.Module):
             S,
             x.device,
         )
-        x = self.prepare_tokens_with_masks(x)
+        depth_maps = self._validate_depth_maps(
+            kwargs.get("depth_maps"), B, S, H, W, x.device
+        )
+        camera_vectors = self._validate_camera_vectors(
+            kwargs.get("camera_vectors"), B, S, x.device
+        )
+        # depth_maps MUST be threaded explicitly: prepare_tokens_with_masks
+        # declares **kwargs it never reads, and an argument landing there is
+        # indistinguishable from working code under zero-init.
+        x = self.prepare_tokens_with_masks(x, depth_maps=depth_maps)
         output, total_block_len, aux_output = [], len(self.blocks), []
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
@@ -436,11 +526,24 @@ class DinoVisionTransformer(nn.Module):
                 local_x = reorder_by_reference(local_x, b_idx)
                 if time_indices is not None:
                     time_indices = reorder_by_reference(time_indices, b_idx)
+                if camera_vectors is not None:
+                    # Consumed per view at i == alt_start, one iteration after
+                    # this reorder fires: an un-permuted vector would pair
+                    # camera k's pose with camera j's tokens. Depth needs no
+                    # line here -- it was added before the loop and rides
+                    # inside x.
+                    camera_vectors = reorder_by_reference(camera_vectors, b_idx)
 
             if self.alt_start != -1 and i == self.alt_start:
                 ref_token = self.camera_token[:, :1].expand(B, -1, -1)
                 src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                 cam_token = torch.cat([ref_token, src_token], dim=1)
+                if camera_vectors is not None:
+                    # Added INTO the existing slot 0, never a new token: the
+                    # prefix arithmetic in get_intermediate_layers and
+                    # patch_start_idx stay untouched, and zero-init reproduces
+                    # the bare overwrite bit for bit.
+                    cam_token = cam_token + self.camera_proj(camera_vectors)
                 x[:, :, 0] = cam_token
 
                 if self.has_time_token:
