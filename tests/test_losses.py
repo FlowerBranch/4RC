@@ -14,6 +14,7 @@ from arc.training import (
     compose_tracking_loss,
     confidence_occlusion_diagnostics,
     per_sample_huber_error,
+    refinement_iteration_weights,
     resolve_confidence_alpha,
     synchronized_consistency_loss,
     synchronized_consistency_stats,
@@ -956,3 +957,64 @@ def test_velocity_stats_report_the_residual_in_metres():
     assert stats["pair_count"] == 6
     assert stats["mean_m"] == pytest.approx((3 * 0.01**2) ** 0.5, rel=1e-5)
     assert stats["p90_m"] >= stats["median_m"] >= 0.0
+
+
+# ------------------------------------------- the refinement discount ---
+
+
+def test_refinement_iteration_weights_follow_mvtrackers_schedule():
+    """gamma ** (n - 1 - i) / n, mvtracker/models/core/losses.py:63 and :71:
+    divided by the COUNT, not the weight sum, so the tuple is not convex. A
+    helper that divided by the weight SUM would return (1/3, 2/3) at (2, 0.5)
+    and still be monotone; one with the exponent reversed would weight the
+    first iteration most; either passes a shape-only check and both fail
+    here. Powers of two pin exactly; (4, 0.8) is pinned with a tolerance
+    because 0.8 ** 3 / 4 lands one ulp from the decimal literal, and its sum
+    (0.738, not 1) is what refuses a renormalised schedule, which would
+    train the head at a different step size from MVTracker's."""
+
+    assert refinement_iteration_weights(2, 0.5) == (0.25, 0.5)
+    assert refinement_iteration_weights(4, 0.5) == (0.03125, 0.0625, 0.125, 0.25)
+    assert refinement_iteration_weights(3, 1.0) == (1 / 3, 1 / 3, 1 / 3)
+    assert sum(refinement_iteration_weights(2, 0.5)) == 0.75
+    weights = refinement_iteration_weights(4, 0.8)
+    assert weights == pytest.approx((0.128, 0.16, 0.2, 0.25), abs=1e-12)
+    assert sum(weights) == pytest.approx(0.738, abs=1e-12)
+    assert list(weights) == sorted(weights)
+    assert weights[-1] == 0.25
+
+
+@pytest.mark.parametrize("gamma", [0.3, 0.5, 0.8, 1.0])
+def test_one_iteration_weighs_exactly_one(gamma):
+    """Exact equality, not approx: this is the bit-identity the trainer's
+    K=1 path rests on -- anchor_total * window_scale * 1.0 is today's
+    scalar only because the weight is the float 1.0 and nothing near it."""
+
+    assert refinement_iteration_weights(1, gamma) == (1.0,)
+
+
+@pytest.mark.parametrize(
+    "iterations, gamma, error",
+    [
+        (True, 0.8, TypeError),
+        (2.0, 0.8, TypeError),
+        (2, True, TypeError),
+        (0, 0.8, ValueError),
+        (-1, 0.8, ValueError),
+        (2, 0.0, ValueError),
+        (2, -0.5, ValueError),
+        (2, 1.5, ValueError),
+        (2, float("nan"), ValueError),
+        (2, float("inf"), ValueError),
+    ],
+)
+def test_refinement_iteration_weights_refuse_bad_inputs(iterations, gamma, error):
+    """A bool count would silently mean one or two iterations; a bool gamma
+    would silently mean 1.0; a zero gamma zeroes every iteration but the
+    last, one above 1 inverts the discount, and a non-finite one poisons the
+    backwarded scalar while the reported loss -- the undiscounted final
+    Huber -- stays finite. Types match set_freeze's k: TypeError for the
+    kind of the value, ValueError for its range."""
+
+    with pytest.raises(error):
+        refinement_iteration_weights(iterations, gamma)

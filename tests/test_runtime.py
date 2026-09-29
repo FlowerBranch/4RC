@@ -19,6 +19,8 @@ trainer.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -288,6 +290,131 @@ def test_encode_and_reconstruct_threads_geometry_to_encode_features():
 
     assert recorded["depth_maps"] is depth_sentinel
     assert recorded["camera_vectors"] is camera_sentinel
+
+
+# ------------------------------------------------------------- the refiner ---
+
+
+def test_refiner_trainable_set_matches_the_meta_arc_module():
+    """REFINER_TRAINABLE is arithmetic from the refiner's widths, which
+    runtime imports from motiondecoder rather than restating; this proves the
+    arithmetic against the real module's parameter count and the module's
+    shapes against those widths -- the way the injection constants are proven
+    against the meta-device Arc. A drift prices the arm wrong, and the startup
+    guard then refuses every --refine_iters run -- or, worse, accepts one whose
+    refiner is frozen."""
+
+    refiner = _meta_arc().motion_decoder.refiner
+    assert runtime.REFINER_TRAINABLE == (
+        8,
+        sum(parameter.numel() for parameter in refiner.parameters()),
+    )
+    assert runtime.REFINER_TRAINABLE[1] == 1_398_016
+    assert refiner.field_embed.in_channels == runtime.REFINER_FIELD_CHANNELS
+    assert refiner.field_embed.kernel_size == (runtime.ENCODER_PATCH_SIZE,) * 2
+    assert refiner.query_proj.out_features == runtime.REFINER_CORRELATION_DIM
+    assert refiner.key_proj.out_features == runtime.REFINER_CORRELATION_DIM
+    assert refiner.read_proj.in_features == runtime.REFINER_NEIGHBOURS * 4
+    assert refiner.read_proj.out_features == runtime.ENCODER_EMBED_DIM
+
+
+@pytest.mark.parametrize("refine", [False, True])
+def test_assert_trainable_parameter_set_prices_the_refine_arm(refine):
+    """The refiner's startup guard, in both directions: a driver that unfroze
+    the refiner but priced it as off fails here, and so does one that priced
+    a K=4 arm as on while set_freeze left it frozen -- the fed-but-frozen
+    case no gradient guard can see: a refiner fed K iterations but frozen is
+    zero-init and therefore bit-identical to K=1. At refine=False the rows
+    are today's exactly, which is the flag-off half of the pin."""
+
+    model = _meta_arc()
+    model.set_freeze("temporal_tracking", refine=refine)
+    report = runtime.assert_trainable_parameter_set(
+        model, freeze_mode="temporal_tracking", max_time_indices=32, refine=refine
+    )
+    assert report["tensor_count"] == 231 + runtime.REFINER_TRAINABLE[0] * int(refine)
+    assert report["parameter_count"] == (
+        314_600_740 + runtime.REFINER_TRAINABLE[1] * int(refine)
+    )
+
+    with pytest.raises(RuntimeError, match="parameter set"):
+        runtime.assert_trainable_parameter_set(
+            model, freeze_mode="temporal_tracking", max_time_indices=32, refine=not refine
+        )
+
+
+@pytest.mark.parametrize("refine", [False, True])
+def test_build_optimizer_places_the_refiner_by_its_flag(refine):
+    """No change to build_optimizer was needed, which is a claim until driven:
+    the refiner sits inside motion_decoder, so it lands in the decoder group
+    at the full rate when trainable (fresh capacity, like the injections) and
+    is excluded by requires_grad when not. The narrow preset's encoder group
+    must stay empty either way, and this is what keeps that true if the
+    grouping is ever rewritten."""
+
+    model = _meta_arc()
+    model.set_freeze("temporal_tracking", refine=refine)
+
+    optimizer, learning_rates, encoder_parameters = runtime.build_optimizer(
+        model, lr=1e-3
+    )
+
+    assert encoder_parameters == []
+    assert learning_rates["encoder_blocks"] is None
+    grouped = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    decoder_group = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+    refiner_parameters = list(model.motion_decoder.refiner.parameters())
+    assert len(refiner_parameters) == 8
+    for parameter in refiner_parameters:
+        assert parameter.requires_grad is refine
+        assert (id(parameter) in decoder_group) is refine
+        assert (id(parameter) in grouped) is refine
+
+
+def test_anchor_tracks_passes_refinement_only_when_set():
+    """Recording is weight-free, so a dropped or always-passed keyword fails
+    here even though every field would look right. The three-positional fake
+    is the surface test_sparse_tracking's fakes bind; it must still be reached
+    with refinement None. The keyword fake must receive the very object, with
+    views_per_time and merge beside it."""
+
+    scene = SimpleNamespace(anchor_observation_slots=[3, 5])
+    feats, images = object(), object()
+    track = torch.zeros(1, 4, 2, 3, 3)
+    confidence = torch.zeros(1, 4, 2, 3)
+
+    class _Positional:
+        def track_for_query(self, feats, images, query_idx):
+            return track, confidence
+
+    raw = runtime.anchor_tracks(_Positional(), feats, images, scene, 1)
+    assert raw["track_multi"].shape == (1, 1, 4, 2, 3, 3)
+    assert raw["track_query_idx"].tolist() == [5]
+
+    seen = {}
+
+    class _Keyword:
+        def track_for_query(
+            self, feats, images, query_idx, *, views_per_time=1, merge=False, refinement=None
+        ):
+            seen.update(
+                query_idx=query_idx,
+                views_per_time=views_per_time,
+                merge=merge,
+                refinement=refinement,
+            )
+            return track, confidence
+
+    sentinel = object()
+    runtime.anchor_tracks(
+        _Keyword(), feats, images, scene, 0,
+        views_per_time=2, merge=True, refinement=sentinel,
+    )
+    assert seen == {"query_idx": 3, "views_per_time": 2, "merge": True, "refinement": sentinel}
 
 
 @pytest.mark.parametrize(

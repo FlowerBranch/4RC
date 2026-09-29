@@ -299,6 +299,14 @@ def _loop_args(tmp_path, **overrides):
         # parser's default and the behaviour every existing test assumes.
         depth_input=False,
         camera_input=False,
+        # The refinement pair: stream-defining (REFUSED tier, absent defaults
+        # 1 and the parser's gamma), read by _checkpoint_settings,
+        # _plan_summary, _validate_args and run_training's step and eval
+        # calls, so every loop test needs them present. One pass at the
+        # parser's gamma is today's behaviour and what every existing test
+        # assumes; at one pass gamma is inert.
+        refine_iters=1,
+        refine_gamma=0.8,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -867,6 +875,90 @@ def test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader():
         assert found.get(loader_name), f"{module.__name__} has no {loader_name} call"
         for call in found[loader_name]:
             assert loader_pairs <= flag_reads(call), (module.__name__, loader_name)
+
+
+def test_the_trainer_wires_the_refinement_flags_to_freeze_assert_step_and_eval():
+    """The fed-but-frozen pin for the refiner, inspected rather than executed
+    (test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader is
+    the precedent; main() is .to("cuda") unconditionally). A driver that
+    threads refine_iters into the step but not refine=args.refine_iters > 1
+    into set_freeze runs K iterations through a FROZEN zero-init refiner --
+    bit-identical to K=1, reported as a refinement arm; one that unfreezes it
+    but leaves refine_iters off evaluate_held_out scores a K-iteration model
+    at one iteration; one that drops refine_gamma from the step trains at the
+    default whatever the flag says. Every such call in the trainer must read
+    the args attribute, and the freeze predicate must be exactly
+    `args.refine_iters > 1` so the two call sites cannot disagree. Trainer
+    only: the overfit driver is deliberately not refinement-aware."""
+
+    calls = {}
+    for node in ast.walk(ast.parse(Path(train_cli.__file__).read_text())):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            calls.setdefault(name, []).append(node)
+
+    def keyword(call, name):
+        return next((item.value for item in call.keywords if item.arg == name), None)
+
+    def reads_args(node, attribute):
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+            and node.attr == attribute
+        )
+
+    def is_refine_predicate(node):
+        return (
+            isinstance(node, ast.Compare)
+            and reads_args(node.left, "refine_iters")
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Gt)
+            and len(node.comparators) == 1
+            and isinstance(node.comparators[0], ast.Constant)
+            and type(node.comparators[0].value) is int
+            and node.comparators[0].value == 1
+        )
+
+    for name in ("set_freeze", "assert_trainable_parameter_set"):
+        assert calls.get(name), f"trainer has no {name} call"
+        for call in calls[name]:
+            assert is_refine_predicate(keyword(call, "refine")), name
+    assert calls.get("step_fn"), "run_training has no step_fn call"
+    for call in calls["step_fn"]:
+        assert reads_args(keyword(call, "refine_iters"), "refine_iters")
+        assert reads_args(keyword(call, "refine_gamma"), "refine_gamma")
+    assert calls.get("evaluate_held_out"), "run_training has no evaluate_held_out call"
+    for call in calls["evaluate_held_out"]:
+        assert reads_args(keyword(call, "refine_iters"), "refine_iters")
+
+
+def test_the_refinement_flags_default_to_one_iteration_at_mvtrackers_gamma():
+    """One iteration is exactly today's step; 0.8 is MVTracker's gamma
+    (configs/train.yaml:38, sequence_loss_3d's default at losses.py:49) and
+    the value _RESUME_SETTINGS_ABSENT_DEFAULTS resolves a pre-flag checkpoint
+    to. Both keys must sit in the refused tier for that map to be read at
+    all; test_every_absent_default_is_the_parsers_own_default then checks the
+    agreement itself."""
+
+    args = train_cli.build_arg_parser().parse_args(["--manifest", "m.jsonl"])
+    assert args.refine_iters == 1 and type(args.refine_iters) is int
+    assert args.refine_gamma == train_cli.DEFAULT_REFINE_GAMMA == 0.8
+    assert isinstance(args.refine_gamma, float)
+    assert train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS["refine_iters"] == 1
+    assert (
+        train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS["refine_gamma"]
+        == train_cli.DEFAULT_REFINE_GAMMA
+    )
+    assert "refine_iters" in train_cli._RESUME_SETTINGS_REFUSED
+    assert "refine_gamma" in train_cli._RESUME_SETTINGS_REFUSED
+    assert "refine_iters" not in train_cli._RESUME_SETTINGS_WARNED
+    assert "refine_gamma" not in train_cli._RESUME_SETTINGS_WARNED
+
+    override = train_cli.build_arg_parser().parse_args(
+        ["--manifest", "m.jsonl", "--refine_iters", "4", "--refine_gamma", "0.5"]
+    )
+    assert (override.refine_iters, override.refine_gamma) == (4, 0.5)
 
 
 def test_the_init_flags_default_to_the_swept_band_and_reach_the_artifacts():
@@ -4106,6 +4198,50 @@ def test_the_geometry_inputs_are_recorded_in_the_plan_summary_settings(tmp_path)
             assert settings[key] is enabled
 
 
+def test_the_refinement_flags_are_recorded_in_the_plan_summary_settings(tmp_path):
+    """A K=1 and a K=3 run write the same checkpoint key set apart from the
+    refiner tensors, and the reported `loss` is the final iteration's either
+    way, so a curve alone does not say which K and gamma produced it; the
+    summary and the stored settings do. Stored in the checkpoint's plain
+    types, so a value round-tripped through torch.load(weights_only=True)
+    compares equal to a freshly parsed one."""
+
+    tally = SimpleNamespace(
+        planned=[],
+        skipped=[],
+        skip_counts={},
+        considered=0,
+        threshold_skip_fraction=0.0,
+    )
+
+    args = _validator_args(tmp_path, manifest="m.jsonl", refine_iters=3, refine_gamma=0.5)
+    settings = train_cli._plan_summary(tally, args)["settings"]
+    assert settings["refine_iters"] == 3
+    assert settings["refine_gamma"] == 0.5
+    stored = train_cli._checkpoint_settings(args)
+    assert stored["refine_iters"] == 3 and type(stored["refine_iters"]) is int
+    assert stored["refine_gamma"] == 0.5 and type(stored["refine_gamma"]) is float
+
+
+def test_unusable_refinement_flags_are_refused_at_parse_time(tmp_path):
+    """0 iterations would run no head and index an empty list; a bool is an
+    int subclass and True would silently mean one; a float count would
+    silently truncate in range() -- refused by isinstance, since a Namespace
+    can carry one even though the parser's int type never produces it.
+    gamma at 0 zeroes every iteration but the last, above 1 inverts the
+    discount, and a non-finite value poisons the backwarded scalar while the
+    reported loss stays finite. Refused by name at parse time, before the
+    model is loaded, in the file's own ValueError voice."""
+
+    for bad in (0, -1, True, 2.0):
+        with pytest.raises(ValueError, match="--refine_iters"):
+            train_cli._validate_args(_validator_args(tmp_path, refine_iters=bad))
+    for bad in (0.0, -0.5, 1.5, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="--refine_gamma"):
+            train_cli._validate_args(_validator_args(tmp_path, refine_gamma=bad))
+    train_cli._validate_args(_validator_args(tmp_path, refine_iters=4, refine_gamma=1.0))
+
+
 def test_unusable_loss_weights_are_refused_at_parse_time(tmp_path):
     for bad in (-1e-9, float("nan"), float("inf")):
         with pytest.raises(ValueError, match="--confidence_weight"):
@@ -6074,6 +6210,44 @@ def test_a_resume_that_changes_a_geometry_input_flag_is_refused(tmp_path, flag):
     stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{flag: True}))
     with pytest.raises(RuntimeError, match=f"carries {flag}=True"):
         train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+
+@pytest.mark.parametrize("flag, changed", (("refine_iters", 3), ("refine_gamma", 0.5)))
+def test_a_checkpoint_predating_the_refinement_flags_resumes_at_their_defaults(
+    tmp_path, flag, changed
+):
+    """Absence resolves to the parser's pair, for a sharper reason than
+    symmetry: a pre-flag checkpoint was necessarily K=1, and at K=1 gamma is
+    inert (gamma ** (K - 1 - i) is gamma ** 0), so 1 and 0.8 are the values
+    the stored run actually trained under. Resolved, not tolerated: resuming
+    a K=1 arm with the lever pulled is refused like any changed value, which
+    is the whole point -- the lever needs a fresh run."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path))
+    del stored[flag]
+
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
+
+    with pytest.raises(RuntimeError, match="predates"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, **{flag: changed}))
+
+
+@pytest.mark.parametrize(
+    "flag, before, after", (("refine_iters", 3, 1), ("refine_gamma", 0.8, 0.5))
+)
+def test_a_resume_that_changes_a_refinement_flag_is_refused(tmp_path, flag, before, after):
+    """Refused-tier by the tier's own rule for loss weights, not by analogy:
+    gamma reweights the per-iteration losses, so it IS a loss weight by that
+    rule's definition, and K decides how many of them there are; the reported
+    `loss` is the final iteration's position Huber under either, so nothing
+    in the history would show the switch. A warned-tier entry -- the reading
+    that gamma "only reshapes a schedule" -- would let a K=1 arm resume with
+    the lever pulled and be read as one curve."""
+
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{flag: before}))
+    with pytest.raises(RuntimeError, match=f"carries {flag}={before!r}"):
+        train_cli.check_resume_settings(stored, _loop_args(tmp_path, **{flag: after}))
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path, **{flag: before}))
 
 
 def test_a_checkpoint_predating_val_seq_len_resumes_at_the_default(tmp_path):

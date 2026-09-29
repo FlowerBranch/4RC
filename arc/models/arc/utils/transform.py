@@ -580,6 +580,63 @@ def unproject_depth(
     return world_points
 
 
+def predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
+    """Model-gauge world points of the model's own reconstruction, (1, S, H, W, 3).
+
+    Predicted depth unprojected through the predicted pose encoding, in the
+    reconstruction's own gauge -- the frame ``fit_scene_sim3`` maps FROM and
+    the frame raw track displacements live in: the same geometry
+    ``Arc._postprocess_output`` adds to the tracks, computed in torch here
+    and in numpy there from the same pose encoding, so equal up to float
+    rounding. float32, detached, on depth's device; B must be 1, which every
+    caller is. Moved here verbatim from
+    ``arc.training.sparse_tracking._predicted_pointmaps`` so the model can
+    read its own cloud (TrackRefiner) without importing from arc.training;
+    sparse_tracking imports it back under the old name for its two callers
+    and for the tests that plant a known gauge through that name.
+    """
+
+    required = {"depth", "pose_enc"}
+    missing = required - set(raw_predictions)
+    if missing:
+        raise KeyError(
+            f"Raw predictions are missing alignment fields: {sorted(missing)}"
+        )
+    depth = raw_predictions["depth"]
+    pose_encoding = raw_predictions["pose_enc"]
+    if depth.ndim != 4 or depth.shape[0] != 1:
+        raise ValueError(
+            "The bounded alignment expects depth with shape (1,S,H,W), got "
+            f"{tuple(depth.shape)}"
+        )
+    if pose_encoding.shape[:2] != depth.shape[:2] or pose_encoding.shape[-1] != 9:
+        raise ValueError(
+            "pose_enc must have shape (1,S,9) matching depth, got "
+            f"{tuple(pose_encoding.shape)}"
+        )
+
+    # Scene alignment is a detached numerical side path. Keep its geometry in
+    # float32 even when the caller is inside mixed-precision autocast; otherwise
+    # unprojection can return BF16 and NumPy cannot consume it below.
+    with torch.no_grad(), torch.autocast(
+        device_type=depth.device.type,
+        enabled=False,
+    ):
+        depth = depth.detach().float()
+        pose_encoding = pose_encoding.detach().float()
+        height, width = depth.shape[-2:]
+        camera_to_world, intrinsics = pose_encoding_to_extri_intri(
+            pose_encoding,
+            (height, width),
+        )
+        pointmaps = unproject_depth(
+            depth[..., None],
+            intrinsics,
+            as_homogeneous(camera_to_world),
+        )
+    return pointmaps.detach()
+
+
 def normalize_extrinsics(ex_t: torch.Tensor | None) -> torch.Tensor | None:
     """
     Normalize extrinsics to canonical coordinate system.

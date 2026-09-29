@@ -118,6 +118,13 @@ DEFAULT_MAX_UNREPLAYABLE_FRACTION = 0.02
 # checked against this fraction of the device rather than trusted -- the point is
 # to die with a step index and a number instead of a bare OOM at step 4000.
 DEFAULT_MAX_DEVICE_FRACTION = 0.97
+# MVTracker's discount over its unrolled iterations, sequence_loss_3d's own
+# default (mvtracker/models/core/losses.py:49): pass i of K is weighted
+# gamma ** (K - 1 - i) / K, so at 0.8 and K=4 the final pass carries 0.25 and
+# the first 0.128. Inert at --refine_iters 1, where the single weight is
+# gamma ** 0 / 1 == 1.0 exactly -- which is also why a pre-flag checkpoint
+# resolves to this value on resume (see _RESUME_SETTINGS_ABSENT_DEFAULTS).
+DEFAULT_REFINE_GAMMA = 0.8
 
 
 # Set by the signal handlers, read at the top of each accumulation window. A
@@ -202,6 +209,9 @@ class StepOutcome:
     # thing that says the per-anchor confidence shares have stopped matching the
     # mask the loss reduced over, since those shares cannot see either
     # prediction-finiteness or confidence-finiteness. None when the term is off.
+    # Under --refine_iters K > 1 this is the FINAL pass's count, like every
+    # other reported figure: every pass backwards the term, but drops on passes
+    # 0..K-2 are not reported anywhere. At K=1 the only pass is the final one.
     confidence_dropped: dict | None = None
     # Velocity-term pair samples per seated anchor, in spec order -- the same
     # shape as anchor_sample_counts and the same derivation, over pairs rather
@@ -210,6 +220,19 @@ class StepOutcome:
     # window offered it no pair". The latter is normal on a narrow window and is
     # what run_summary's velocity_term_totals counts.
     anchor_velocity_counts: list[int] | None = None
+    # Position Huber per refinement pass, in pass order, share-combined
+    # across the step's anchors exactly like `loss` -- same calls, same anchor
+    # order -- so its last entry equals `loss` bit for bit. None at
+    # --refine_iters 1, like loss_breakdown on a position-only step: a
+    # one-pass row carries null here. This is the instrument that says
+    # whether pass k+1 came in below pass k, readable from step 1 of any
+    # trainer run on real data -- the cheap reading the overfit driver would
+    # otherwise have offered. The overfit stays one-pass: the geometry inputs
+    # (59d1537) went into it only because it was the sole dumped-source driver
+    # the sidecar refusal could live in, which does not apply here, and a
+    # second unrolled loop inside its inline step loop is the shape that
+    # reintroduced the late-binding checkpoint bug once already.
+    iteration_losses: list[float] | None = None
 
 
 def compact_eligibility(eligibility: dict) -> dict:
@@ -524,6 +547,8 @@ def train_step(
     window_start: bool,
     window_end: bool,
     merge_synchronized_slots: bool = False,
+    refine_iters: int = 1,
+    refine_gamma: float = DEFAULT_REFINE_GAMMA,
 ) -> StepOutcome:
     """One micro-step over one scene, with every guard the harness runs.
 
@@ -550,16 +575,45 @@ def train_step(
     identical to one combined backward, while only one track-head graph is ever
     alive; the overfit measured the marginal anchor at a flat ~2.3 GiB where a
     widened Q axis would not fit the card). At a single active anchor the cut
-    is bypassed and the step runs the exact pre-multi-anchor graph:
-    ``Arc._forward`` is encode → reconstruct → per-query track with no other
-    glue, so the decomposition changes no kernel and no number.
+    is bypassed -- at ``--refine_iters 1``; see below -- and the step runs the
+    exact pre-multi-anchor graph: ``Arc._forward`` is encode → reconstruct →
+    per-query track with no other glue, so the decomposition changes no kernel
+    and no number.
+
+    Under ``--refine_iters K > 1`` each anchor's head pass is unrolled K times
+    on the same encoder taps. Pass k conditions the query patch tokens on pass
+    k-1's displacement field, DETACHED (:class:`RefinementInput`; a zero field
+    on pass 0), plus a nearest-neighbour read into the model's own predicted
+    cloud, built once per step from the same ``predicted_pointmaps`` the Sim(3)
+    fit and the anchor gather consume. Correspondences, anchors and the Sim(3)
+    are built once before any head pass and shared by every pass, so the K
+    losses differ only by the field scored. Every pass is scored by the same
+    :func:`sparse_tracking_loss` and backwarded on its own, weighted by
+    :func:`refinement_iteration_weights` -- MVTracker's ``gamma ** (K-1-k) / K``
+    -- so later passes weigh more and each is trained to improve on the last.
+    Every term of a pass (position, and confidence, sync, velocity when on) is
+    discounted alike: MVTracker predicts visibility once from its final
+    features, but here confidence is a channel of the same head output, so it
+    is supervised per pass under the same discount. Backwarding per pass is
+    what bounds retention to one head graph, exactly as backwarding per anchor
+    does; detaching the carry alone would not, since pass k's graph would stay
+    alive until the final pass's backward. It is also why the cut is taken at
+    K > 1 even at one anchor: pass k's backward frees the encoder graph pass
+    k+1 would otherwise need. ``loss`` and every share-combined figure --
+    ``confidence_dropped`` included -- are the FINAL pass's, so their meaning
+    is unchanged at any K; ``iteration_losses`` carries all K. At K=1 the
+    single weight is exactly 1.0 and the loop body is today's, statement for
+    statement.
     """
 
+    from arc.models.arc.heads.motiondecoder import RefinementInput, patch_centre_points
+    from arc.models.arc.utils.transform import predicted_pointmaps
     from arc.training import (
         build_anchor_correspondences,
         camera_major_layout,
         fit_scene_sim3,
         gather_query_anchor_points,
+        refinement_iteration_weights,
         sparse_tracking_loss,
     )
 
@@ -578,6 +632,14 @@ def train_step(
     # since the scaler's own factor is constant across the window (`update()`
     # only runs at the boundary, inside finish_window).
     window_scale = 1.0 / accum_steps
+    # One weight per refinement pass, MVTracker's discount: later passes weigh
+    # more so each is trained to improve on the last. At --refine_iters 1 this
+    # is exactly (1.0,), and the backward below multiplies by it
+    # unconditionally on the same bit-exactness argument as window_scale.
+    # Resolved here, before the encoder runs, so a bad count or gamma raises
+    # with no GPU work behind it (the helper refuses bool, K < 1 and a gamma
+    # outside (0, 1]; _validate_args already refused them by flag name).
+    iteration_weights = refinement_iteration_weights(refine_iters, refine_gamma)
 
     correspondences, eligibility = build_anchor_correspondences(scene)
     # ONE layout proof per step; every V/T-dependent reduction below -- the
@@ -683,12 +745,34 @@ def train_step(
         anchors, anchor_frame = gather_query_anchor_points(
             recon, scene, correspondences
         )
-        if len(active_anchors) == 1:
+        # The refiner's cloud: one patch-centre point per slot and patch of the
+        # model's OWN reconstruction, read once per step because every anchor
+        # and every pass reads the same cloud (reconstruct ran once, above).
+        # predicted_pointmaps is the unprojection the Sim(3) fit and the anchor
+        # gather above already consume -- it runs under no_grad in fp32 itself,
+        # so this line is safe inside the autocast block -- and so the cloud
+        # the refiner reads into is the gauge the loss composes in; no second
+        # unprojection anywhere. None at --refine_iters 1: nothing reads it,
+        # and building it would move peak_bytes on the flag-off step, the same
+        # reason the velocity counts are gated on their weight.
+        key_xyz = (
+            None
+            if refine_iters == 1
+            else patch_centre_points(predicted_pointmaps(recon), model.PATCH_SIZE)
+        )
+        if len(active_anchors) == 1 and refine_iters == 1:
             # One anchor needs no cut: its backward is the only one and runs
             # straight through the encoder, exactly the pre-multi-anchor graph.
             # The cut is not free — it holds an accumulated .grad on every
             # backbone tap for the whole step — and the committed window was
             # sized against the memory ceiling without one.
+            #
+            # Any --refine_iters above 1 needs the cut even at one anchor: pass
+            # k's backward frees the encoder graph pass k+1 would need, and a
+            # second head backward onto freed taps is autograd's "backward
+            # through the graph a second time" error. The cut's detached
+            # leaves are what let every pass backward onto the same taps. At
+            # --refine_iters 1 this condition is today's exactly.
             cut_feats, cut_pairs = feats, []
         else:
             cut_feats, cut_pairs = cut_features(feats)
@@ -709,113 +793,213 @@ def train_step(
     # outcome, which run_training pins -- by every later step of the run. None
     # here only on the first executed step of an --confidence_alpha auto run.
     step_alpha = confidence_alpha
+    # Bound before the loop rather than inside it: the refinement carry's zero
+    # field needs the output row count before the first head pass has returned
+    # one, and the shape check below compares against the same value. Pure
+    # Python over names already bound, so the flag-off step computes exactly
+    # what it did. R is the merged time count under the merge, else S.
+    expected_observation_axis = (
+        merged_time_count if merge_synchronized_slots else scene.num_observations
+    )
+    height, width = images.shape[-2:]
+    # Position Huber per refinement pass, share-combined across anchors exactly
+    # like step_loss below. None altogether at --refine_iters 1 (like
+    # loss_breakdown on a position-only step); at K > 1 a list of None that
+    # every active anchor fills at every pass, so no entry is None once the
+    # loop ends.
+    step_iteration_losses = None if refine_iters == 1 else [None] * refine_iters
     for anchor_index, anchor_weight in active_anchors:
-        with autocast_context(precision):
-            raw = anchor_tracks(
-                model,
-                cut_feats,
-                images,
-                scene,
-                anchor_index,
-                views_per_time=views_per_time,
-                merge=merge_synchronized_slots,
-            )
-            expected_observation_axis = (
-                merged_time_count if merge_synchronized_slots else scene.num_observations
-            )
-            if raw["track_multi"].shape[2] != expected_observation_axis:
-                raise RuntimeError(
-                    "Output observation axis does not match the scene's inputs"
-                    + (
-                        " (merged: one slot per time index expected)"
-                        if merge_synchronized_slots
-                        else ""
+        # The refinement carry: the previous pass's field, detached. None on
+        # pass 0, where the refiner reads a zero field. Detaching makes each
+        # pass's graph end at its own head pass; the per-pass backward below
+        # is what frees that graph before the next pass allocates.
+        previous_field = None
+        for iteration, iteration_weight in enumerate(iteration_weights):
+            final_iteration = iteration == refine_iters - 1
+            with autocast_context(precision):
+                # Branched so the flag-off call keeps its exact spelling:
+                # injected fakes bind today's anchor_tracks surface, which
+                # has no `refinement` keyword.
+                if refine_iters == 1:
+                    raw = anchor_tracks(
+                        model,
+                        cut_feats,
+                        images,
+                        scene,
+                        anchor_index,
+                        views_per_time=views_per_time,
+                        merge=merge_synchronized_slots,
                     )
+                else:
+                    # The zero field is fp32 on the images' device, the dtype
+                    # the track head returns (its autocast region is fp32),
+                    # so pass 0 and pass k hand the refiner one dtype. The
+                    # anchor's own patch centres are the query anchor's slot
+                    # of the cloud -- the S-grid slot index, the same one
+                    # anchor_tracks passes as track_query_idx.
+                    refinement = RefinementInput(
+                        previous_field=(
+                            torch.zeros(
+                                (1, expected_observation_axis, height, width, 3),
+                                device=images.device,
+                                dtype=torch.float32,
+                            )
+                            if previous_field is None
+                            else previous_field
+                        ),
+                        anchor_xyz=key_xyz[
+                            :, scene.anchor_observation_slots[anchor_index]
+                        ],
+                        key_xyz=key_xyz,
+                    )
+                    raw = anchor_tracks(
+                        model,
+                        cut_feats,
+                        images,
+                        scene,
+                        anchor_index,
+                        views_per_time=views_per_time,
+                        merge=merge_synchronized_slots,
+                        refinement=refinement,
+                    )
+                    # The dataclass is a second holder of the carry (its
+                    # previous_field IS the tensor `previous_field` names), so
+                    # dropping the local after the loop would not free it:
+                    # on the final pass this name would keep pass K-2's field
+                    # -- (1, R, H, W, 3) fp32, about 209 MiB at R=96 -- alive
+                    # through backward_through_cut and finish_window.
+                    # Released here, once the call has consumed it; the
+                    # autograd graph of `raw` holds the field until this
+                    # pass's backward, and `del raw` below ends that.
+                    del refinement
+                if raw["track_multi"].shape[2] != expected_observation_axis:
+                    raise RuntimeError(
+                        "Output observation axis does not match the scene's inputs"
+                        + (
+                            " (merged: one slot per time index expected)"
+                            if merge_synchronized_slots
+                            else ""
+                        )
+                    )
+                if stats is None and final_iteration:
+                    # The step's first anchor, not necessarily anchor 0:
+                    # active_anchors drops one with no supervised samples. Its
+                    # FINAL pass, so the reported channel is the one the eval
+                    # bundles carry; at K=1 that is pass 0, as today.
+                    stats = confidence_stats(raw)
+                result = sparse_tracking_loss(
+                    # conf_track_multi is dropped by default and the confidence term
+                    # needs it; keeping it costs device memory, so it is kept only
+                    # when something reads it. Sync needs only track_multi, which
+                    # survives either way.
+                    tracking_only(raw, keep_confidence=confidence_weight > 0),
+                    scene,
+                    per_anchor_correspondences[anchor_index],
+                    alignment,
+                    anchors[per_anchor_rows[anchor_index].to(anchors.device)],
+                    query_anchor_frame=anchor_frame,
+                    huber_delta_m=huber_delta_m,
+                    confidence_weight=confidence_weight,
+                    confidence_alpha=step_alpha,
+                    # UNDIVIDED here on purpose: this weight is only the gate that
+                    # decides whether the term is built at all, and the total it
+                    # composes is discarded by the multi-anchor path. The share
+                    # belongs to weighted_anchor_total below.
+                    sync_weight=sync_weight,
+                    velocity_weight=velocity_weight,
+                    collect_diagnostics=False,
+                    merge_synchronized_slots=merge_synchronized_slots,
                 )
-            if stats is None:
-                # The step's first anchor, not necessarily anchor 0:
-                # active_anchors drops one with no supervised samples.
-                stats = confidence_stats(raw)
-            result = sparse_tracking_loss(
-                # conf_track_multi is dropped by default and the confidence term
-                # needs it; keeping it costs device memory, so it is kept only
-                # when something reads it. Sync needs only track_multi, which
-                # survives either way.
-                tracking_only(raw, keep_confidence=confidence_weight > 0),
-                scene,
-                per_anchor_correspondences[anchor_index],
-                alignment,
-                anchors[per_anchor_rows[anchor_index].to(anchors.device)],
-                query_anchor_frame=anchor_frame,
-                huber_delta_m=huber_delta_m,
-                confidence_weight=confidence_weight,
-                confidence_alpha=step_alpha,
-                # UNDIVIDED here on purpose: this weight is only the gate that
-                # decides whether the term is built at all, and the total it
-                # composes is discarded by the multi-anchor path. The share
-                # belongs to weighted_anchor_total below.
-                sync_weight=sync_weight,
-                velocity_weight=velocity_weight,
-                collect_diagnostics=False,
-                merge_synchronized_slots=merge_synchronized_slots,
-            )
-            # Whatever the first active anchor resolved, every later one reuses.
-            # Guarded rather than assigned: an anchor whose confidence mask came
-            # back empty reports None, and letting that overwrite a resolved
-            # alpha would silently unpin the run one anchor into a step.
-            if result.confidence_alpha is not None:
-                step_alpha = result.confidence_alpha
-            # Each term's share of the step, so backwarding per anchor equals one
-            # combined reduction="mean". Position, confidence and velocity are
-            # shares of their own supervised samples -- three different masks,
-            # hence three different counts; velocity's is a reduction over PAIRS
-            # of slots, so it is not proportional to the position count either.
-            # Sync is a share of the ACTIVE ANCHORS: every anchor's
-            # sync_loss is a mean over an identical 1*P*H*W*3 element count (P, H
-            # and W depend on the window, never on which anchor), so equal
-            # denominators make the stacked-Q mean the plain mean of the
-            # per-anchor means. All three sets of shares sum to 1 whatever this
-            # step's anchor count turned out to be, which is what keeps the terms'
-            # balance fixed under --adaptive_query_anchors.
-            anchor_total = weighted_anchor_total(
-                result,
-                position_weight=anchor_weight,
-                confidence_weight=confidence_weight * confidence_shares[anchor_index],
-                sync_weight=sync_weight / len(active_anchors),
-                velocity_weight=velocity_weight * velocity_shares[anchor_index],
-            )
-        # Backward per anchor, so this anchor's track-head graph is freed
-        # before the next one allocates its own; the gradient lands on the cut
-        # and is pushed through the encoder once, after the loop. The window
-        # scale rides on the backwarded scalar only: the reported step_loss and
-        # friends below stay this micro-step's own undivided means, because 1/N
-        # is a cross-step weight, not a property of this scene's samples.
-        scaler.scale(anchor_total * window_scale).backward()
-        step_loss = accumulate_weighted(step_loss, result.loss, anchor_weight)
-        step_metric_error = accumulate_weighted(
-            step_metric_error, result.metric_error, anchor_weight
-        )
-        # The same shares the objective used, so the reported figures are the
-        # step's own means rather than one anchor's. accumulate_weighted passes
-        # None through, so a disabled term needs no branch here.
-        step_sync_loss = accumulate_weighted(
-            step_sync_loss, result.sync_loss, 1.0 / len(active_anchors)
-        )
-        step_velocity_loss = accumulate_weighted(
-            step_velocity_loss, result.velocity_loss, velocity_shares[anchor_index]
-        )
-        step_confidence_loss = accumulate_weighted(
-            step_confidence_loss,
-            result.confidence_loss,
-            confidence_shares[anchor_index],
-        )
-        if result.confidence_dropped is not None:
-            if step_confidence_dropped is None:
-                step_confidence_dropped = dict(result.confidence_dropped)
-            else:
-                for cause, count in result.confidence_dropped.items():
-                    step_confidence_dropped[cause] += count
-        del raw, result, anchor_total
+                # Whatever the first active anchor resolved, every later one reuses.
+                # Guarded rather than assigned: an anchor whose confidence mask came
+                # back empty reports None, and letting that overwrite a resolved
+                # alpha would silently unpin the run one anchor into a step. Under
+                # 'auto' the pin therefore comes from the first anchor's FIRST
+                # pass, and every later pass and anchor descends toward it.
+                if result.confidence_alpha is not None:
+                    step_alpha = result.confidence_alpha
+                # Each term's share of the step, so backwarding per anchor equals one
+                # combined reduction="mean". Position, confidence and velocity are
+                # shares of their own supervised samples -- three different masks,
+                # hence three different counts; velocity's is a reduction over PAIRS
+                # of slots, so it is not proportional to the position count either.
+                # Sync is a share of the ACTIVE ANCHORS: every anchor's
+                # sync_loss is a mean over an identical 1*P*H*W*3 element count (P, H
+                # and W depend on the window, never on which anchor), so equal
+                # denominators make the stacked-Q mean the plain mean of the
+                # per-anchor means. All three sets of shares sum to 1 whatever this
+                # step's anchor count turned out to be, which is what keeps the terms'
+                # balance fixed under --adaptive_query_anchors.
+                anchor_total = weighted_anchor_total(
+                    result,
+                    position_weight=anchor_weight,
+                    confidence_weight=confidence_weight * confidence_shares[anchor_index],
+                    sync_weight=sync_weight / len(active_anchors),
+                    velocity_weight=velocity_weight * velocity_shares[anchor_index],
+                )
+            # Backward per anchor AND per pass, so this pass's track-head graph
+            # is freed before the next one allocates its own; the gradient
+            # lands on the cut and is pushed through the encoder once, after
+            # the loop. The window scale and the pass weight ride on the
+            # backwarded scalar only: the reported step_loss and friends below
+            # stay this micro-step's own undivided means, because 1/N is a
+            # cross-step weight and the discount a cross-pass one, neither a
+            # property of this scene's samples. Every term of the pass is
+            # discounted by the same weight (see the docstring). At
+            # --refine_iters 1 the weight is exactly 1.0, and IEEE754
+            # multiplication by 1.0 is bit-exact forward and backward -- the
+            # window_scale argument again -- so the default path does not fork.
+            scaler.scale(anchor_total * window_scale * iteration_weight).backward()
+            # The carry for the next pass: this pass's field, detached,
+            # (1, R, H, W, 3) fp32. It shares storage with raw["track_multi"],
+            # so the `del raw` below frees the rest of the dict and keeps only
+            # the field alive. Assigned only when a next pass exists to read
+            # it: at K=1, and on the final pass at any K, nothing would, and
+            # holding a field across the next anchor's forward would move
+            # peak_bytes on the flag-off step.
+            if not final_iteration:
+                previous_field = raw["track_multi"][:, 0].detach()
+            if step_iteration_losses is not None:
+                step_iteration_losses[iteration] = accumulate_weighted(
+                    step_iteration_losses[iteration], result.loss, anchor_weight
+                )
+            if final_iteration:
+                # The reported figures are the FINAL pass's, so `loss` keeps
+                # its meaning at any K and equals iteration_losses[-1] bit for
+                # bit (same calls, same anchor order). confidence_dropped too:
+                # earlier passes' drops are not reported (see the StepOutcome
+                # field). At K=1 the only pass is the final one and every line
+                # below runs as before.
+                step_loss = accumulate_weighted(step_loss, result.loss, anchor_weight)
+                step_metric_error = accumulate_weighted(
+                    step_metric_error, result.metric_error, anchor_weight
+                )
+                # The same shares the objective used, so the reported figures are the
+                # step's own means rather than one anchor's. accumulate_weighted passes
+                # None through, so a disabled term needs no branch here.
+                step_sync_loss = accumulate_weighted(
+                    step_sync_loss, result.sync_loss, 1.0 / len(active_anchors)
+                )
+                step_velocity_loss = accumulate_weighted(
+                    step_velocity_loss, result.velocity_loss, velocity_shares[anchor_index]
+                )
+                step_confidence_loss = accumulate_weighted(
+                    step_confidence_loss,
+                    result.confidence_loss,
+                    confidence_shares[anchor_index],
+                )
+                if result.confidence_dropped is not None:
+                    if step_confidence_dropped is None:
+                        step_confidence_dropped = dict(result.confidence_dropped)
+                    else:
+                        for cause, count in result.confidence_dropped.items():
+                            step_confidence_dropped[cause] += count
+            del raw, result, anchor_total
+        # The local's last value is pass K-2's field at K > 1 (None at K=1),
+        # and with the dataclass released above this name is its last holder;
+        # unbound here or it lives through backward_through_cut and
+        # finish_window.
+        del previous_field
 
     # Unweighted, in the order sparse_tracking_loss composes its own terms, so
     # this reads like the overfit's loss_breakdown. None when nothing but
@@ -867,6 +1051,7 @@ def train_step(
         confidence_alpha=step_alpha,
         confidence_dropped=step_confidence_dropped,
         anchor_velocity_counts=velocity_counts,
+        iteration_losses=step_iteration_losses,
     )
 
 
@@ -885,6 +1070,7 @@ def evaluate_held_out(
     merge_synchronized_slots: bool = False,
     oracle_query_anchor: bool = False,
     ground_truth_query_anchor: bool = False,
+    refine_iters: int = 1,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
@@ -943,6 +1129,25 @@ def evaluate_held_out(
     ground-truth depth would buy.  Recorded in the metrics beside the oracle
     marker; mutually exclusive with it (refused at parse time and inside the
     gather); eval-only by the same construction.
+
+    ``refine_iters`` is the run's own count, threaded so the held-out forward
+    runs the SAME unrolled refinement the step trains -- MVTracker scores at
+    its training count on the Hydra path (train_iters = eval_iters = 4) -- and
+    both arms, plain and shuffled, run it. Every intermediate field of the
+    plain arm is scored too, as ``iteration_position_losses``: entry k is the
+    position Huber of pass k on the same correspondences, anchors and Sim(3)
+    as the final one, so the list says whether each pass improved on the last
+    on held-out data; None at 1, like the step record. The written bundle and
+    every other figure read the FINAL pass, which is what ``track_multi``
+    holds. The whole thing runs under the existing ``no_grad`` block, so K
+    passes cost K head forwards and no retained graph -- but each arm's
+    forward returns Q x K dense fields (about 0.44 GB at the held-out window
+    under the merge -- four validation cameras, 12 times, Q=4, K=4, fp32 --
+    and about 1.6 GiB per-slot at that window's 48 slots), so the plain arm's
+    stack is popped as soon as its passes are scored, before the shuffled
+    forward, and the shuffled arm's
+    right after its forward, and an eval that lands inside an accumulation
+    window is folded into that window's ``peak_bytes`` (see StepOutcome).
     """
 
     from arc.training import (
@@ -998,6 +1203,10 @@ def evaluate_held_out(
             forward_kwargs = (
                 {"merge_synchronized_slots": True} if merge_synchronized_slots else {}
             )
+            # Same rule for the pass count: only a K above 1 is spelled. The
+            # shuffled arm below reuses this dict, so both arms run one K.
+            if refine_iters > 1:
+                forward_kwargs["refine_iters"] = refine_iters
             with torch.no_grad(), autocast_context(precision):
                 raw = model(scene.views, force_no_output_conversion=True, **forward_kwargs)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
@@ -1018,6 +1227,72 @@ def evaluate_held_out(
                     huber_delta_m=huber_delta_m,
                     merge_synchronized_slots=merge_synchronized_slots,
                 )
+                # One position Huber per refinement pass, on the same
+                # correspondences, anchors and Sim(3) as `result`, so the
+                # entries differ only by the field scored. None at
+                # --refine_iters 1, where the model emits no pass stack
+                # (`track_multi_iterations` is absent at K=1, as loss_breakdown
+                # is None on a position-only step). The last entry IS
+                # result.loss: the stack's final slice is asserted identical to
+                # track_multi rather than re-scored, so the two cannot disagree
+                # by a reduction-order ulp and the last entry needs no second
+                # loss pass.
+                if refine_iters == 1:
+                    iteration_position_losses = None
+                else:
+                    # Popped, not read: `raw` is the stack's only holder, and
+                    # nothing after this block reads it -- confidence_stats,
+                    # the shuffled arm and _prediction_arrays read track_multi
+                    # and conf_track_multi (L1247, L1255, L1273). The shuffled
+                    # forward below returns a stack of its own, so this one
+                    # must be gone by then or the two are resident together.
+                    stacked = raw.pop("track_multi_iterations")
+                    # Zero-tolerance allclose with equal_nan, not torch.equal:
+                    # the final slice and track_multi are the same values, and
+                    # they must compare equal even where the head emitted a NaN
+                    # at a pixel no correspondence supervises. torch.equal is
+                    # False on any NaN, a tensor against its own clone
+                    # included, and would turn a non-finite pixel the loss
+                    # tolerates (it guards supervised pixels only,
+                    # sparse_tracking.py:1614) into a fatal wiring error at an
+                    # eval boundary. At rtol=atol=0 the comparison is exact:
+                    # one ulp apart is False.
+                    if stacked.shape[2] != refine_iters or not torch.allclose(
+                        stacked[:, :, -1],
+                        raw["track_multi"],
+                        rtol=0.0,
+                        atol=0.0,
+                        equal_nan=True,
+                    ):
+                        raise RuntimeError(
+                            "track_multi_iterations must hold every pass and end "
+                            f"in track_multi: got {tuple(stacked.shape)} against "
+                            f"{tuple(raw['track_multi'].shape)} at "
+                            f"refine_iters={refine_iters}"
+                        )
+                    iteration_position_losses = []
+                    for k in range(refine_iters - 1):
+                        iteration_result = sparse_tracking_loss(
+                            tracking_only(
+                                {
+                                    "track_multi": stacked[:, :, k],
+                                    "track_query_idx": raw["track_query_idx"],
+                                }
+                            ),
+                            scene,
+                            correspondences,
+                            alignment,
+                            anchors,
+                            query_anchor_frame=anchor_frame,
+                            huber_delta_m=huber_delta_m,
+                            merge_synchronized_slots=merge_synchronized_slots,
+                        )
+                        iteration_position_losses.append(
+                            float(iteration_result.loss.item())
+                        )
+                        del iteration_result
+                    iteration_position_losses.append(float(result.loss.item()))
+                    del stacked
                 entry = {
                     "scene": plan.seq_name,
                     "position_loss": float(result.loss.item()),
@@ -1030,6 +1305,9 @@ def evaluate_held_out(
                     # against. Metres per INDEX step, so it is comparable across
                     # this run's windows but not against a different --stride.
                     "velocity_consistency": result.velocity_stats,
+                    # Per pass; see above. Everything else in this entry and
+                    # the written bundle read the final pass.
+                    "iteration_position_losses": iteration_position_losses,
                 }
 
                 # The index-advantage arm: the same model scored with one camera's
@@ -1045,6 +1323,12 @@ def evaluate_held_out(
                     shuffled_raw = model(
                         shuffled, force_no_output_conversion=True, **forward_kwargs
                     )
+                    # Same forward, same K, same stack -- and this arm scores
+                    # its final field only, so the stack goes before the loss
+                    # allocates. A plain pop: the plain arm above already
+                    # proved the model emits the key at this K.
+                    if refine_iters > 1:
+                        shuffled_raw.pop("track_multi_iterations")
                     shuffled_result = sparse_tracking_loss(
                         tracking_only(shuffled_raw),
                         scene,
@@ -1105,6 +1389,13 @@ def evaluate_held_out(
 
     losses = [entry["position_loss"] for entry in per_scene]
     errors = [entry["metric_error_m"] for entry in per_scene]
+    # K-long per scored scene at --refine_iters K > 1, None at 1; averaged per
+    # pass below. Every scored scene ran the same K, so the columns line up.
+    iteration_losses = [
+        entry["iteration_position_losses"]
+        for entry in per_scene
+        if entry["iteration_position_losses"] is not None
+    ]
     shuffled_losses = [
         entry["position_loss_shuffled"]
         for entry in per_scene
@@ -1134,6 +1425,16 @@ def evaluate_held_out(
         "ground_truth_query_anchor": bool(ground_truth_query_anchor),
         "scenes": len(per_scene),
         "position_loss": sum(losses) / len(losses) if losses else None,
+        # Per refinement pass, meaned over the scored scenes: entry k is the
+        # held-out position Huber of pass k, and the last entry is
+        # position_loss above (same scenes, same floats, same order). None at
+        # --refine_iters 1, and None rather than [] when no scene scored, on
+        # position_loss's own convention.
+        "iteration_position_losses": (
+            [sum(column) / len(column) for column in zip(*iteration_losses)]
+            if iteration_losses
+            else None
+        ),
         "metric_error_m": sum(errors) / len(errors) if errors else None,
         # None, not 0, when no scene had a synchronized pair to break: a zero here
         # would read as "reversal costs nothing", which is a finding rather than
@@ -1727,6 +2028,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     training.add_argument(
+        "--refine_iters",
+        type=int,
+        default=1,
+        help=(
+            "Unrolled track refinement: run the motion decoder (all four taps) "
+            "and the track head this many times per anchor on the same encoder "
+            "taps, each pass conditioning the query patch tokens on the "
+            "previous pass's displacement field (detached) through a "
+            "zero-initialised patch conv plus a 16-nearest-neighbour "
+            "correlation read into the model's OWN predicted point cloud -- "
+            "MVTracker's mechanism, which it runs at iters=4 for training and "
+            "for its Hydra-path eval (the hubconf predictor defaults to 6). "
+            "Every pass is supervised by the same sparse loss, discounted by "
+            "--refine_gamma so later passes weigh more, and backwarded on its "
+            "own so only one head graph is ever alive. 1, the default, is "
+            "exactly today's behaviour: one pass, the refiner frozen, no extra "
+            "term. The held-out eval runs the same count and scores every pass "
+            "(iteration_position_losses), as does the step record "
+            "(iteration_losses). Refused on resume alongside --refine_gamma, "
+            "so this lever needs a fresh run, never a resume of a one-pass arm "
+            "(default: %(default)s)"
+        ),
+    )
+    training.add_argument(
+        "--refine_gamma",
+        type=float,
+        default=DEFAULT_REFINE_GAMMA,
+        help=(
+            "Discount over the per-pass losses under --refine_iters K: pass i "
+            "is weighted gamma**(K-1-i)/K, MVTracker's sequence_loss_3d at its "
+            "default 0.8, so the final pass weighs most and each pass is "
+            "trained to improve on the last; the division is by K, not by the "
+            "weight sum. Inert at --refine_iters 1, where the single weight is "
+            "exactly 1.0. Refused on resume like the loss weights: it "
+            "reweights the objective, and the reported loss -- the final "
+            "pass's Huber -- would not show the switch (default: %(default)s)"
+        ),
+    )
+    training.add_argument(
         "--velocity_weight",
         type=float,
         default=0.0,
@@ -2069,6 +2409,21 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sync_weight must be finite and non-negative")
     if not math.isfinite(args.velocity_weight) or args.velocity_weight < 0:
         raise ValueError("--velocity_weight must be finite and non-negative")
+    # refinement_iteration_weights repeats both checks, but at the first
+    # executed step, after the model load and the provider preflight; refused
+    # here by flag name like the weights above. bool is rejected explicitly:
+    # True would otherwise pass as one pass and False as zero, and a Namespace
+    # can carry either even though the parser's int type never produces one.
+    if (
+        isinstance(args.refine_iters, bool)
+        or not isinstance(args.refine_iters, int)
+        or args.refine_iters < 1
+    ):
+        raise ValueError(
+            f"--refine_iters must be an integer of at least 1, got {args.refine_iters!r}"
+        )
+    if not math.isfinite(args.refine_gamma) or not 0 < args.refine_gamma <= 1:
+        raise ValueError("--refine_gamma must be finite and in (0, 1]")
     # Parsed in place, like the anchor spec below: everything downstream --
     # train_step, the checkpoint, the summary -- reads a float or None, never
     # the flag's string.
@@ -2314,6 +2669,14 @@ def _plan_summary(tally, args) -> dict:
             # it must be read beside a --ground_truth_query_anchor run.
             "depth_input": bool(args.depth_input),
             "camera_input": bool(args.camera_input),
+            # How many unrolled refinement passes each anchor ran, and the
+            # discount over their losses; K=1 is today's single pass with the
+            # refiner frozen. The reported `loss` is the final pass's Huber at
+            # any K, so a curve alone does not say how many passes or which
+            # discount produced it; recorded here beside the checkpoint's
+            # refused pair so an archived summary does.
+            "refine_iters": int(args.refine_iters),
+            "refine_gamma": float(args.refine_gamma),
             # Whether the held-out tracks were anchored at ground truth. An
             # oracle-anchored curve is an upper bound on the geometry, not a
             # measurement of the model, so it is not comparable with a real one.
@@ -2752,6 +3115,8 @@ def run_training(
                     window_start=(window_executed == 0),
                     window_end=window_end,
                     merge_synchronized_slots=args.merge_synchronized_slots,
+                    refine_iters=args.refine_iters,
+                    refine_gamma=args.refine_gamma,
                 )
             except UnsupervisableSceneError as error:
                 # Skipped like a scene that failed to load, and for the same
@@ -2844,6 +3209,14 @@ def run_training(
                     for name, value in outcome.loss_breakdown.items()
                 )
             )
+            # Absent at --refine_iters 1 on the same rule; at K > 1 the K
+            # per-pass Hubers in pass order, the last of which is `loss`.
+            # Rounded so the list stays one readable line.
+            iterations_log = (
+                ""
+                if outcome.iteration_losses is None
+                else f" iters={[round(value, 8) for value in outcome.iteration_losses]}"
+            )
             print(
                 f"step={step}/{args.num_steps} scene={outcome.seq_name} "
                 f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
@@ -2852,6 +3225,7 @@ def run_training(
                 f"samples={outcome.sample_count} "
                 f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
                 f"{breakdown_log}"
+                f"{iterations_log}"
             )
         elif window_end and window_executed > 0:
             # The window's closing micro-step was skipped -- its scene lost, or
@@ -2895,6 +3269,9 @@ def run_training(
                 merge_synchronized_slots=args.merge_synchronized_slots,
                 oracle_query_anchor=args.oracle_query_anchor,
                 ground_truth_query_anchor=args.ground_truth_query_anchor,
+                # The run's own count, so the held-out curve measures the
+                # model as trained and every pass is scored.
+                refine_iters=args.refine_iters,
             )
             evaluations.append(metrics)
             print(
@@ -3051,6 +3428,17 @@ def _checkpoint_settings(args) -> dict:
         # mid-run continues the step counter over a different function class.
         "depth_input": bool(args.depth_input),
         "camera_input": bool(args.camera_input),
+        # How many refinement passes every step trains, and the discount over
+        # their losses. Both refused. refine_iters decides whether the refiner
+        # trains at all and how many head passes a step backwards -- a
+        # different function class, like merge_synchronized_slots.
+        # refine_gamma reweights the per-pass losses, so it is a loss weight by
+        # the tier's own rule: a changed weight reports one curve over two
+        # objectives, and the reported `loss` -- the final pass's Huber
+        # whatever the discount -- would not show the switch. Coerced like
+        # grad_accum for the weights_only round trip.
+        "refine_iters": int(args.refine_iters),
+        "refine_gamma": float(args.refine_gamma),
         "confidence_alpha": args.confidence_alpha,
         # Derived state rather than a flag, and so deliberately in NEITHER resume
         # tier: check_resume_settings iterates the two tuples only, so this rides
@@ -3086,6 +3474,13 @@ def _write_checkpoint(
     )
     payload = {
         "freeze_mode": getattr(model, "freeze", None),
+        # Beside freeze_mode because the patch readers read the pair together:
+        # a trained refiner (its keys in state_dict, since the saver keys off
+        # requires_grad) with no pass count, or a count with no refiner, cannot
+        # be run as trained, and read_temporal_patch_metadata refuses it. The
+        # settings dict carries the same number for the resume tier; this copy
+        # is for inference.py, which opens the patch and never the settings.
+        "refine_iters": int(args.refine_iters),
         "state_dict": {
             name: parameter.detach().cpu()
             for name, parameter in model.named_parameters()
@@ -3121,6 +3516,12 @@ def _write_checkpoint(
 # function class, not a different weight on the same one), or the numerics
 # under the restored scaler state (precision): a changed value means the
 # "resumed" run trains a different stream while its step counter continues.
+# refine_iters and refine_gamma are refused on the same two grounds -- the
+# count decides whether the refiner trains at all and how many head passes
+# every step backwards (a function class, like merge_synchronized_slots), and
+# gamma reweights the per-pass losses, so it is a loss weight by the rule
+# above: the reported `loss` is the final pass's Huber whatever the discount,
+# so nothing in the history would show a changed gamma either.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
@@ -3171,6 +3572,8 @@ _RESUME_SETTINGS_REFUSED = (
     "merge_synchronized_slots",
     "depth_input",
     "camera_input",
+    "refine_iters",
+    "refine_gamma",
     "confidence_alpha",
     "precision",
     "grad_accum",
@@ -3231,6 +3634,16 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # value.
     "depth_input": False,
     "camera_input": False,
+    # A checkpoint from before --refine_iters / --refine_gamma could only have
+    # been written by a one-pass run: the refiner did not exist. So
+    # refine_iters resolves to 1, pre-flag runs resume silently at one pass,
+    # and resuming one at K > 1 is refused like any changed value.
+    # refine_gamma resolves to the parser default for a sharper reason than
+    # symmetry with the parser: at K=1 gamma is inert -- the single weight is
+    # gamma ** 0 / 1 -- so the default IS the value the stored run actually
+    # trained under, and it is what a same-flags resume presents.
+    "refine_iters": 1,
+    "refine_gamma": DEFAULT_REFINE_GAMMA,
     # A checkpoint from before --val_seq_len could only have been written by a
     # run whose held-out window already fit the 24-frame clip: run_training
     # loads every held-out scene in its preflight, before step 0 and before the
@@ -3500,6 +3913,9 @@ def main() -> None:
         late_global_blocks=late_global_blocks,
         depth_input=args.depth_input,
         camera_input=args.camera_input,
+        # The refiner trains only when a second pass exists to read it; at
+        # one pass it stays frozen and the parameter set is today's.
+        refine=args.refine_iters > 1,
     )
     model.set_encoder_local_checkpointing(args.encoder_local_checkpointing)
     report = assert_trainable_parameter_set(
@@ -3509,6 +3925,7 @@ def main() -> None:
         late_global_blocks=late_global_blocks,
         depth_input=args.depth_input,
         camera_input=args.camera_input,
+        refine=args.refine_iters > 1,
     )
     print(
         f"trainable={report['tensor_count']} tensors / "

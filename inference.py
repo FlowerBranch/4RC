@@ -257,11 +257,15 @@ def main():
         # late-global mode's name does not by itself fix that set -- and the
         # geometry flags likewise, derived from the patch's own key set, or a
         # geometry-arm patch's injection tensors surface as unexpected keys.
+        # The refiner flag is the same derivation one module later: a patch
+        # trained at --refine_iters > 1 carries the refiner's tensors, and
+        # they too would surface as unexpected keys under a frozen refiner.
         model.set_freeze(
             patch_metadata["freeze_mode"],
             late_global_blocks=patch_metadata["late_global_blocks"],
             depth_input=patch_metadata["depth_input"],
             camera_input=patch_metadata["camera_input"],
+            refine=patch_metadata["refine"],
         )
         load_temporal_tracking_checkpoint(model, args.temporal_patch)
         late_global_note = (
@@ -269,9 +273,15 @@ def main():
             if patch_metadata["late_global_blocks"] is None
             else f", late_global_blocks {patch_metadata['late_global_blocks']}"
         )
+        refine_note = (
+            ""
+            if patch_metadata["refine_iters"] == 1
+            else f", refine_iters {patch_metadata['refine_iters']}"
+        )
         print(
             f"Loaded temporal-tracking patch: {args.temporal_patch} "
-            f"(freeze mode {patch_metadata['freeze_mode']}{late_global_note})"
+            f"(freeze mode {patch_metadata['freeze_mode']}"
+            f"{late_global_note}{refine_note})"
         )
     elif TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
         print(
@@ -295,8 +305,15 @@ def main():
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
+    # The patch's recorded iteration count reaches Arc.forward as
+    # refine_iters, so a K=4 patch runs its trained refiner four times, as
+    # trained. A patch without the field reads as 1 -- it trained one
+    # iteration, whether written before the field existed or by the overfit's
+    # saver, which never refines -- and without --temporal_patch there is no
+    # count: the released weights run one iteration, today's forward exactly.
     output_dict, profiling = inference(
-        imgs, model, device, dtype="bf16-mixed", verbose=True, profiling=True, use_center_as_anchor=False
+        imgs, model, device, dtype="bf16-mixed", verbose=True, profiling=True, use_center_as_anchor=False,
+        refine_iters=1 if patch_metadata is None else patch_metadata["refine_iters"],
     )
     print(f"Inference: {profiling['total_time']:.2f}s")
 

@@ -12,11 +12,16 @@ from arc.models.arc.utils.transform import (
     affine_inverse,
     get_extrinsic_from_camray,
     as_homogeneous,
+    predicted_pointmaps,
 )
 from arc.models.arc.dinov2.dinov2 import DinoV2
 from arc.models.arc.heads.dualdpt import DualDPT
 from arc.models.arc.heads.cam_dec import CameraDec
-from arc.models.arc.heads.motiondecoder import MotionDecoder
+from arc.models.arc.heads.motiondecoder import (
+    MotionDecoder,
+    RefinementInput,
+    patch_centre_points,
+)
 from arc.models.arc.heads.dpt_head import DPTHead
 
 from arc.dust3r.utils.image import ImgRenormalize
@@ -47,6 +52,19 @@ class Arc(
         "backbone.pretrained.depth_patch_embed.bias",
         "backbone.pretrained.camera_proj.weight",
         "backbone.pretrained.camera_proj.bias",
+        # The track refiner postdates every released checkpoint. A tolerated
+        # missing key is left at its constructed value -- the loader never
+        # writes zeros itself -- which is zeros for field_embed and read_proj,
+        # so a K=1 run is inert, and the default init for the two
+        # projections, so a K>1 run starts where a fresh construction would.
+        "motion_decoder.refiner.field_embed.weight",
+        "motion_decoder.refiner.field_embed.bias",
+        "motion_decoder.refiner.query_proj.weight",
+        "motion_decoder.refiner.query_proj.bias",
+        "motion_decoder.refiner.key_proj.weight",
+        "motion_decoder.refiner.key_proj.bias",
+        "motion_decoder.refiner.read_proj.weight",
+        "motion_decoder.refiner.read_proj.bias",
     )
     LEGACY_SAFETENSOR_ALIASES = {
         "head.scratch.output_conv2_aux.1.2.weight":
@@ -76,7 +94,9 @@ class Arc(
     ):
         super().__init__()
 
-        # Keys the checkpoint loader accepted as legacy gaps and zero-filled.
+        # Keys the checkpoint loader accepted as legacy gaps and left at their
+        # constructed init (zeros for the injections; the refiner's two
+        # projections keep their default init, see LEGACY_CHECKPOINT_MISSING_KEYS).
         # Callers use this to warn that a feature is silently inactive.
         self.consumed_legacy_missing_keys = frozenset()
 
@@ -460,7 +480,7 @@ class Arc(
             if index % 2 == 1
         ]
 
-    def set_freeze(self, freeze, *, late_global_blocks=None, depth_input=False, camera_input=False):
+    def set_freeze(self, freeze, *, late_global_blocks=None, depth_input=False, camera_input=False, refine=False):
         supported_modes = {"none", *self.TEMPORAL_FREEZE_MODES}
         if freeze not in supported_modes:
             raise ValueError(
@@ -514,6 +534,18 @@ class Arc(
             self.backbone.pretrained.time_index_embedding.requires_grad_(True)
             self.motion_decoder.requires_grad_(True)
             self.track_head.requires_grad_(True)
+            # The track refiner rides inside motion_decoder, so the blanket
+            # line above has just unfrozen it; it trains only when
+            # --refine_iters > 1 says so and is re-frozen by NAME otherwise.
+            # At K=1 no forward calls it, so left trainable it would reach
+            # assert_trainable_gradients_finite with grad None and stop the
+            # run at step 1 as "missing gradients" -- and it would count in
+            # the trainable set the startup guard prices. Under 'none' the
+            # blanket trains it regardless, like the injections. MotionDecoder
+            # always constructs the refiner, so the attribute access cannot
+            # miss through Arc; a stand-in decoder without one fails here by
+            # name, which is the point of unfreezing by name.
+            self.motion_decoder.refiner.requires_grad_(refine)
             # The zero-init geometry injections train only when their flag
             # says so: unfreeze is by NAME here or a module trains nothing,
             # silently, under a healthy-looking loss curve. Under 'none' the
@@ -697,6 +729,7 @@ class Arc(
         force_no_output_conversion=False,
         inference_track = True,
         merge_synchronized_slots: bool = False,
+        refine_iters: int = 1,
         **kwargs
     ):
         if merge_synchronized_slots and not force_no_output_conversion:
@@ -723,6 +756,7 @@ class Arc(
             merge_synchronized_slots=merge_synchronized_slots,
             depth_maps=depth_maps,
             camera_vectors=camera_vectors,
+            refine_iters=refine_iters,
             **kwargs,
         )
         
@@ -746,7 +780,22 @@ class Arc(
         *,
         depth_maps=None,
         camera_vectors=None,
+        refine_iters: int = 1,
     ) -> Dict[str, torch.Tensor]:
+        # Rejected before the encoder runs, so a bad K costs nothing. bool is
+        # excluded by name: True is an int in Python and would silently mean
+        # one iteration. The B=1 rule binds only when the cloud is read,
+        # which is only when the track heads run.
+        if isinstance(refine_iters, bool) or not isinstance(refine_iters, int):
+            raise TypeError("refine_iters must be a positive integer")
+        if refine_iters < 1:
+            raise ValueError("refine_iters must be a positive integer")
+        if refine_iters > 1 and inference_track and x.shape[0] != 1:
+            raise ValueError(
+                "refine_iters > 1 requires batch size 1: the refiner reads the "
+                "model-gauge cloud from predicted_pointmaps, a B=1 helper, and "
+                f"got B={x.shape[0]}"
+            )
         feats = self.encode_features(
             x,
             ref_view_strategy=ref_view_strategy,
@@ -766,19 +815,81 @@ class Arc(
                 views_per_time = self._synchronized_views_per_time(
                     time_indices, x.shape[1]
                 )
+            # The refiner's cloud: every slot's patch-centre points in the
+            # model's own gauge, from the reconstruction just computed. Built
+            # ONCE per forward -- it depends on neither the query nor the
+            # iteration -- and None at K=1 so the flag-off path never touches
+            # the depth output. Its anchor row is the iteration-0 estimate; a
+            # row is a slot, which is what track_query_idx indexes on both
+            # branches. field_rows is the head's output axis: TIME under the
+            # merge, slots otherwise, the rule track_for_query's head_images
+            # slice applies.
+            key_xyz = None
+            field_rows = None
+            if refine_iters > 1:
+                key_xyz = patch_centre_points(predicted_pointmaps(output), self.PATCH_SIZE)
+                field_rows = (
+                    x.shape[1] // views_per_time if merge_synchronized_slots else x.shape[1]
+                )
             track_list = []
             conf_list = []
-            for query_idx in track_query_idx_list:
-                # Branched so the flag-off call keeps its exact spelling:
-                # injected fakes bind today's surface.
-                if merge_synchronized_slots:
-                    track, track_conf = self.track_for_query(
-                        feats, x, query_idx, views_per_time=views_per_time, merge=True
-                    )
-                else:
-                    track, track_conf = self.track_for_query(
-                        feats, x, query_idx, views_per_time=views_per_time
-                    )
+            # Every iteration's field, (B, Q, K, rows, H, W, 3), for the
+            # eval's per-iteration curve. Allocated once, on the first field,
+            # and written in place: stacking per query and again over the
+            # queries would hold two more copies of K*Q dense fields at the
+            # end (0.44 GB at the held-out window, K=4, Q=4, T=12). The held-out eval runs
+            # this under no_grad; a grad-enabled caller gets copy nodes into
+            # the buffer, which is harmless. None at K=1.
+            iterations = None
+            for position, query_idx in enumerate(track_query_idx_list):
+                previous = None
+                for iteration in range(refine_iters):
+                    if refine_iters == 1:
+                        # Branched so the flag-off call keeps its exact spelling:
+                        # injected fakes bind today's surface.
+                        if merge_synchronized_slots:
+                            track, track_conf = self.track_for_query(
+                                feats, x, query_idx, views_per_time=views_per_time, merge=True
+                            )
+                        else:
+                            track, track_conf = self.track_for_query(
+                                feats, x, query_idx, views_per_time=views_per_time
+                            )
+                    else:
+                        # One iteration per call; the loop lives here, under
+                        # whatever grad context the caller set (the held-out
+                        # eval and inference run this under no_grad). The
+                        # carry is detached so no iteration's graph reaches
+                        # into the previous iteration's head graph; the K head
+                        # graphs still share the encoder graph through feats,
+                        # which only the trainer's cut separates.
+                        refinement = RefinementInput(
+                            previous_field=(
+                                torch.zeros(
+                                    (x.shape[0], field_rows, x.shape[-2], x.shape[-1], 3),
+                                    device=x.device,
+                                    dtype=torch.float32,
+                                )
+                                if previous is None
+                                else previous.detach()
+                            ),
+                            anchor_xyz=key_xyz[:, query_idx],
+                            key_xyz=key_xyz,
+                        )
+                        track, track_conf = self.track_for_query(
+                            feats,
+                            x,
+                            query_idx,
+                            views_per_time=views_per_time,
+                            merge=merge_synchronized_slots,
+                            refinement=refinement,
+                        )
+                        previous = track
+                        if iterations is None:
+                            iterations = track.new_empty(
+                                (x.shape[0], len(track_query_idx_list), refine_iters, *track.shape[1:])
+                            )
+                        iterations[:, position, iteration] = track
                 track_list.append(track)
                 conf_list.append(track_conf)
 
@@ -786,6 +897,11 @@ class Arc(
             output["conf_track"] = conf_list[0]
             output["track_multi"] = torch.stack(track_list, dim=1)
             output["conf_track_multi"] = torch.stack(conf_list, dim=1)
+            if refine_iters > 1:
+                # track_multi above is the LAST iteration. Absent at K=1
+                # rather than a K=1 stack, the way loss_breakdown is None at
+                # K=1: a reader that finds the key knows a refinement ran.
+                output["track_multi_iterations"] = iterations
 
         output['track_query_idx'] = output_track_query_idx
 
@@ -824,8 +940,9 @@ class Arc(
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             # Under every temporal freeze mode the depth head and camera decoder
             # are frozen and their outputs are consumed only through detached
-            # paths (arc.training.sparse_tracking._predicted_pointmaps is
-            # no_grad plus .detach()), so retaining the dual-pyramid DPT graph
+            # paths (arc.models.arc.utils.transform.predicted_pointmaps is
+            # no_grad plus .detach(), and the track refiner reads its cloud
+            # under no_grad again), so retaining the dual-pyramid DPT graph
             # costs about 1.2 GB per observation for nothing. This holds even
             # when encoder blocks are trainable: no loss reads these outputs
             # undetached, so no gradient is lost by cutting the graph here.
@@ -850,6 +967,7 @@ class Arc(
         *,
         views_per_time: int = 1,
         merge: bool = False,
+        refinement: RefinementInput | None = None,
     ):
         """One query frame's dense displacement field and its confidence.
 
@@ -863,6 +981,21 @@ class Arc(
         ``views_per_time`` including 1; False, the default, is exactly the
         per-slot path. ``views_per_time`` is the merged head's geometry, the
         camera-major slot count per time.
+
+        ``refinement`` makes this ONE refinement iteration: the decoder's
+        query patch tokens are conditioned on the previous iteration's
+        detached field and on a kNN read into the model's own cloud (see
+        TrackRefiner), and the same four taps and the same head run again.
+        None is exactly today's call, spelled verbatim. Callers loop, the way
+        they loop over queries and for the same reason: the trainer backwards
+        each iteration and detaches the carry, and per-iteration backward is
+        the only thing that bounds retention to one head pass -- detaching
+        the carry alone does not, because iteration k's own graph (four
+        decoder passes and the DPT head) stays alive until something
+        backwards it, so a loop inside this method would hold K such graphs
+        for its caller's single backward. _forward loops under whatever grad
+        context its caller set; the held-out eval and inference run it under
+        no_grad.
         """
 
         frames_chunk_size = 1 if self.training else 8
@@ -872,7 +1005,12 @@ class Arc(
                 [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
                 dim=2,
             )[..., 1536:] # [cam, time, patch] in global feauture as required by MotionDecoder
-            if not merge:
+            if refinement is not None:
+                track_tokens = self.motion_decoder(
+                    feature, images=x, patch_start_idx=2, track_query_idx=query_idx,
+                    views_per_time=views_per_time, merge=merge, refinement=refinement,
+                )
+            elif not merge:
                 track_tokens = self.motion_decoder(
                     feature, images=x, patch_start_idx=2, track_query_idx=query_idx
                 )

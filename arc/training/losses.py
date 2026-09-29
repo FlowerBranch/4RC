@@ -525,6 +525,57 @@ def resolve_confidence_alpha(
     return alpha
 
 
+def refinement_iteration_weights(iterations: int, gamma: float) -> tuple[float, ...]:
+    """Per-iteration loss weights for an unrolled refinement, MVTracker's rule.
+
+    Copied from ``mvtracker/models/core/losses.py:49-73`` (``sequence_loss_3d``):
+    iteration ``i`` of ``n`` weighs ``gamma ** (n - i - 1)`` (``i_weight``,
+    line 63) and the accumulated sum is divided by ``n`` (line 71) -- by the
+    COUNT, not by the weight sum, so the weights are not a convex combination.
+    At ``(4, 0.8)`` they sum to 0.738 and the final iteration's own weight is
+    0.25 where a one-iteration run's is 1.0: a longer unroll at the same gamma
+    puts less total weight behind the step's gradient, a scale the learning
+    rate sees, so a K=4 arm trains the head at a different effective step from
+    the K=1 control under the same ``--lr``.  It is the scale MVTracker trained
+    under and is kept rather than renormalised.  MVTracker also REPORTS that
+    weighted sum; this repo reports only unweighted per-iteration losses
+    (``StepOutcome.iteration_losses``, the eval's ``iteration_position_losses``)
+    and the weights touch nothing but the backwarded scalar.  Later iterations
+    weigh more: the last weighs ``1/n`` and each earlier one is discounted by a
+    further factor of gamma, so every iteration is trained to improve on the
+    one before it rather than the first being asked to be right already.
+    MVTracker's default gamma is 0.8 (``configs/train.yaml:38``); this repo's
+    is ``DEFAULT_REFINE_GAMMA`` in the trainer.
+
+    At ``(1, gamma)`` the result is exactly ``(1.0,)`` for every admissible
+    gamma: ``gamma ** 0`` is the float 1.0 and ``1.0 / 1`` is 1.0, both exact.
+    That is what keeps a one-iteration step's ``anchor_total * window_scale *
+    1.0`` bit-identical to today's ``anchor_total * window_scale``, the IEEE754
+    argument the trainer's window_scale comment already makes.  Above one
+    iteration the entries are ordinary floats -- ``(4, 0.8)`` gives
+    ``0.12800000000000003``, one ulp from the decimal -- so a test pins them
+    with a tolerance and pins only the ``(1, gamma)`` case exactly.
+
+    A tuple of Python floats: the weights are schedule constants multiplied
+    into a Python-side scale beside ``window_scale``, and a float tuple
+    compares exactly, which is what the ``(1, gamma) == (1.0,)`` pin needs.
+    """
+
+    if isinstance(iterations, bool) or not isinstance(iterations, int):
+        raise TypeError(
+            f"iterations must be an integer, got {type(iterations).__name__}"
+        )
+    if iterations < 1:
+        raise ValueError(f"iterations must be at least 1, got {iterations}")
+    if isinstance(gamma, bool) or not isinstance(gamma, (int, float)):
+        raise TypeError(f"gamma must be a float, got {type(gamma).__name__}")
+    if not math.isfinite(gamma) or not 0 < gamma <= 1:
+        raise ValueError(f"gamma must be finite and in (0, 1], got {gamma}")
+    return tuple(
+        gamma ** (iterations - 1 - i) / iterations for i in range(iterations)
+    )
+
+
 def compose_tracking_loss(
     terms: Mapping[str, torch.Tensor],
     weights: Mapping[str, float],

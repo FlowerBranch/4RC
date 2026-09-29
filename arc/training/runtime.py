@@ -27,6 +27,11 @@ from contextlib import nullcontext
 
 import torch
 
+from arc.models.arc.heads.motiondecoder import (
+    REFINER_CORRELATION_DIM,
+    REFINER_FIELD_CHANNELS,
+    REFINER_NEIGHBOURS,
+)
 from arc.training.losses import adjacent_pair_indices, compose_tracking_loss
 from arc.training.sparse_tracking import (
     camera_major_layout,
@@ -37,10 +42,12 @@ from arc.training.sparse_tracking import (
 
 # Per freeze mode: (trainable tensor count, trainable parameters excluding the
 # time-index embedding, whose row count is a flag, and excluding the geometry
-# injections, whose trainability is a flag -- both enter as explicit separate
-# terms in assert_trainable_parameter_set). Measured on a meta-device Arc. A
-# refactor that silently changes a freeze mask must fail here rather than
-# quietly costing GPU weeks.
+# injections and the track refiner, whose trainability is a flag -- all three
+# enter as explicit separate terms in assert_trainable_parameter_set. The
+# refiner sits INSIDE motion_decoder, whose blanket unfreeze the rows count;
+# the rows exclude it because set_freeze re-freezes it by name unless refine).
+# Measured on a meta-device Arc. A refactor that silently changes a freeze
+# mask must fail here rather than quietly costing GPU weeks.
 EXPECTED_TRAINABLE_SETS = {
     "temporal_tracking": (231, 314_551_588),
     "temporal_tracking_global_attention": (483, 711_268_132),
@@ -80,6 +87,29 @@ CAMERA_PROJ_TRAINABLE = (
     2,
     ENCODER_EMBED_DIM * CAMERA_VECTOR_DIM + ENCODER_EMBED_DIM,
 )
+# The track refiner's widths are IMPORTED from arc.models.arc.heads.motiondecoder
+# (see the import block above), not restated like the encoder widths: this
+# module already loads the model stack through sparse_tracking, so a mirror
+# would duplicate a constant to dodge no import at all, which the working
+# agreements forbid; the ruling is the maintainer's (2026-09-28). The
+# refiner's token width is the motion decoder's embed_dim, which Arc constructs
+# at the encoder width (arc.py passes embed_dim=1536), so the arithmetic
+# below may use ENCODER_EMBED_DIM, and a test pins the result against the
+# meta-device Arc's real refiner.
+# (tensor count, parameter count) the refiner adds when --refine_iters > 1
+# unfreezes it: field_embed, a patch-size conv over the 3-channel previous
+# field; query_proj and key_proj, embed width to correlation width; and
+# read_proj, k neighbours x (one correlation + three offsets) back to the
+# embed width. A weight plus a bias each, derived from the widths rather than
+# hand-counted; 1_398_016 at the production widths.
+REFINER_TRAINABLE = (
+    8,
+    ENCODER_EMBED_DIM * REFINER_FIELD_CHANNELS * ENCODER_PATCH_SIZE**2
+    + ENCODER_EMBED_DIM
+    + 2 * (ENCODER_EMBED_DIM * REFINER_CORRELATION_DIM + REFINER_CORRELATION_DIM)
+    + REFINER_NEIGHBOURS * 4 * ENCODER_EMBED_DIM
+    + ENCODER_EMBED_DIM,
+)
 
 
 def expected_trainable_set(freeze_mode, late_global_blocks):
@@ -109,6 +139,7 @@ def assert_trainable_parameter_set(
     late_global_blocks: int | None = None,
     depth_input: bool = False,
     camera_input: bool = False,
+    refine: bool = False,
 ) -> dict:
     """Fail if the freeze mask is not exactly the set the mode promises.
 
@@ -131,13 +162,22 @@ def assert_trainable_parameter_set(
         expected_non_embedding + max_time_indices * TIME_EMBEDDING_DIM
     )
     # Each injection is its own explicit term, like the embedding above, so
-    # all four flag arms derive from the one table.
+    # every flag arm derives from the one table.
     if depth_input:
         expected_tensors += DEPTH_EMBED_TRAINABLE[0]
         expected_parameter_count += DEPTH_EMBED_TRAINABLE[1]
     if camera_input:
         expected_tensors += CAMERA_PROJ_TRAINABLE[0]
         expected_parameter_count += CAMERA_PROJ_TRAINABLE[1]
+    # The refiner is priced the same way. It rides inside motion_decoder,
+    # whose blanket unfreeze the rows count, but the rows were measured with
+    # it frozen -- set_freeze re-freezes it by name unless refine -- so they
+    # stay exact at refine=False and a mask that forgot the re-freeze fails
+    # there by 8 tensors; this term is what admits exactly those eight at
+    # refine=True, priced like the injections instead of a second table.
+    if refine:
+        expected_tensors += REFINER_TRAINABLE[0]
+        expected_parameter_count += REFINER_TRAINABLE[1]
     note = "" if late_global_blocks is None else f", k={late_global_blocks}"
     if (
         report["tensor_count"] != expected_tensors
@@ -428,6 +468,7 @@ def anchor_tracks(
     *,
     views_per_time: int = 1,
     merge: bool = False,
+    refinement=None,
 ):
     """One anchor's dense field, shaped as the Q=1 raw dict the loss expects.
 
@@ -435,12 +476,30 @@ def anchor_tracks(
     (the merged head, at any ``views_per_time`` including 1);
     ``track_query_idx`` stays the S-grid slot index either way -- it names the
     anchor, not a row of the output.
+
+    ``refinement`` is ONE iteration's ``RefinementInput`` (the previous
+    field, detached by the caller, with the anchor and key clouds) and is
+    handed straight to ``track_for_query``, untouched; it validates itself at
+    construction.  This helper shapes one head pass; the unrolled loop stays
+    in the trainer, which backwards after each pass and so bounds retention
+    to one head graph -- baking the loop in here would hold K of them.
+    ``None`` is exactly today's single pass.
     """
 
     slot = scene.anchor_observation_slots[anchor_index]
     # Branched so the flag-off call keeps its exact spelling: injected fakes
-    # bind today's three-positional surface.
-    if not merge:
+    # bind today's three-positional surface. The refinement keyword is passed
+    # only when set, for the same reason.
+    if refinement is not None:
+        track, track_conf = model.track_for_query(
+            feats,
+            images,
+            slot,
+            views_per_time=views_per_time,
+            merge=merge,
+            refinement=refinement,
+        )
+    elif not merge:
         track, track_conf = model.track_for_query(feats, images, slot)
     else:
         track, track_conf = model.track_for_query(

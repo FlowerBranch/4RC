@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
+import arc.models.arc.utils.transform as transform_module
 import arc.training.runtime as runtime_module
 import arc.training.sparse_tracking as sparse_module
 import overfit_temporal_tracking as overfit_cli
@@ -49,6 +50,7 @@ from arc.training import (
 )
 from arc.training.runtime import anchor_sample_counts, anchor_velocity_counts
 from arc.training.dumped_kubric import compute_image_transform
+from test_time_indexing import _LinearMotionDecoder
 
 
 # Every track lies on this world plane, so depth0 can be rendered analytically
@@ -2317,13 +2319,18 @@ def test_predicted_pointmaps_stay_float32_inside_bfloat16_autocast(monkeypatch):
         marker = marker @ marker
         return marker * torch.ones(1, 2, 4, 5, 3, dtype=torch.float32)
 
+    # Planted where the body resolves them: the helper moved to transform.py
+    # (the model reads its own cloud through it), and sparse_tracking keeps
+    # only the alias, which this call goes through so the alias is pinned to
+    # the moved function as well.
+    assert sparse_module._predicted_pointmaps is transform_module.predicted_pointmaps
     monkeypatch.setattr(
-        sparse_module,
+        transform_module,
         "pose_encoding_to_extri_intri",
         fake_pose_conversion,
     )
-    monkeypatch.setattr(sparse_module, "as_homogeneous", lambda value: value)
-    monkeypatch.setattr(sparse_module, "unproject_depth", fake_unproject)
+    monkeypatch.setattr(transform_module, "as_homogeneous", lambda value: value)
+    monkeypatch.setattr(transform_module, "unproject_depth", fake_unproject)
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
         pointmaps = sparse_module._predicted_pointmaps(
@@ -3070,7 +3077,7 @@ def _tiny_arc():
     model.backbone = _TinyBackbone()
     model.head = nn.Linear(1, 1)
     model.cam_dec = nn.Linear(1, 1)
-    model.motion_decoder = nn.Linear(1, 1)
+    model.motion_decoder = _LinearMotionDecoder(1, 1)
     model.track_head = nn.Linear(1, 1)
     model.set_freeze("temporal_tracking")
     return model
@@ -3122,7 +3129,11 @@ def test_only_temporal_tracking_parameters_receive_gradients(dumped_scene):
         "track_head.",
     )
     for name, parameter in model.named_parameters():
-        should_train = name.startswith(expected_prefixes)
+        # The refiner rides inside motion_decoder but set_freeze re-freezes it
+        # by name unless refine=True, so it neither trains nor takes gradient.
+        should_train = name.startswith(expected_prefixes) and not name.startswith(
+            "motion_decoder.refiner."
+        )
         assert parameter.requires_grad is should_train
         assert (parameter.grad is not None) is should_train
 
@@ -3377,7 +3388,11 @@ def test_confidence_term_leaves_frozen_parameters_without_gradients(dumped_scene
         "track_head.",
     )
     for name, parameter in model.named_parameters():
-        should_train = name.startswith(expected_prefixes)
+        # The refiner rides inside motion_decoder but set_freeze re-freezes it
+        # by name unless refine=True, so it neither trains nor takes gradient.
+        should_train = name.startswith(expected_prefixes) and not name.startswith(
+            "motion_decoder.refiner."
+        )
         assert parameter.requires_grad is should_train
         assert (parameter.grad is not None) is should_train
 
@@ -5455,7 +5470,10 @@ class _SummaryPathArc(Arc):
         self.backbone = _SummaryPathBackbone(max_time_indices)
         self.head = nn.Linear(1, 1)
         self.cam_dec = nn.Linear(1, 1)
-        self.motion_decoder = nn.Linear(1, 1)
+        # The overfit main's production set_freeze (overfit_temporal_tracking
+        # .py:1073) re-freezes motion_decoder.refiner by name; the overfit
+        # itself is untouched, so only the stub changes.
+        self.motion_decoder = _LinearMotionDecoder(1, 1)
         self.track_head = nn.Linear(1, 1)
 
     def get_trainable_parameter_report(self):

@@ -20,9 +20,12 @@ import numpy as np
 import torch
 
 from arc.models.arc.utils.transform import (
-    as_homogeneous,
     pose_encoding_to_extri_intri,
-    unproject_depth,
+    # The model reads its own cloud too (TrackRefiner), so the helper lives
+    # beside unproject_depth now; the private alias keeps this module's two
+    # callers, and the tests that plant a known gauge through this name,
+    # unchanged.
+    predicted_pointmaps as _predicted_pointmaps,
 )
 from arc.training.diagnostics import (
     confidence_occlusion_diagnostics,
@@ -343,48 +346,6 @@ def _metric_pointmap_at_anchor(
         & np.isfinite(world_points).all(axis=-1)
     )
     return world_points, valid
-
-
-def _predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
-    required = {"depth", "pose_enc"}
-    missing = required - set(raw_predictions)
-    if missing:
-        raise KeyError(
-            f"Raw predictions are missing alignment fields: {sorted(missing)}"
-        )
-    depth = raw_predictions["depth"]
-    pose_encoding = raw_predictions["pose_enc"]
-    if depth.ndim != 4 or depth.shape[0] != 1:
-        raise ValueError(
-            "The bounded alignment expects depth with shape (1,S,H,W), got "
-            f"{tuple(depth.shape)}"
-        )
-    if pose_encoding.shape[:2] != depth.shape[:2] or pose_encoding.shape[-1] != 9:
-        raise ValueError(
-            "pose_enc must have shape (1,S,9) matching depth, got "
-            f"{tuple(pose_encoding.shape)}"
-        )
-
-    # Scene alignment is a detached numerical side path. Keep its geometry in
-    # float32 even when the caller is inside mixed-precision autocast; otherwise
-    # unprojection can return BF16 and NumPy cannot consume it below.
-    with torch.no_grad(), torch.autocast(
-        device_type=depth.device.type,
-        enabled=False,
-    ):
-        depth = depth.detach().float()
-        pose_encoding = pose_encoding.detach().float()
-        height, width = depth.shape[-2:]
-        camera_to_world, intrinsics = pose_encoding_to_extri_intri(
-            pose_encoding,
-            (height, width),
-        )
-        pointmaps = unproject_depth(
-            depth[..., None],
-            intrinsics,
-            as_homogeneous(camera_to_world),
-        )
-    return pointmaps.detach()
 
 
 def fit_scene_sim3(

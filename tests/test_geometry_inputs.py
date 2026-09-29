@@ -744,7 +744,7 @@ def test_geometry_signatures_are_keyword_only():
             assert parameter.default is None
 
     for function in (Arc.set_freeze, runtime.assert_trainable_parameter_set):
-        for name in ("depth_input", "camera_input"):
+        for name in ("depth_input", "camera_input", "refine"):
             parameter = inspect.signature(function).parameters[name]
             assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
             assert parameter.default is False

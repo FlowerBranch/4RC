@@ -11,6 +11,7 @@ import torch.nn as nn
 import inference as inference_cli
 from arc.models.arc.arc import Arc
 from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
+from arc.models.arc.heads.motiondecoder import TrackRefiner
 # Imported from the module rather than the arc.training package to avoid pulling
 # in sparse_tracking (and its eval.* dependency) for these tests.
 from arc.training.checkpoint import (
@@ -258,6 +259,29 @@ class _TinyBackbone(nn.Module):
         self.pretrained = _TinyPretrained(include_time_embedding)
 
 
+class _LinearMotionDecoder(nn.Linear):
+    """An nn.Linear standing in for MotionDecoder, plus the production refiner.
+
+    set_freeze re-freezes ``motion_decoder.refiner`` by name under every
+    temporal preset, so a bare Linear raises AttributeError there. The child is
+    the real TrackRefiner at tiny widths rather than a hand-built stub: that
+    gives exactly the eight parameter names LEGACY_CHECKPOINT_MISSING_KEYS and
+    checkpoint._REFINER_KEY spell, and the zero-init of field_embed and
+    read_proj, so a stub cannot drift from either. The Linear's own weight and
+    bias stay, because the legacy fixtures save a plain Linear under this name
+    and the round-trip tests fill and compare its weight. Constructed inside
+    the refiner's own fork_rng, so a seeded double draws exactly as before.
+    A stub either has every forgiven module or none (_TinyPretrained's rule):
+    this one is the hub side; _LegacyTinyArc keeps the bare Linear.
+    """
+
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features)
+        self.refiner = TrackRefiner(
+            embed_dim=4, patch_size=2, neighbours=2, correlation_dim=2
+        )
+
+
 class _TinyHubArc(Arc):
     def __init__(self, freeze="none"):
         nn.Module.__init__(self)
@@ -265,7 +289,7 @@ class _TinyHubArc(Arc):
         self.backbone = _TinyBackbone(include_time_embedding=True)
         self.head = nn.Linear(2, 2)
         self.cam_dec = nn.Linear(2, 2)
-        self.motion_decoder = nn.Linear(2, 2)
+        self.motion_decoder = _LinearMotionDecoder(2, 2)
         self.track_head = nn.Linear(2, 2)
         self.set_freeze(freeze)
 
@@ -674,6 +698,83 @@ def test_main_rejects_a_non_positive_frame_cap(monkeypatch):
         inference_cli.main()
 
 
+def test_inference_multiview_threads_refine_iters_to_the_model():
+    """The executed half of the inference route pin.
+
+    Recording is weight-free: a keyword dropped at inference() or at
+    loss_of_one_batch leaves every output plausible -- a K=3 patch loads
+    cleanly and runs its trained refiner zero times -- and only a recorder
+    that sees the model call can tell. The default arm pins that a caller
+    passing nothing (app.py) reaches the model with refine_iters=1,
+    Arc.forward's own default and today's single pass, on both the profiling
+    and the plain return shape.
+    """
+
+    from arc.dust3r.inference_multiview import inference as run_inference
+
+    class _Recorder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, views, **kwargs):
+            self.calls.append(dict(kwargs))
+            return ({}, {"total_time": 0.0}) if kwargs.get("profiling") else {}
+
+    def views():
+        return [{"img": torch.zeros(1, 3, 4, 4)} for _ in range(2)]
+
+    recorder = _Recorder()
+    run_inference(
+        views(), recorder, torch.device("cpu"), "bf16-mixed",
+        verbose=False, profiling=True, refine_iters=3,
+    )
+    assert recorder.calls == [{"profiling": True, "refine_iters": 3}]
+
+    recorder.calls.clear()
+    run_inference(
+        views(), recorder, torch.device("cpu"), "bf16-mixed",
+        verbose=False, profiling=False,
+    )
+    assert recorder.calls == [{"profiling": False, "refine_iters": 1}]
+
+
+def test_inference_wires_the_patch_refine_fields_to_freeze_and_forward():
+    """The inspected half: the fed-but-frozen pin for inference.main.
+
+    test_trainer_loop's AST pin covers the two training drivers only. Here
+    the silent case is the forward hop: a set_freeze that dropped refine=
+    fails loudly on unexpected refiner keys, but an inference() call that
+    dropped refine_iters= loads a K=4 patch cleanly and runs one iteration.
+    main() cannot be executed past the model import on CPU, so both calls
+    are read from the source, the way the driver pin reads its drivers.
+    """
+
+    import ast
+    from pathlib import Path
+
+    calls = {}
+    for node in ast.walk(ast.parse(Path(inference_cli.__file__).read_text())):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            calls.setdefault(name, []).append(node)
+
+    def keyword_sources(call):
+        return {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
+
+    assert calls.get("set_freeze"), "inference.py has no set_freeze call"
+    for call in calls["set_freeze"]:
+        assert keyword_sources(call).get("refine") == "patch_metadata['refine']"
+    assert calls.get("inference"), "inference.py has no inference() call"
+    # The whole expression, not a substring of it: an inverted None check
+    # still spells patch_metadata['refine_iters'], and would run every loaded
+    # patch at one pass while crashing the patch-less path.
+    for call in calls["inference"]:
+        assert keyword_sources(call).get("refine_iters") == (
+            "1 if patch_metadata is None else patch_metadata['refine_iters']"
+        )
+
+
 def test_time_count_is_checked_before_subsampling_and_after_loading():
     paths = [f"frame_{index:03d}.png" for index in range(31)]
     with pytest.raises(ValueError, match="expected 31, got 30"):
@@ -933,8 +1034,12 @@ def test_temporal_tracking_freeze_is_exact_and_reversible():
     expected_names = {
         "backbone.pretrained.time_index_embedding.weight",
         *{
+            # The refiner rides inside motion_decoder; set_freeze re-freezes
+            # it by name unless refine=True, so the preset's set excludes it
+            # (the refine=True arm is test_the_refine_flag_trains_exactly_the_refiner).
             f"motion_decoder.{name}"
             for name, _ in model.motion_decoder.named_parameters()
+            if not name.startswith("refiner.")
         },
         *{
             f"track_head.{name}"
@@ -1020,6 +1125,58 @@ def test_temporal_freeze_flags_train_exactly_the_enabled_injections():
     report = model.get_trainable_parameter_report()
     assert report["tensor_count"] == 231
     assert report["parameter_count"] == 314_600_740
+
+
+@pytest.mark.parametrize(
+    "mode, extra",
+    [
+        ("temporal_tracking", {}),
+        ("temporal_tracking_global_attention", {}),
+        ("temporal_tracking_late_global", {"late_global_blocks": 2}),
+    ],
+)
+def test_the_refine_flag_trains_exactly_the_refiner(mode, extra):
+    """The refiner's fork of the landmine-4 pin, by NAME in both directions,
+    under every temporal preset the trainer can run.
+
+    It rides INSIDE motion_decoder, whose blanket unfreeze the preset performs,
+    so a set_freeze that forgot the by-name re-freeze would leave it trainable
+    at --refine_iters 1, where no forward feeds it: every step would then die
+    in assert_trainable_gradients_finite on a missing gradient, and the
+    exact-and-reversible pins would move by 8 / 1_398_016. One that forgot
+    the unfreeze -- under any one preset -- would leave a K=4 arm training
+    nothing new under a healthy curve: fed but frozen, which no gradient
+    guard sees, and the zero-init refiner would then make every pass equal.
+    Counts are arithmetic from REFINER_TRAINABLE on top of the preset's own
+    report, never fresh literals, and the flag-off re-freeze must land back
+    on that report exactly; the narrow preset keeps its pinned pair.
+    """
+
+    import arc.training.runtime as runtime
+
+    model = _full_meta_arc()
+    model.set_freeze(mode, **extra)
+    base = model.get_trainable_parameter_report()
+    base_names = {name for name, _ in base["parameters"]}
+    refiner_names = {
+        f"motion_decoder.refiner.{name}"
+        for name, _ in model.motion_decoder.refiner.named_parameters()
+    }
+    assert len(refiner_names) == 8
+    assert not refiner_names & base_names
+    if mode == "temporal_tracking":
+        assert (base["tensor_count"], base["parameter_count"]) == (231, 314_600_740)
+
+    model.set_freeze(mode, refine=True, **extra)
+    report = model.get_trainable_parameter_report()
+    assert {name for name, _ in report["parameters"]} == base_names | refiner_names
+    assert report["tensor_count"] == base["tensor_count"] + runtime.REFINER_TRAINABLE[0]
+    assert report["parameter_count"] == base["parameter_count"] + runtime.REFINER_TRAINABLE[1]
+
+    model.set_freeze(mode, **extra)
+    report = model.get_trainable_parameter_report()
+    assert report["tensor_count"] == base["tensor_count"]
+    assert report["parameter_count"] == base["parameter_count"]
 
 
 def test_from_pretrained_accepts_only_the_legacy_time_embedding_gap(tmp_path):
@@ -1488,7 +1645,7 @@ class _GlobalAttnTinyArc(Arc):
         self.backbone = _GlobalAttnTinyBackbone(alt_start=alt_start)
         self.head = nn.Linear(2, 2)
         self.cam_dec = nn.Linear(2, 2)
-        self.motion_decoder = nn.Linear(2, 2)
+        self.motion_decoder = _LinearMotionDecoder(2, 2)
         self.track_head = nn.Linear(2, 2)
         self.set_freeze(freeze, late_global_blocks=late_global_blocks)
 
@@ -1546,8 +1703,11 @@ def test_global_attention_freeze_is_exact_on_the_full_model():
     expected_names = {
         "backbone.pretrained.time_index_embedding.weight",
         *{
+            # The refiner rides inside motion_decoder; set_freeze re-freezes
+            # it by name unless refine=True, so the preset's set excludes it.
             f"motion_decoder.{name}"
             for name, _ in model.motion_decoder.named_parameters()
+            if not name.startswith("refiner.")
         },
         *{
             f"track_head.{name}"
@@ -1694,8 +1854,11 @@ def test_late_global_freeze_is_exact_on_the_full_model():
     expected_names = {
         "backbone.pretrained.time_index_embedding.weight",
         *{
+            # The refiner rides inside motion_decoder; set_freeze re-freezes
+            # it by name unless refine=True, so the preset's set excludes it.
             f"motion_decoder.{name}"
             for name, _ in model.motion_decoder.named_parameters()
+            if not name.startswith("refiner.")
         },
         *{
             f"track_head.{name}"
@@ -1791,7 +1954,7 @@ def test_late_global_mode_backward_reaches_only_the_last_k_blocks():
     model.backbone = _EncoderBackbone(encoder)
     model.head = nn.Linear(2, 2)
     model.cam_dec = nn.Linear(2, 2)
-    model.motion_decoder = nn.Linear(2, 2)
+    model.motion_decoder = _LinearMotionDecoder(2, 2)
     model.track_head = nn.Linear(2, 2)
     # Global blocks are [3, 5]; k=1 keeps only 5.
     model.set_freeze("temporal_tracking_late_global", late_global_blocks=1)
@@ -1860,7 +2023,7 @@ def test_global_attention_mode_backward_reaches_all_unfrozen_blocks():
     model.backbone = _EncoderBackbone(encoder)
     model.head = nn.Linear(2, 2)
     model.cam_dec = nn.Linear(2, 2)
-    model.motion_decoder = nn.Linear(2, 2)
+    model.motion_decoder = _LinearMotionDecoder(2, 2)
     model.track_head = nn.Linear(2, 2)
     model.set_freeze("temporal_tracking_global_attention")
 
@@ -2014,12 +2177,19 @@ def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
 
     metadata = read_temporal_patch_metadata(patch)
 
+    # Dict equality, not by-key reads: a reader that dropped refine or
+    # refine_iters would let inference.py run a K=4 patch at one iteration.
+    # Both derived: refine from the key set (a K=1 patch carries no refiner
+    # tensor, since the saver keys off requires_grad), the count from a
+    # payload scalar whose absence means one iteration.
     assert metadata == {
         "freeze_mode": "temporal_tracking",
         "late_global_blocks": None,
         "max_time_indices": 4,
         "depth_input": False,
         "camera_input": False,
+        "refine": False,
+        "refine_iters": 1,
     }
 
 
@@ -2047,6 +2217,7 @@ def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):
         metadata = read_temporal_patch_metadata(patch)
         assert metadata["depth_input"] is depth_input
         assert metadata["camera_input"] is camera_input
+        assert metadata["refine"] is False
 
         restored = _TinyHubArc(freeze="none")
         restored.set_freeze(
@@ -2054,6 +2225,7 @@ def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):
             late_global_blocks=metadata["late_global_blocks"],
             depth_input=metadata["depth_input"],
             camera_input=metadata["camera_input"],
+            refine=metadata["refine"],
         )
         load_temporal_tracking_checkpoint(restored, patch)
         if depth_input:
@@ -2223,7 +2395,15 @@ def test_patch_without_a_recorded_k_still_loads_a_k_less_mode(tmp_path):
     torch.save(payload, path)
 
     assert read_temporal_patch_metadata(path)["late_global_blocks"] is None
+    # The refinement count reads the same way: no field, no refiner tensors,
+    # one iteration -- the only thing a patch without the field can have
+    # trained. A stored None is absence too, as it is for k.
+    assert read_temporal_patch_metadata(path)["refine"] is False
+    assert read_temporal_patch_metadata(path)["refine_iters"] == 1
     load_temporal_tracking_checkpoint(_TinyHubArc(freeze="temporal_tracking"), path)
+    none_path = tmp_path / "none_count_patch.pt"
+    torch.save({**payload, "refine_iters": None}, none_path)
+    assert read_temporal_patch_metadata(none_path)["refine_iters"] == 1
 
     payload["freeze_mode"] = "temporal_tracking_late_global"
     late_path = tmp_path / "late_without_k.pt"
@@ -2236,6 +2416,114 @@ def test_patch_without_a_recorded_k_still_loads_a_k_less_mode(tmp_path):
     torch.save(payload, bad_path)
     with pytest.raises(RuntimeError, match="must be an integer or absent"):
         read_temporal_patch_metadata(bad_path)
+
+
+def test_a_refiner_trained_patch_without_a_recorded_count_is_refused(tmp_path):
+    """A reader that trusted the field alone would resolve the absent count
+    to 1 and run this patch at one iteration, where the trained refiner never
+    executes -- a plausible output from the wrong model. The loader refuses
+    it too, so a --resume cannot pick it up either. The payload is exactly
+    what save_temporal_tracking_checkpoint writes for a refine=True model:
+    the overfit's saver records no count, and that is why the trainer's own
+    writer is the only sanctioned source of K>1 patches."""
+
+    trained = _TinyHubArc(freeze="none")
+    trained.set_freeze("temporal_tracking", refine=True)
+    with torch.no_grad():
+        trained.motion_decoder.refiner.read_proj.weight.fill_(0.5)
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+
+    with pytest.raises(ValueError, match="refine_iters=1"):
+        read_temporal_patch_metadata(patch)
+    with pytest.raises(ValueError, match="refine_iters=1"):
+        load_temporal_tracking_checkpoint(trained, patch)
+
+
+def test_a_recorded_count_without_refiner_tensors_is_refused(tmp_path):
+    """The converse: a count above 1 over a refiner-less key set would unroll
+    K identical passes of a zero-term refiner -- K times the cost for the K=1
+    output -- under a record claiming a refinement that never trained."""
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    payload = {
+        "freeze_mode": "temporal_tracking",
+        "refine_iters": 3,
+        "state_dict": {
+            name: parameter.detach().clone()
+            for name, parameter in trained.named_parameters()
+            if parameter.requires_grad
+        },
+    }
+    path = tmp_path / "count_without_refiner.pt"
+    torch.save(payload, path)
+
+    with pytest.raises(ValueError, match="lacks"):
+        read_temporal_patch_metadata(path)
+
+
+def test_a_consistent_refine_patch_records_its_arm_and_loads_back(tmp_path):
+    """The K>1 round trip inference.py drives: metadata names the arm and the
+    count, set_freeze(refine=True) admits the tensors, and the trained
+    read_proj comes back. The blind arm -- a model that never unfroze the
+    refiner -- fails on unexpected keys, the geometry arms' loud arm."""
+
+    trained = _TinyHubArc(freeze="none")
+    trained.set_freeze("temporal_tracking", refine=True)
+    with torch.no_grad():
+        trained.motion_decoder.refiner.read_proj.weight.fill_(0.5)
+    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    payload = torch.load(patch, map_location="cpu", weights_only=True)
+    payload["refine_iters"] = 3
+    torch.save(payload, patch)
+
+    metadata = read_temporal_patch_metadata(patch)
+    assert metadata["refine"] is True
+    assert metadata["refine_iters"] == 3
+
+    restored = _TinyHubArc(freeze="none")
+    assert torch.count_nonzero(restored.motion_decoder.refiner.read_proj.weight) == 0
+    restored.set_freeze(
+        metadata["freeze_mode"],
+        late_global_blocks=metadata["late_global_blocks"],
+        depth_input=metadata["depth_input"],
+        camera_input=metadata["camera_input"],
+        refine=metadata["refine"],
+    )
+    load_temporal_tracking_checkpoint(restored, patch)
+    torch.testing.assert_close(
+        restored.motion_decoder.refiner.read_proj.weight,
+        trained.motion_decoder.refiner.read_proj.weight,
+    )
+
+    blind = _TinyHubArc(freeze="temporal_tracking")
+    with pytest.raises(RuntimeError, match="unexpected keys"):
+        load_temporal_tracking_checkpoint(blind, patch)
+
+
+@pytest.mark.parametrize(
+    "value, match",
+    [(True, "integer or absent"), ("four", "integer or absent"), (0, "at least 1")],
+)
+def test_a_malformed_refine_count_is_refused(tmp_path, value, match):
+    """Read as late_global_blocks is read: a bool is not a count, a string is
+    not a count, and zero iterations is not a run. int() coercion would turn
+    True into a silent 1."""
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    payload = {
+        "freeze_mode": "temporal_tracking",
+        "refine_iters": value,
+        "state_dict": {
+            name: parameter.detach().clone()
+            for name, parameter in trained.named_parameters()
+            if parameter.requires_grad
+        },
+    }
+    path = tmp_path / "bad_count.pt"
+    torch.save(payload, path)
+
+    with pytest.raises(RuntimeError, match=match):
+        read_temporal_patch_metadata(path)
 
 
 def test_harness_step_helpers_drive_the_split_forward():
