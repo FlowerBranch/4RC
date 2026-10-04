@@ -145,9 +145,9 @@ def test_camera_order_is_preserved_rather_than_sorted(tmp_path):
 def test_a_camera_the_scene_does_not_have_fails_loudly_naming_both():
     """Work-order test 2, checked against ids rather than a loader exception.
 
-    ``load_dumped_kubric_scene`` raises ``ValueError`` for non-increasing times,
-    a bad anchor and a bad upscaling factor too, so a wrapper that caught it and
-    reported "views the dump cannot serve" would mislabel three unrelated faults
+    ``build_scene`` raises ``ValueError`` for non-increasing times, a bad anchor
+    and a bad upscaling factor too, so a wrapper that caught it and reported
+    "views the scene cannot serve" would mislabel three unrelated faults
     as a camera problem.
     """
 

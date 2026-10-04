@@ -40,18 +40,15 @@ from arc.training.scene_provider import (
     rotation_from_degrees,
     select_tracks_positionally,
 )
-from test_sparse_tracking import _write_scene
+from scene_fixtures import fixture_datapoint, fixture_scene
 
 
 @pytest.fixture
-def dumped_scene(tmp_path):
-    """A real two-camera window on disk. There is no conftest, so it is local."""
+def dumped_scene():
+    """A real two-camera window, in memory. There is no conftest, so it is local."""
 
-    from arc.training import load_dumped_kubric_scene
-
-    _write_scene(tmp_path, time_count=4, view_count=2, depth_sidecar=True)
-    return load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    return fixture_scene(
+        time_count=4, view_count=2, cameras=(0, 1), times=(0, 1, 2, 3), size=56
     )
 
 
@@ -1315,17 +1312,13 @@ def test_the_default_provider_spec_resolves_to_build_scenes_own_default():
     )
 
 
-def test_the_provider_resolves_relative_slots_against_the_steps_own_window(tmp_path):
+def test_the_provider_resolves_relative_slots_against_the_steps_own_window():
     """Slot 0:0 on a (1, 0) view list anchors camera id 1 -- relative, not
     absolute -- and the resolved pair reaches the scene through
     scene_from_datapoint end to end."""
 
-    from test_scene_sources import _datapoint_from_dump
     from arc.training.scene_provider import MVTrackerSceneProvider
 
-    scene_path = _write_scene(
-        tmp_path, time_count=4, view_count=2, depth_sidecar=True
-    )
     plan = _anchor_plan()
     assert plan.cameras == (1, 0) and len(plan.times) == 2
 
@@ -1333,9 +1326,9 @@ def test_the_provider_resolves_relative_slots_against_the_steps_own_window(tmp_p
         seq_names = ["0000"]
 
         def __getitem__(self, index):
-            datapoint = _datapoint_from_dump(scene_path)
+            datapoint = fixture_datapoint(time_count=4, view_count=2)
             # The provider's column selection reads the loaded sample's own
-            # eligible pool; the dump fixture carries three tracks.
+            # eligible pool; the fixture carries three tracks.
             datapoint.sample_track_indices = [0, 1, 2]
             return datapoint, True
 
@@ -1361,7 +1354,7 @@ def test_the_provider_resolves_relative_slots_against_the_steps_own_window(tmp_p
     assert primary.original_time == plan.times[0]
 
 
-def test_the_provider_attaches_geometry_view_keys_when_its_flags_are_on(tmp_path):
+def test_the_provider_attaches_geometry_view_keys_when_its_flags_are_on():
     """The live training chain, EXECUTED: provider -> scene_from_datapoint ->
     build_scene -> _attach_view_geometry.
 
@@ -1369,24 +1362,20 @@ def test_the_provider_attaches_geometry_view_keys_when_its_flags_are_on(tmp_path
     this pins that the chain actually delivers view dicts carrying the keys.
     Severing any of its pass-through points -- the provider's kwargs, the
     scene_from_datapoint forwarding, or the build_scene attach -- leaves the
-    rest of the suite green, because every other end-to-end loader test goes
-    through load_dumped_kubric_scene, the OVERFIT path. One flag per arm, so
-    the arms also pin that each flag attaches only its own key.
+    rest of the suite green, because every other end-to-end scene test builds
+    its scene with build_scene directly, never through the provider. One flag
+    per arm, so the arms also pin that each flag attaches only its own key.
     """
 
-    from test_scene_sources import _datapoint_from_dump
     from arc.training.scene_provider import MVTrackerSceneProvider
 
-    scene_path = _write_scene(
-        tmp_path, time_count=4, view_count=2, depth_sidecar=True
-    )
     plan = _anchor_plan()
 
     class _Pool:
         seq_names = ["0000"]
 
         def __getitem__(self, index):
-            datapoint = _datapoint_from_dump(scene_path)
+            datapoint = fixture_datapoint(time_count=4, view_count=2)
             datapoint.sample_track_indices = [0, 1, 2]
             return datapoint, True
 
@@ -1476,7 +1465,7 @@ def test_adaptive_drops_the_slots_a_step_cannot_seat_and_keeps_spec_order():
         )
 
 
-def test_the_first_surviving_anchor_owns_the_scene_under_adaptive(tmp_path):
+def test_the_first_surviving_anchor_owns_the_scene_under_adaptive():
     """A dropped primary hands the Sim(3) to the next slot that seats.
 
     Asserted through scene_from_datapoint rather than on the resolved tuple,
@@ -1484,19 +1473,15 @@ def test_the_first_surviving_anchor_owns_the_scene_under_adaptive(tmp_path):
     query_observation_slot points at.
     """
 
-    from test_scene_sources import _datapoint_from_dump
     from arc.training.scene_provider import MVTrackerSceneProvider
 
-    scene_path = _write_scene(
-        tmp_path, time_count=4, view_count=2, depth_sidecar=True
-    )
     plan = _anchor_plan()
 
     class _Pool:
         seq_names = ["0000"]
 
         def __getitem__(self, index):
-            datapoint = _datapoint_from_dump(scene_path)
+            datapoint = fixture_datapoint(time_count=4, view_count=2)
             datapoint.sample_track_indices = [0, 1, 2]
             return datapoint, True
 

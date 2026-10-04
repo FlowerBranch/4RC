@@ -17,7 +17,6 @@ from arc.training import (
     refinement_iteration_weights,
     resolve_confidence_alpha,
     synchronized_consistency_loss,
-    synchronized_consistency_stats,
     synchronized_pair_indices,
     temporal_differences,
     temporal_velocity_stats,
@@ -694,26 +693,6 @@ def test_sync_loss_validates_inputs():
         synchronized_consistency_loss(
             fields, slot_time_indices, huber_delta=0.05, metric_scale=0.0
         )
-
-
-def test_sync_stats_report_metric_disagreement_and_skip_unpaired_windows():
-    fields, slot_time_indices = _paired_fields()
-    perturbed = fields.clone()
-    # A uniform 3 mm offset on one synchronized slot: every pixel of that pair
-    # disagrees by exactly sqrt(3 * 0.003^2) after the metric lift below.
-    perturbed[:, :, 2] += 0.003
-
-    stats = synchronized_consistency_stats(
-        perturbed, slot_time_indices, metric_scale=2.0
-    )
-    expected = 2.0 * (3 * 0.003**2) ** 0.5
-    assert stats["pair_count"] == 2
-    assert stats["p90_m"] >= stats["median_m"] >= 0.0
-    assert stats["mean_m"] == pytest.approx(expected / 2.0, rel=1e-5)
-
-    assert synchronized_consistency_stats(
-        fields, torch.tensor([0, 1, 2, 3])
-    ) is None
 
 
 # ------------------------------------------------------- velocity (Eq. 8) ---

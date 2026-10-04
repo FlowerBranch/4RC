@@ -17,7 +17,6 @@ from arc.models.arc.heads.motiondecoder import TrackRefiner
 from arc.training.checkpoint import (
     load_temporal_tracking_checkpoint,
     read_temporal_patch_metadata,
-    save_temporal_tracking_checkpoint,
 )
 
 
@@ -406,6 +405,33 @@ def _save_raw_safetensors_state(state_dict, directory):
     )
 
 
+def _trainer_patch(model, directory, **args_overrides):
+    """Write ``model``'s trainable tensors through the trainer's own writer.
+
+    ``train_temporal_tracking._write_checkpoint`` is the only in-repo writer of
+    temporal patches, and inference loads its ``train_state.pt`` directly, so
+    that is the writer a round trip has to go through. The trainer is imported
+    here rather than at module level so the test modules that import this one
+    do not pull it in.
+    """
+
+    import train_temporal_tracking as train_cli
+    from test_trainer_loop import _loop_args
+
+    optimizer = torch.optim.AdamW(
+        [{"params": [p for p in model.parameters() if p.requires_grad], "lr": 1e-3}]
+    )
+    return train_cli._write_checkpoint(
+        model,
+        optimizer,
+        torch.amp.GradScaler("cuda", enabled=False),
+        [1e-3],
+        step=0,
+        output_dir=directory,
+        args=_loop_args(directory, **args_overrides),
+    )
+
+
 def test_time_embedding_size_is_configurable_and_zero_initialized():
     model = _configured_time_transformer()
 
@@ -467,13 +493,13 @@ def test_inference_parser_accepts_a_temporal_patch_path():
             "--save",
             "output.npz",
             "--temporal_patch",
-            "runs/overfit/temporal_tracking.pt",
+            "runs/train/train_state.pt",
             "--track_query_idx",
             "0",
         ]
     )
 
-    assert args.temporal_patch == "runs/overfit/temporal_tracking.pt"
+    assert args.temporal_patch == "runs/train/train_state.pt"
     assert args.track_query_idx == [0]
 
 
@@ -928,7 +954,7 @@ def test_optimizer_step_leaves_frozen_parameter_values_untouched():
     }
     assert frozen_before and trainable_before
 
-    # Built the same way overfit_temporal_tracking.py builds it.
+    # AdamW over the trainable set with weight decay off, as build_optimizer does.
     trainable = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=1e-2, weight_decay=0.0)
     optimizer.zero_grad(set_to_none=True)
@@ -1228,7 +1254,7 @@ def test_legacy_load_records_the_consumed_time_embedding_gap(tmp_path):
 
 
 def test_temporal_patch_restores_a_nonzero_time_embedding(tmp_path):
-    """The overfit's output must be loadable back onto a base checkpoint.
+    """The trainer's ``train_state.pt`` must be loadable back onto a base checkpoint.
 
     This is the mechanism ``inference.py --temporal_patch`` drives.
     """
@@ -1240,10 +1266,7 @@ def test_temporal_patch_restores_a_nonzero_time_embedding(tmp_path):
     with torch.no_grad():
         trained.backbone.pretrained.time_index_embedding.weight.fill_(1.75)
         trained.motion_decoder.weight.fill_(0.25)
-    patch = save_temporal_tracking_checkpoint(
-        trained,
-        tmp_path / "temporal_tracking.pt",
-    )
+    patch = _trainer_patch(trained, tmp_path / "patch")
 
     restored = _TinyHubArc.from_pretrained(str(legacy_dir))
     assert torch.count_nonzero(
@@ -1691,8 +1714,8 @@ def test_global_attention_freeze_requires_alternating_attention():
 def test_global_attention_freeze_is_exact_on_the_full_model():
     """Pin the exact trainable set of the new mode on the real 1.5B Arc.
 
-    The counts are also asserted at runtime by overfit_temporal_tracking.py's
-    EXPECTED_TRAINABLE_SETS; the two must agree.
+    The counts are also asserted at runtime by the trainer, against
+    arc.training.runtime's EXPECTED_TRAINABLE_SETS; the two must agree.
     """
 
     model = _full_meta_arc()
@@ -1842,8 +1865,8 @@ def test_late_global_blocks_is_rejected_outside_its_own_mode():
 def test_late_global_freeze_is_exact_on_the_full_model():
     """Pin the exact trainable set of the middle rung on the real 1.5B Arc.
 
-    The counts are also asserted at runtime by overfit_temporal_tracking.py's
-    _expected_trainable_set; the two must agree.
+    The counts are also asserted at runtime by the trainer, through
+    arc.training.runtime's expected_trainable_set; the two must agree.
     """
 
     model = _full_meta_arc()
@@ -2173,7 +2196,7 @@ def test_reinitialize_validates_mode_scale_and_table_shape():
 
 def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
     trained = _TinyHubArc(freeze="temporal_tracking")
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    patch = _trainer_patch(trained, tmp_path / "patch")
 
     metadata = read_temporal_patch_metadata(patch)
 
@@ -2212,7 +2235,7 @@ def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):
                 trained.backbone.pretrained.depth_patch_embed.weight.fill_(0.25)
             if camera_input:
                 trained.backbone.pretrained.camera_proj.weight.fill_(0.75)
-        patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+        patch = _trainer_patch(trained, tmp_path / "patch")
 
         metadata = read_temporal_patch_metadata(patch)
         assert metadata["depth_input"] is depth_input
@@ -2246,13 +2269,6 @@ def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):
             load_temporal_tracking_checkpoint(blind, patch)
 
 
-def test_patch_save_requires_a_temporal_freeze_mode(tmp_path):
-    unfrozen = _TinyHubArc(freeze="none")
-
-    with pytest.raises(ValueError, match="model.freeze"):
-        save_temporal_tracking_checkpoint(unfrozen, tmp_path / "patch.pt")
-
-
 def test_patches_predating_the_freeze_mode_field_are_rejected(tmp_path):
     """Pre-freeze_mode patches also predate the motion-decoder gradient fix,
     so they carry weights trained on corrupted gradients; refuse them with an
@@ -2270,9 +2286,9 @@ def test_patches_predating_the_freeze_mode_field_are_rejected(tmp_path):
     path = tmp_path / "legacy_patch.pt"
     torch.save(payload, path)
 
-    with pytest.raises(RuntimeError, match="re-run the overfit"):
+    with pytest.raises(RuntimeError, match="train a new one"):
         read_temporal_patch_metadata(path)
-    with pytest.raises(RuntimeError, match="re-run the overfit"):
+    with pytest.raises(RuntimeError, match="train a new one"):
         load_temporal_tracking_checkpoint(
             _TinyHubArc(freeze="temporal_tracking"), path
         )
@@ -2283,7 +2299,7 @@ def test_patch_freeze_mode_mismatch_is_rejected_and_matching_mode_loads(tmp_path
     with torch.no_grad():
         trained.backbone.pretrained.blocks[1].weight.fill_(1.25)
         trained.backbone.pretrained.time_index_embedding.weight.fill_(0.5)
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    patch = _trainer_patch(trained, tmp_path / "patch")
 
     metadata = read_temporal_patch_metadata(patch)
     assert metadata["freeze_mode"] == "temporal_tracking_global_attention"
@@ -2313,7 +2329,7 @@ def test_new_mode_patch_covers_the_trained_encoder_blocks(tmp_path):
     """
 
     trained = _GlobalAttnTinyArc(freeze="temporal_tracking_global_attention")
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    patch = _trainer_patch(trained, tmp_path / "patch")
 
     payload = torch.load(patch, map_location="cpu", weights_only=True)
     saved_names = set(payload["state_dict"])
@@ -2337,7 +2353,21 @@ def test_patch_records_late_global_k_and_rejects_a_k_mismatch(tmp_path):
     )
     with torch.no_grad():
         trained.backbone.pretrained.blocks[3].weight.fill_(1.25)
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    # Hand-built: the trainer's writer does not record late_global_blocks, so
+    # this is the shape an archived late-global patch carries.
+    patch = tmp_path / "patch.pt"
+    torch.save(
+        {
+            "freeze_mode": "temporal_tracking_late_global",
+            "late_global_blocks": 1,
+            "state_dict": {
+                name: parameter.detach().cpu()
+                for name, parameter in trained.named_parameters()
+                if parameter.requires_grad
+            },
+        },
+        patch,
+    )
 
     metadata = read_temporal_patch_metadata(patch)
     assert metadata["freeze_mode"] == "temporal_tracking_late_global"
@@ -2408,7 +2438,7 @@ def test_patch_without_a_recorded_k_still_loads_a_k_less_mode(tmp_path):
     payload["freeze_mode"] = "temporal_tracking_late_global"
     late_path = tmp_path / "late_without_k.pt"
     torch.save(payload, late_path)
-    with pytest.raises(RuntimeError, match="re-run the overfit"):
+    with pytest.raises(RuntimeError, match="cannot be reconstructed"):
         read_temporal_patch_metadata(late_path)
 
     payload["late_global_blocks"] = "four"
@@ -2422,16 +2452,27 @@ def test_a_refiner_trained_patch_without_a_recorded_count_is_refused(tmp_path):
     """A reader that trusted the field alone would resolve the absent count
     to 1 and run this patch at one iteration, where the trained refiner never
     executes -- a plausible output from the wrong model. The loader refuses
-    it too, so a --resume cannot pick it up either. The payload is exactly
-    what save_temporal_tracking_checkpoint writes for a refine=True model:
-    the overfit's saver records no count, and that is why the trainer's own
-    writer is the only sanctioned source of K>1 patches."""
+    it too, so a --resume cannot pick it up either. No in-repo writer
+    produces this payload (the trainer records the count beside the
+    tensors), so it is built by hand: a refine=True model's trainable
+    tensors with no count."""
 
     trained = _TinyHubArc(freeze="none")
     trained.set_freeze("temporal_tracking", refine=True)
     with torch.no_grad():
         trained.motion_decoder.refiner.read_proj.weight.fill_(0.5)
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
+    patch = tmp_path / "patch.pt"
+    torch.save(
+        {
+            "freeze_mode": "temporal_tracking",
+            "state_dict": {
+                name: parameter.detach().cpu()
+                for name, parameter in trained.named_parameters()
+                if parameter.requires_grad
+            },
+        },
+        patch,
+    )
 
     with pytest.raises(ValueError, match="refine_iters=1"):
         read_temporal_patch_metadata(patch)
@@ -2471,10 +2512,7 @@ def test_a_consistent_refine_patch_records_its_arm_and_loads_back(tmp_path):
     trained.set_freeze("temporal_tracking", refine=True)
     with torch.no_grad():
         trained.motion_decoder.refiner.read_proj.weight.fill_(0.5)
-    patch = save_temporal_tracking_checkpoint(trained, tmp_path / "patch.pt")
-    payload = torch.load(patch, map_location="cpu", weights_only=True)
-    payload["refine_iters"] = 3
-    torch.save(payload, patch)
+    patch = _trainer_patch(trained, tmp_path / "patch", refine_iters=3)
 
     metadata = read_temporal_patch_metadata(patch)
     assert metadata["refine"] is True
@@ -2526,16 +2564,16 @@ def test_a_malformed_refine_count_is_refused(tmp_path, value, match):
         read_temporal_patch_metadata(path)
 
 
-def test_harness_step_helpers_drive_the_split_forward():
+def test_runtime_step_helpers_drive_the_split_forward():
     """The multi-anchor step's glue, exercised on the real Arc methods.
 
-    ``_encode_and_reconstruct`` and ``_anchor_tracks`` are what a training step
+    ``encode_and_reconstruct`` and ``anchor_tracks`` are what a training step
     calls instead of ``model(views)``. They are thin, but they are the only new
     code between the model and the loss, and a shape or key mistake in them
     would surface as a wasted GPU allocation rather than a test failure.
     """
 
-    import overfit_temporal_tracking as overfit_cli
+    from arc.training import runtime
 
     model = _arc_shell(max_time_indices=32)
     model.backbone = _FakeBackbone()
@@ -2556,7 +2594,7 @@ def test_harness_step_helpers_drive_the_split_forward():
         num_observations=len(views),
     )
 
-    images, feats, recon = overfit_cli._encode_and_reconstruct(model, views)
+    images, feats, recon = runtime.encode_and_reconstruct(model, views)
 
     assert images.shape == (1, 4, 3, 2, 2)
     # The reconstruction is built once and shared: it is what the Sim(3) fit and
@@ -2568,7 +2606,7 @@ def test_harness_step_helpers_drive_the_split_forward():
     assert len(feats) == 4
 
     for anchor_index, slot in enumerate(anchor_slots):
-        raw = overfit_cli._anchor_tracks(model, feats, images, scene, anchor_index)
+        raw = runtime.anchor_tracks(model, feats, images, scene, anchor_index)
         # Shaped as the Q=1 raw dict the loss expects, so sparse_tracking_loss
         # keeps its contract whether it is scoring one anchor or a stacked Q=A.
         assert raw["track_multi"].shape == (1, 1, 4, 2, 2, 3)

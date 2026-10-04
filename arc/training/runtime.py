@@ -1,19 +1,19 @@
-"""Runtime helpers shared by every bounded 4RC training entry point.
+"""Runtime helpers for the temporal-tracking trainer.
 
-These grew inside ``overfit_temporal_tracking.py`` when it was the only driver.
-A second driver would otherwise copy them, and a copy is exactly how the guards
-here stop being guards: the freeze-mask assertion, the frozen-gradient check and
-the finite-gradient check exist to make a silent no-op loud, and two divergent
-copies make them quiet again.
+These grew inside the one-scene driver that preceded the trainer and moved here
+when the trainer became their second caller.  Keeping one copy matters because
+a copy is exactly how the guards here stop being guards: the freeze-mask
+assertion, the frozen-gradient check and the finite-gradient check exist to make
+a silent no-op loud, and two divergent copies make them quiet again.
 
 Nothing here knows about ``argparse``.  ``build_optimizer`` takes scalars rather
-than a ``Namespace`` precisely so a second driver with a different parser can
-call it without inheriting the first driver's flag names.
+than a ``Namespace`` precisely so a caller with a different parser can use it
+without inheriting the trainer's flag names.
 
 The per-anchor supervision mechanism (``cut_features`` through
-``accumulate_weighted``) lives here for the same reason: the overfit built and
-measured it, the multi-scene trainer runs the identical structure, and a copy
-would let the two drivers' memory behaviour drift apart silently.
+``accumulate_weighted``) lives here for the same reason: it was built and
+measured on the one-scene driver, the trainer runs the identical structure, and
+the tests drive each piece directly.
 
 Deliberately **not** re-exported from ``arc.training``'s ``__all__``:
 ``gradient_norm`` and ``move_views_to_cuda`` are device-specific, and the
@@ -59,10 +59,6 @@ EXPECTED_TRAINABLE_SETS = {
 # homogeneous, so k of them cost exactly k times this.
 LATE_GLOBAL_PER_BLOCK = (18, 28_336_896)
 DEFAULT_LATE_GLOBAL_BLOCKS = 4
-# Every global-attention block the vitg encoder has (alt_start=13, depth=40).
-# At this k the late mask equals temporal_tracking_global_attention exactly --
-# asserted in the tests, since argument validation runs before a model exists.
-MAX_LATE_GLOBAL_BLOCKS = 14
 TIME_EMBEDDING_DIM = 1536
 TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
 # The encoder's own width, patch size and the injections' input widths,
@@ -145,9 +141,9 @@ def assert_trainable_parameter_set(
 
     This is the guard the whole module exists for: a refactor that silently
     changes which parameters train must stop the run here rather than quietly
-    cost GPU weeks.  Both drivers call it, so there is one expectation and one
-    message -- a second copy beside a caller is how the two drift until only one
-    of them is still checking anything.
+    cost GPU weeks.  It is the one expectation and the one message -- a second
+    copy beside a caller is how the two drift until only one of them is still
+    checking anything.
 
     Returns the trainable-parameter report so a caller can log it without asking
     the model twice.
@@ -395,12 +391,12 @@ def tracking_only(raw_predictions: dict, keep_confidence: bool = False) -> dict:
     return kept
 
 
-# --- The per-anchor memory mechanism, shared by both drivers. Several anchors
-# are supervised as one encoder pass plus one track-head pass per anchor, each
-# backwarded onto a detached cut of the backbone taps; the summed cut gradients
-# then flow through the encoder exactly once. The overfit measured the marginal
-# cost of an extra anchor at a flat ~2.3 GiB against a 135 GiB primary arm at
-# the 48-observation window -- which is what a widened Q axis cannot deliver.
+# --- The per-anchor memory mechanism. Several anchors are supervised as one
+# encoder pass plus one track-head pass per anchor, each backwarded onto a
+# detached cut of the backbone taps; the summed cut gradients then flow through
+# the encoder exactly once. The one-scene driver measured the marginal cost of
+# an extra anchor at a flat ~2.3 GiB against a 135 GiB primary arm at the
+# 48-observation window -- which is what a widened Q axis cannot deliver.
 
 
 def cut_features(feats):
@@ -759,35 +755,3 @@ def confidence_stats(raw_predictions) -> dict | None:
     }
 
 
-def confidence_gradient_norms(model) -> dict[str, float]:
-    """Attribute the final track conv's gradient to its confidence and xyz rows.
-
-    xyz and confidence come off the same ``Conv2d(_, 4, 1)``: rows 0-2 are the
-    position term's contribution and row 3 is the confidence term's.  Because the
-    confidence term detaches the error, that split is exact -- no second backward
-    pass is needed to attribute it.
-    """
-
-    output_conv = model.track_head.scratch.output_conv2[2]
-    # The split is only meaningful for the 4-channel xyz+conf head. Fail loudly if
-    # the head is ever rebuilt with a different output_dim rather than silently
-    # reporting a norm over the wrong rows.
-    if output_conv.out_channels != 4:
-        raise RuntimeError(
-            "Expected a 4-channel track output conv (3 xyz + 1 confidence), got "
-            f"{output_conv.out_channels}"
-        )
-    norms = {}
-    for label, rows in (
-        ("track_head_output_conv_position_rows", slice(0, 3)),
-        ("track_head_output_conv_confidence_row", slice(3, 4)),
-    ):
-        total = 0.0
-        for parameter in (output_conv.weight, output_conv.bias):
-            if parameter is None or parameter.grad is None:
-                continue
-            total += float(
-                parameter.grad[rows].detach().float().norm().item() ** 2
-            )
-        norms[label] = float(total**0.5)
-    return norms

@@ -184,7 +184,7 @@ def build_arg_parser():
         "--temporal_patch",
         default=None,
         help=(
-            "Optional temporal_tracking.pt written by overfit_temporal_tracking.py. "
+            "Optional train_state.pt written by train_temporal_tracking.py. "
             "Overlays the finetuned parameters recorded for its freeze mode onto "
             "the base checkpoint. Without it the time embedding stays zero-initialized "
             "and --time_indices has no effect on the output."
@@ -308,9 +308,10 @@ def main():
     # The patch's recorded iteration count reaches Arc.forward as
     # refine_iters, so a K=4 patch runs its trained refiner four times, as
     # trained. A patch without the field reads as 1 -- it trained one
-    # iteration, whether written before the field existed or by the overfit's
-    # saver, which never refines -- and without --temporal_patch there is no
-    # count: the released weights run one iteration, today's forward exactly.
+    # iteration, whether written before the field existed or by the retired
+    # one-scene driver, which never refined -- and without --temporal_patch
+    # there is no count: the released weights run one iteration, today's
+    # forward exactly.
     output_dict, profiling = inference(
         imgs, model, device, dtype="bf16-mixed", verbose=True, profiling=True, use_center_as_anchor=False,
         refine_iters=1 if patch_metadata is None else patch_metadata["refine_iters"],

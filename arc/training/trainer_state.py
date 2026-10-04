@@ -1,10 +1,9 @@
 """The resumable half of a training checkpoint, and the one hazard it has.
 
-``save_temporal_tracking_checkpoint`` writes a *patch*: the trainable parameters
-and the freeze mode, which is what inference loads.  A run that a scheduler can
-preempt needs more than that -- optimizer moments, the step counter, every RNG
-stream and the grad scaler -- or a resume silently restarts Adam and the data
-order instead of continuing them.
+A temporal *patch* is the trainable parameters and the freeze mode, which is
+what inference loads.  A run that a scheduler can preempt needs more than that
+-- optimizer moments, the step counter, every RNG stream and the grad scaler --
+or a resume silently restarts Adam and the data order instead of continuing them.
 
 **Everything here is a plain Python type on purpose.** ``checkpoint.py`` reads
 patches with ``torch.load(..., weights_only=True)``, and that rejects *every*

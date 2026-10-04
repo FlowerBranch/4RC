@@ -1,20 +1,17 @@
-"""Pins for the helpers shared by every bounded training entry point.
+"""Pins for the training helpers in ``arc/training/runtime.py``.
 
 What is being protected: the helpers must work on CPU, because every test that
 drives a training step in this suite runs there; ``gradient_norm`` used to name
-CUDA outright, which made those tests impossible to write at all. And they must
-stay reachable as module globals on the harness, because six tests monkeypatch
-them there by name.
+CUDA outright, which made those tests impossible to write at all.
 
-A source-equivalence pin on ``overfit_temporal_tracking.py`` used to live here
-too, comparing every top-level function against a pinned commit. Removed: it
-guarded the one-scene harness, which `4I4/docs/execution.md` records as exhausted
-as an instrument, while ``train_temporal_tracking.py`` -- the program that
-produces every current result -- was never pinned at all. It fired three times,
-each on a deliberate change, each resolved by moving the baseline, and caught
-nothing; meanwhile each extraction into ``arc/training/runtime.py`` shrank the
-surface it still covered. If a mechanical check comes back, it belongs on the
-trainer.
+A source-equivalence pin on the retired one-scene driver used to live here too,
+comparing every top-level function against a pinned commit. Removed: it guarded
+a harness `4I4/docs/execution.md` records as exhausted as an instrument, while
+``train_temporal_tracking.py`` -- the program that produces every current
+result -- was never pinned at all. It fired three times, each on a deliberate
+change, each resolved by moving the baseline, and caught nothing; meanwhile each
+extraction into ``arc/training/runtime.py`` shrank the surface it still covered.
+If a mechanical check comes back, it belongs on the trainer.
 """
 
 from __future__ import annotations
@@ -25,64 +22,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-import overfit_temporal_tracking as overfit_cli
 from arc.models.arc.arc import Arc
 from arc.training import runtime
-
-
-# The helpers the extractions moved out of ``overfit_temporal_tracking.py``. The
-# harness must still expose every one of them as a module global; see below.
-# The second group is the per-anchor supervision mechanism, moved when the
-# multi-scene trainer became its second consumer.
-MOVED_TO_RUNTIME = {
-    "_assert_frozen_gradients_absent",
-    "_assert_trainable_gradients_finite",
-    "_autocast_context",
-    "_confidence_gradient_norms",
-    "_confidence_stats",
-    "_expected_trainable_set",
-    "_gradient_norm",
-    "_move_views_to_cuda",
-    "_shuffled_index_views",
-    "_tracking_only",
-    "_accumulate",
-    "_anchor_confidence_counts",
-    "_anchor_sample_counts",
-    "_anchor_tracks",
-    "_anchor_velocity_counts",
-    "_backward_through_cut",
-    "_cut_features",
-    "_encode_and_reconstruct",
-    "_weighted_anchor_total",
-}
-
-
-def test_the_harness_still_exposes_the_moved_helpers_as_module_globals():
-    """Six tests monkeypatch these onto the harness module by name.
-
-    The alias-import form is what keeps that working after the move. A plain
-    ``from arc.training import runtime`` plus ``runtime.tracking_only(...)`` call
-    sites would leave those patches setting an attribute nothing reads, and the
-    tests would pass while testing nothing.
-    """
-
-    for name in MOVED_TO_RUNTIME:
-        assert hasattr(overfit_cli, name), name
-
-    assert overfit_cli._tracking_only is runtime.tracking_only
-    assert overfit_cli._confidence_stats is runtime.confidence_stats
-    assert overfit_cli._autocast_context is runtime.autocast_context
-    assert overfit_cli.EXPECTED_TRAINABLE_SETS is runtime.EXPECTED_TRAINABLE_SETS
-    assert overfit_cli._cut_features is runtime.cut_features
-    assert overfit_cli._weighted_anchor_total is runtime.weighted_anchor_total
-    # Moved when the trainer became its second consumer: the confidence term's
-    # per-anchor shares are the trainer's too, and a copy would let the two
-    # drivers weight the same objective differently.
-    assert overfit_cli._anchor_confidence_counts is runtime.anchor_confidence_counts
-    # Same reason, one term later: the velocity term's shares are a third
-    # reduction over the same targets, and a copy in either driver would let
-    # them weight one objective two ways.
-    assert overfit_cli._anchor_velocity_counts is runtime.anchor_velocity_counts
 
 
 # --------------------------------------------------------------- gradient norm ---

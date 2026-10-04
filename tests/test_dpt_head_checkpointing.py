@@ -7,7 +7,7 @@ recomputation runs after the chunk loop has finished, so a closure over
 chunk's bounds -- forward values stay bit-identical, nothing raises, and the
 gradients are silently wrong for every chunk but the final one.  That is the
 shape of the bug ``ce12837`` fixed in the MotionDecoder, which invalidated every
-overfit result taken before it.  These tests are the pin against it here.
+one-scene result taken before it.  These tests are the pin against it here.
 
 The oracle is the *single-shot* path (``frames_chunk_size >= S``, the early
 return in ``forward``), which has neither chunking nor checkpointing.  Comparing

@@ -1669,7 +1669,7 @@ def _hand_passes(model, scene, offsets, **overrides):
     return references
 
 
-def test_train_step_backwards_each_pass_under_its_discount(tmp_path, monkeypatch):
+def test_train_step_backwards_each_pass_under_its_discount(monkeypatch):
     """--refine_iters 4 --refine_gamma 0.5 -- the count the live arms are
     recommended to run, and a discount whose four weights (1/32, 1/16, 1/8,
     1/4) are powers of two, so every scale below is bit-exact -- on the fake
@@ -1696,7 +1696,7 @@ def test_train_step_backwards_each_pass_under_its_discount(tmp_path, monkeypatch
     reconstruction through the public predicted_pointmaps, not the planted
     alignment cloud, at the anchor SLOT."""
 
-    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((1, 0),))
+    scene = _step_scene(monkeypatch, query_anchors=((1, 0),))
     height, width = scene.views[0]["img"].shape[-2:]
     slot = scene.anchor_observation_slots[0]
     assert slot == 4 and len(scene.anchor_observation_slots) == 1
@@ -1780,7 +1780,7 @@ def test_train_step_backwards_each_pass_under_its_discount(tmp_path, monkeypatch
     assert plain.seen_track_kwargs == [[]] and plain.seen_previous_fields == []
 
 
-def test_train_step_carries_each_anchor_separately_and_shares_every_pass(tmp_path, monkeypatch):
+def test_train_step_carries_each_anchor_separately_and_shares_every_pass(monkeypatch):
     """Two active anchors at --refine_iters 4, the pass count the live arms
     are recommended to run, with one occluded track so the anchors' sample
     shares differ (the live arms seat six camera anchors; this fixture has
@@ -1801,7 +1801,7 @@ def test_train_step_carries_each_anchor_separately_and_shares_every_pass(tmp_pat
     are asserted exact."""
 
     scene = _step_scene(
-        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
     )
     height, width = scene.views[0]["img"].shape[-2:]
     anchor_slots = scene.anchor_observation_slots
@@ -1896,7 +1896,7 @@ def test_train_step_carries_each_anchor_separately_and_shares_every_pass(tmp_pat
         assert not torch.equal(anchor, expected_cloud[:, anchor_slots[1 - index]])
 
 
-def test_train_step_pins_alpha_on_the_first_pass_and_discounts_every_term(tmp_path, monkeypatch):
+def test_train_step_pins_alpha_on_the_first_pass_and_discounts_every_term(monkeypatch):
     """--confidence_weight 0.5 with --confidence_alpha auto at
     --refine_iters 4. The pin comes from the first anchor's FIRST pass: the
     step's resolved alpha equals what a K=1 auto step on the same weights
@@ -1912,7 +1912,7 @@ def test_train_step_pins_alpha_on_the_first_pass_and_discounts_every_term(tmp_pa
     pass 0 drops samples and the final pass drops none, and a count summed
     over the passes reports the pass-0 drops."""
 
-    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((1, 0),))
+    scene = _step_scene(monkeypatch, query_anchors=((1, 0),))
     height, width = scene.views[0]["img"].shape[-2:]
     refine_iters = 4
     torch.manual_seed(0)
@@ -1964,7 +1964,7 @@ def test_train_step_pins_alpha_on_the_first_pass_and_discounts_every_term(tmp_pa
     assert outcome.confidence_dropped == final.confidence_dropped
 
 
-def test_train_step_merges_the_carry_rows_by_time(tmp_path, monkeypatch):
+def test_train_step_merges_the_carry_rows_by_time(monkeypatch):
     """The merged arm of the step: under --merge_synchronized_slots the head
     emits one row per time, so the zero carry is (1, T, H, W, 3) -- T the
     merged time count, not S -- and the head is called with merge=True and
@@ -1972,7 +1972,7 @@ def test_train_step_merges_the_carry_rows_by_time(tmp_path, monkeypatch):
     anchor is the anchor slot's. A carry sized on S here would fail the real
     refiner's row check and pass any fake that ignores it."""
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     model = _RefiningFakeArc(scene.num_observations, height, width, views_per_time=2)
@@ -1997,7 +1997,7 @@ def test_train_step_merges_the_carry_rows_by_time(tmp_path, monkeypatch):
     assert torch.equal(anchor_0, cloud_0[:, scene.anchor_observation_slots[0]])
 
 
-def test_train_step_at_one_iteration_is_todays_step(tmp_path, monkeypatch):
+def test_train_step_at_one_iteration_is_todays_step(monkeypatch):
     """K=1 must be today's step to the keyword: the head is called without a
     refinement keyword (injected fakes bind today's three-positional
     surface), iteration_losses is None like loss_breakdown on a position-only
@@ -2007,7 +2007,7 @@ def test_train_step_at_one_iteration_is_todays_step(tmp_path, monkeypatch):
     at all, whose reconstruction is the zero pose the cloud path would
     refuse."""
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     refining = _RefiningFakeArc(scene.num_observations, height, width)
@@ -2062,7 +2062,7 @@ def test_run_training_records_every_iteration_in_the_history_and_the_step_line(
     own log."""
 
     train_cli._STOP_REQUESTED.clear()
-    scene = _step_scene(tmp_path / "scene", monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _RefiningFakeArc(scene.num_observations, height, width)
 
@@ -2097,8 +2097,8 @@ def test_run_training_records_every_iteration_in_the_history_and_the_step_line(
 
 @pytest.mark.parametrize("refine_iters", [2, 3])
 def test_write_checkpoint_records_the_iteration_count_beside_the_refiner(tmp_path, refine_iters):
-    """The trainer's writer is the only sanctioned source of K > 1 patches,
-    because the overfit's saver records no count. The payload it writes must
+    """The trainer's writer is the only in-repo source of patches, and so of
+    K > 1 patches and their recorded count. The payload it writes must
     read back as the arm it trained -- refine from the key set, the count
     from the scalar -- and load onto a model frozen the same way; a writer
     that dropped the scalar would produce a patch the reader refuses as a
@@ -2242,7 +2242,7 @@ def test_train_step_and_the_eval_drive_the_real_refiner_end_to_end(tmp_path, mon
     refiner frozen, today's path."""
 
     scene = _step_scene(
-        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
     )
     height, width = scene.views[0]["img"].shape[-2:]
     assert (height // _PATCH) * (width // _PATCH) == REFINER_NEIGHBOURS
@@ -2345,13 +2345,12 @@ def test_evaluate_held_out_scores_every_refinement_pass(tmp_path, monkeypatch, m
 
     scenes = {
         "0000": _step_scene(
-            tmp_path / "a", monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+            monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
         ),
         # Track 1 hidden at time 1 in BOTH cameras: the merged head pools the
         # cameras of a time, so hiding it in one would leave the merged
         # supervision, and the merged scores, unchanged.
         "0001": _step_scene(
-            tmp_path / "b",
             monkeypatch,
             query_anchors=((0, 0), (1, 0)),
             invisible=((0, 0, 2), (0, 1, 1), (1, 1, 1)),
@@ -2438,7 +2437,7 @@ def test_the_eval_refuses_a_stack_that_does_not_end_in_the_reported_field(
     conditions, joined by `or`."""
 
     scene = _step_scene(
-        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
     )
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
@@ -2475,7 +2474,7 @@ def test_the_eval_releases_each_stack_before_the_shuffled_arm_is_scored(tmp_path
     import arc.training as training_package
 
     scene = _step_scene(
-        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
     )
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
@@ -2526,7 +2525,7 @@ def test_the_eval_scores_every_pass_in_the_anchor_diagnostics_frame(tmp_path, mo
 
     from test_trainer_loop import _cpu_eval_scene
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch, gauge="scaled")
+    scene = _cpu_eval_scene(monkeypatch, gauge="scaled")
     height, width = scene.views[0]["img"].shape[-2:]
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
     refine_iters = 3

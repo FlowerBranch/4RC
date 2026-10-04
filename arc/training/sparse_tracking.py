@@ -207,8 +207,9 @@ class SparseCorrespondences:
 class SparseTrackingLossResult:
     """Position loss, plus whatever else was asked for.
 
-    ``loss`` stays the position-only Huber whatever else is enabled: the overfit
-    exit gate compares it against an archived run, so its meaning must not drift.
+    ``loss`` stays the position-only Huber whatever else is enabled: the trainer
+    records it as ``loss`` in every step and eval row, and runs with different
+    extra terms are compared on it, so its meaning must not drift.
     ``total_loss`` is what to call ``.backward()`` on.
     """
 
@@ -293,9 +294,9 @@ def _metric_pointmap_at_anchor(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Lift one anchor observation's ground-truth depth into world points.
 
-    Works at any original time the scene can supply depth for;
-    :meth:`DumpedKubricScene.surface_depth_map` is what rejects an off-t0 anchor
-    when the per-frame depth sidecar is absent.
+    Works at any original time: the depth comes from
+    :meth:`DumpedKubricScene.surface_depth_map`, which reads that observation's
+    own frame.
     """
 
     observation = scene.observations[observation_slot]
@@ -500,8 +501,8 @@ def _split_by_baseline(values: list[float], separated: list[bool]) -> dict:
     """Summarise a per-slot figure split on the ground-truth baseline mask.
 
     ``cross_camera`` are the slots genuinely displaced from the anchor;
-    ``static_camera`` are those at zero ground-truth baseline, which in today's
-    dumps means the anchor's own camera at another timestep.  Either group may
+    ``static_camera`` are those at zero ground-truth baseline, which in Kubric
+    scenes means the anchor's own camera at another timestep.  Either group may
     be empty, and an empty group reports ``None`` rather than a NaN mean.
     """
 
@@ -520,13 +521,13 @@ def reconstruction_drift_report(
     scene: DumpedKubricScene,
     alignment: DetachedSim3,
 ) -> dict:
-    """Score the frozen reconstruction against the dump's ground truth.
+    """Score the frozen reconstruction against the scene's ground truth.
 
     The per-step Sim(3) report watches one observation at the top confidence
     quintile, which is nearly blind to where degradation starts.  This instead
-    compares, fully detached: predicted depth against the dumped ``depth0`` for
+    compares, fully detached: predicted depth against the scene's ``depth0`` for
     every camera's time-0 observation (relative error, median and p90), and the
-    token camera against the dumped extrinsics for every observation (rotation
+    token camera against the scene's extrinsics for every observation (rotation
     geodesic plus metric camera-centre error), composed through the given
     alignment.  Ground-truth depth and extrinsics live in stored units; the
     scene's track upscaling factor lifts distances to metres.
@@ -559,9 +560,9 @@ def reconstruction_drift_report(
     slot would also read a single-camera window as perfect pose regardless of
     drift, since the numerator would be identically zero.
 
-    *The split is on the ground-truth baseline, not on camera identity.*  The
-    dumps hold each camera fixed across time, which is what makes
-    ``static_camera`` mean "the anchor's camera at another timestep"; a dump
+    *The split is on the ground-truth baseline, not on camera identity.*  Kubric
+    scenes hold each camera fixed across time, which is what makes
+    ``static_camera`` mean "the anchor's camera at another timestep"; a scene
     with genuinely moving cameras would place those slots in ``cross_camera``,
     which is correct.
 

@@ -774,7 +774,7 @@ def test_main_seeds_the_table_between_the_freeze_and_the_optimizer():
     """Every test above passes on a main() that never calls the seeder.
 
     Which is exactly what shipped: reinitialize_time_index_embedding existed and
-    was tested, and its only caller was the overfit harness, so the multi-scene
+    was tested, but nothing in the trainer called it, so the multi-scene
     trainer ran a full job on a zero table. Inspected rather than executed
     because main() cannot run without a GPU and a checkpoint -- the same reason
     nothing covered the gap in the first place.
@@ -805,19 +805,17 @@ def test_main_seeds_the_table_between_the_freeze_and_the_optimizer():
     )
 
 
-def test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader():
+def test_the_trainer_wires_the_geometry_flags_to_freeze_assert_and_loader():
     """The fed-but-frozen pin, inspected rather than executed.
 
-    The seeding test above records the shipped precedent: a helper whose
-    only caller was the overfit harness let the trainer run a full job on a
-    zero table. The identical class here: a driver that wires the loader but
-    not the freeze runs a control arm that records depth_input=true, and no
-    gradient guard can see it -- frozen parameters receive no gradient. So
-    every set_freeze, assert_trainable_parameter_set and loader-construction
-    call in BOTH drivers must read the same args attributes.
+    The seeding test above records the shipped precedent: a helper with no
+    caller in the trainer let it run a full job on a zero table. The
+    identical class here: a trainer that wires the loader but not the freeze
+    runs a control arm that records depth_input=true, and no gradient guard
+    can see it -- frozen parameters receive no gradient. So every set_freeze,
+    assert_trainable_parameter_set and loader-construction call in the
+    trainer must read the same args attributes.
     """
-
-    import overfit_temporal_tracking as overfit_cli
 
     def flag_reads(call):
         pairs = set()
@@ -825,8 +823,8 @@ def test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader():
             value = keyword.value
             candidates = [value]
             if isinstance(value, ast.IfExp):
-                # input_depth_max=args.kubric_max_depth if args.depth_input
-                # else None -- the flag sits in the conditional's test.
+                # A conditional keyword (x if args.depth_input else None)
+                # carries the flag in its test.
                 candidates.append(value.test)
             for node in candidates:
                 if (
@@ -838,48 +836,31 @@ def test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader():
                     pairs.add((keyword.arg, node.attr))
         return pairs
 
-    def calls_by_name(module):
-        found = {}
-        for node in ast.walk(ast.parse(Path(module.__file__).read_text())):
-            if isinstance(node, ast.Call):
-                name = getattr(node.func, "id", None) or getattr(
-                    node.func, "attr", None
-                )
-                found.setdefault(name, []).append(node)
-        return found
+    found = {}
+    for node in ast.walk(ast.parse(Path(train_cli.__file__).read_text())):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            found.setdefault(name, []).append(node)
 
     both = {("depth_input", "depth_input"), ("camera_input", "camera_input")}
-    for module, loader_name, loader_pairs in (
-        (
-            train_cli,
-            "MVTrackerSceneProvider",
-            {
-                ("input_depth", "depth_input"),
-                ("input_camera_vectors", "camera_input"),
-            },
-        ),
-        (
-            overfit_cli,
-            "load_dumped_kubric_scene",
-            {
-                ("input_depth_max", "depth_input"),
-                ("input_camera_vectors", "camera_input"),
-            },
-        ),
-    ):
-        found = calls_by_name(module)
-        for name in ("set_freeze", "assert_trainable_parameter_set"):
-            assert found.get(name), f"{module.__name__} has no {name} call"
-            for call in found[name]:
-                assert both <= flag_reads(call), (module.__name__, name)
-        assert found.get(loader_name), f"{module.__name__} has no {loader_name} call"
-        for call in found[loader_name]:
-            assert loader_pairs <= flag_reads(call), (module.__name__, loader_name)
+    for name in ("set_freeze", "assert_trainable_parameter_set"):
+        assert found.get(name), f"trainer has no {name} call"
+        for call in found[name]:
+            assert both <= flag_reads(call), name
+    loader_pairs = {
+        ("input_depth", "depth_input"),
+        ("input_camera_vectors", "camera_input"),
+    }
+    assert found.get("MVTrackerSceneProvider"), (
+        "trainer has no MVTrackerSceneProvider call"
+    )
+    for call in found["MVTrackerSceneProvider"]:
+        assert loader_pairs <= flag_reads(call)
 
 
 def test_the_trainer_wires_the_refinement_flags_to_freeze_assert_step_and_eval():
     """The fed-but-frozen pin for the refiner, inspected rather than executed
-    (test_both_drivers_wire_the_geometry_flags_to_freeze_assert_and_loader is
+    (test_the_trainer_wires_the_geometry_flags_to_freeze_assert_and_loader is
     the precedent; main() is .to("cuda") unconditionally). A driver that
     threads refine_iters into the step but not refine=args.refine_iters > 1
     into set_freeze runs K iterations through a FROZEN zero-init refiner --
@@ -888,8 +869,7 @@ def test_the_trainer_wires_the_refinement_flags_to_freeze_assert_step_and_eval()
     at one iteration; one that drops refine_gamma from the step trains at the
     default whatever the flag says. Every such call in the trainer must read
     the args attribute, and the freeze predicate must be exactly
-    `args.refine_iters > 1` so the two call sites cannot disagree. Trainer
-    only: the overfit driver is deliberately not refinement-aware."""
+    `args.refine_iters > 1` so the two call sites cannot disagree."""
 
     calls = {}
     for node in ast.walk(ast.parse(Path(train_cli.__file__).read_text())):
@@ -962,7 +942,7 @@ def test_the_refinement_flags_default_to_one_iteration_at_mvtrackers_gamma():
 
 
 def test_the_init_flags_default_to_the_swept_band_and_reach_the_artifacts():
-    """The default is deliberately 0.3, not the overfit harness's 0.1."""
+    """The default is deliberately 0.3, not the retired one-scene driver's 0.1."""
 
     args = train_cli.build_arg_parser().parse_args(["--manifest", "m.jsonl"])
     assert args.time_embedding_init == "orthogonal"
@@ -1355,7 +1335,7 @@ class _FakeArc(nn.Module):
         return output
 
 
-def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
+def test_the_real_train_step_runs_end_to_end_on_cpu(monkeypatch):
     """Covers the body every other loop test injects past.
 
     Not a numerical check -- it asserts the step completes, produces a finite
@@ -1365,12 +1345,10 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     """
 
     import arc.training.sparse_tracking as sparse_module
-    from arc.training import load_dumped_kubric_scene
-    from test_sparse_tracking import _write_scene
+    from scene_fixtures import fixture_scene
 
-    _write_scene(tmp_path, time_count=4, view_count=2, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    scene = fixture_scene(
+        time_count=4, view_count=2, cameras=(0, 1), times=(0, 1, 2, 3), size=56
     )
 
     # Identity alignment, the same lever the sparse-tracking tests use: hand
@@ -1529,7 +1507,7 @@ def test_the_headroom_guard_is_inert_without_cuda_and_names_the_step_with_it(mon
 # ------------------------------------------------------ the eval, end to end ---
 
 
-def _cpu_eval_scene(tmp_path, monkeypatch, *, gauge="identity"):
+def _cpu_eval_scene(monkeypatch, *, gauge="identity"):
     """A real two-camera window plus a planted alignment, ready for the eval.
 
     Two cameras is required rather than tidy: at one camera
@@ -1549,12 +1527,10 @@ def _cpu_eval_scene(tmp_path, monkeypatch, *, gauge="identity"):
     """
 
     import arc.training.sparse_tracking as sparse_module
-    from arc.training import load_dumped_kubric_scene
-    from test_sparse_tracking import _write_scene
+    from scene_fixtures import fixture_scene
 
-    _write_scene(tmp_path, time_count=4, view_count=2, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+    scene = fixture_scene(
+        time_count=4, view_count=2, cameras=(0, 1), times=(0, 1, 2, 3), size=56
     )
     target, _ = sparse_module._metric_pointmap_at_anchor(
         scene, scene.query_observation_slot
@@ -1592,7 +1568,7 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     function directly, the way the train_step test does.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
@@ -1641,7 +1617,7 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     would survive every unit test and die on the cluster.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width, views_per_time=2)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
@@ -1703,7 +1679,7 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
 
     monkeypatch.setattr(training_package, "gather_query_anchor_points", recording)
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
@@ -1743,8 +1719,7 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
         assert written[flag] is enabled
         assert written[other] is False
 
-    # A separate root: _write_scene refuses to overwrite the eval's dump.
-    step_scene = _step_scene(tmp_path / "step", monkeypatch)
+    step_scene = _step_scene(monkeypatch)
     height, width = step_scene.views[0]["img"].shape[-2:]
     step_model = _FakeArc(step_scene.num_observations, height, width)
     train_cli.train_step(
@@ -1805,7 +1780,7 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(
         gather_query_anchor_points,
     )
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch, gauge=gauge)
+    scene = _cpu_eval_scene(monkeypatch, gauge=gauge)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(
         scene.num_observations, height, width, views_per_time=2 if merge else 1
@@ -1882,7 +1857,7 @@ def test_the_ground_truth_anchor_matches_an_exact_reconstruction(
     through apply_points and land scene magnitudes from the off curve.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch, gauge="scaled")
+    scene = _cpu_eval_scene(monkeypatch, gauge="scaled")
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
@@ -1949,7 +1924,7 @@ def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkey
     # `occ` uniformly False, which would let the comparison below pass against the
     # very defect it exists to catch. At time 2, not at the anchor time, so the
     # query stays eligible and the track still reaches the bundle.
-    scene = _step_scene(tmp_path, monkeypatch, invisible=((0, 2, 2), (1, 2, 2)))
+    scene = _step_scene(monkeypatch, invisible=((0, 2, 2), (1, 2, 2)))
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
 
@@ -1988,7 +1963,7 @@ def test_a_position_only_run_writes_a_sweepable_bundle_with_no_operating_point(
     and would report a real-looking OA that means nothing.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
 
@@ -2024,7 +1999,7 @@ def test_the_eval_writes_one_threshold_from_the_runs_own_alpha(tmp_path, monkeyp
     from the threshold that produced it.
     """
 
-    good = _cpu_eval_scene(tmp_path, monkeypatch)
+    good = _cpu_eval_scene(monkeypatch)
     height, width = good.views[0]["img"].shape[-2:]
     model = _FakeArc(good.num_observations, height, width)
 
@@ -2051,9 +2026,7 @@ def test_the_eval_writes_one_threshold_from_the_runs_own_alpha(tmp_path, monkeyp
     assert first["tau"] == first["confidence_alpha"] / first["tau_distance_m"]
 
 
-def test_a_raw_prediction_without_a_confidence_channel_is_refused(
-    tmp_path, monkeypatch
-):
+def test_a_raw_prediction_without_a_confidence_channel_is_refused(monkeypatch):
     """The old `conf_track_multi is None -> ones_like` fallback wrote a fiction.
 
     An all-ones confidence thresholds to a bundle claiming the model called every
@@ -2064,7 +2037,7 @@ def test_a_raw_prediction_without_a_confidence_channel_is_refused(
 
     from arc.training import DetachedSim3, build_anchor_correspondences
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     correspondences, _ = build_anchor_correspondences(scene)
     height, width = scene.views[0]["img"].shape[-2:]
     raw = {
@@ -2095,7 +2068,7 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
     first eval.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
     model.train()
@@ -2451,7 +2424,7 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
     produces is a real one.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     plans = _plans(4)
     failing = plans[1].seq_name
 
@@ -2515,7 +2488,7 @@ def test_the_eval_records_the_anchors_the_held_out_window_actually_seated(
     records today, which is the other half of the same guarantee.
     """
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     val = [plan_record(_record(seq_name="0000"), budget=48, stride=2)]
     wide = ["0:0", "1:0", "2:0", "3:0", "4:0", "5:0"]
@@ -2563,23 +2536,20 @@ def test_the_eval_records_the_anchors_the_held_out_window_actually_seated(
 # ----------------------------------------- multi-anchor query supervision ---
 
 
-def _step_scene(tmp_path, monkeypatch, *, query_anchors=None, **scene_kwargs):
-    """A real dumped-fixture scene with identity alignment, for the real step."""
+def _step_scene(monkeypatch, *, query_anchors=None, **scene_kwargs):
+    """A real fixture scene with identity alignment, for the real step."""
 
     import arc.training.sparse_tracking as sparse_module
-    from arc.training import load_dumped_kubric_scene
-    from test_sparse_tracking import _write_scene
+    from scene_fixtures import fixture_scene
 
-    _write_scene(
-        tmp_path, time_count=4, view_count=2, depth_sidecar=True, **scene_kwargs
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        time_count=4,
+        view_count=2,
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
         query_anchors=query_anchors,
+        **scene_kwargs,
     )
     target, _ = sparse_module._metric_pointmap_at_anchor(
         scene, scene.query_observation_slot
@@ -2591,9 +2561,7 @@ def _step_scene(tmp_path, monkeypatch, *, query_anchors=None, **scene_kwargs):
     return scene
 
 
-def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
-    tmp_path, monkeypatch
-):
+def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(monkeypatch):
     """The default-spec invariant, pinned: same loss, same post-step weights.
 
     The per-anchor step decomposes the forward into encode -> reconstruct ->
@@ -2606,7 +2574,7 @@ def test_the_restructured_step_matches_the_combined_forward_at_one_anchor(
 
     import copy
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     stepped = _FakeArc(scene.num_observations, height, width)
@@ -2695,9 +2663,7 @@ def _combined_reference_loss(reference, scene):
     )
 
 
-def test_grad_accum_one_is_bit_identical_to_the_pre_accumulation_step(
-    tmp_path, monkeypatch
-):
+def test_grad_accum_one_is_bit_identical_to_the_pre_accumulation_step(monkeypatch):
     """The governing invariant of --grad_accum, pinned the way the velocity
     term's weight-0 identity is: at 1 the window machinery must vanish.
 
@@ -2711,7 +2677,7 @@ def test_grad_accum_one_is_bit_identical_to_the_pre_accumulation_step(
 
     import copy
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     stepped = _FakeArc(scene.num_observations, height, width)
@@ -2760,7 +2726,7 @@ def test_grad_accum_one_is_bit_identical_to_the_pre_accumulation_step(
             )
 
 
-def test_a_window_of_four_equals_one_combined_backward(tmp_path, monkeypatch):
+def test_a_window_of_four_equals_one_combined_backward(monkeypatch):
     """The arithmetic the whole change rests on, at the paper's kind of scale.
 
     Four draws of the SAME scene, deliberately. Backwarding ``l_i * 0.25``
@@ -2779,7 +2745,7 @@ def test_a_window_of_four_equals_one_combined_backward(tmp_path, monkeypatch):
 
     import copy
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     stepped = _FakeArc(scene.num_observations, height, width)
@@ -2832,9 +2798,7 @@ def test_a_window_of_four_equals_one_combined_backward(tmp_path, monkeypatch):
             ), name
 
 
-def test_a_window_over_distinct_scenes_matches_the_combined_mean_closely(
-    tmp_path, monkeypatch
-):
+def test_a_window_over_distinct_scenes_matches_the_combined_mean_closely(monkeypatch):
     """The realistic window: four different scenes, equivalence to tolerance.
 
     Same claim as the torch.equal test above, on draws whose per-branch
@@ -2847,21 +2811,21 @@ def test_a_window_over_distinct_scenes_matches_the_combined_mean_closely(
     import copy
 
     import arc.training.sparse_tracking as sparse_module
-    from arc.training import load_dumped_kubric_scene
-    from test_sparse_tracking import _write_scene
+    from scene_fixtures import fixture_scene
 
     scenes = []
     pointmaps_by_scene = {}
     for index in range(4):
-        root = tmp_path / f"scene_{index}"
         # Distinct visibility masks make the four losses -- and so the four
         # per-branch gradients -- genuinely different draws.
         invisible = ((0, 1, index % 3),) if index else ()
-        _write_scene(
-            root, time_count=4, view_count=2, depth_sidecar=True, invisible=invisible
-        )
-        scene = load_dumped_kubric_scene(
-            root, "0000", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+        scene = fixture_scene(
+            time_count=4,
+            view_count=2,
+            invisible=invisible,
+            cameras=(0, 1),
+            times=(0, 1, 2, 3),
+            size=56,
         )
         target, _ = sparse_module._metric_pointmap_at_anchor(
             scene, scene.query_observation_slot
@@ -2926,10 +2890,10 @@ def test_a_window_over_distinct_scenes_matches_the_combined_mean_closely(
             )
 
 
-def test_the_clip_fires_once_per_window_not_per_micro_step(tmp_path, monkeypatch):
+def test_the_clip_fires_once_per_window_not_per_micro_step(monkeypatch):
     """The count half of the clipping contract; the semantics half is below."""
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
     model = _FakeArc(scene.num_observations, height, width)
@@ -3041,9 +3005,7 @@ def test_the_clip_binds_the_window_average_not_each_draw(tmp_path):
     )
 
 
-def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
-    tmp_path, monkeypatch
-):
+def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(monkeypatch):
     """What --adaptive_query_anchors makes routine: a step whose realized anchor
     count is below the spec's, reducing correctly anyway.
 
@@ -3059,7 +3021,7 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
     from arc.training import build_anchor_correspondences
     from arc.training.runtime import anchor_sample_counts
 
-    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 0), (0, 2)))
+    scene = _step_scene(monkeypatch, query_anchors=((0, 0), (0, 2)))
     height, width = scene.views[0]["img"].shape[-2:]
     correspondences, _ = build_anchor_correspondences(scene)
     counts = anchor_sample_counts(scene, correspondences, 2)
@@ -3097,9 +3059,7 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(
     assert np.isfinite(outcome.loss) and outcome.loss > 0
 
 
-def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
-    tmp_path, monkeypatch
-):
+def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(monkeypatch):
     """The per-anchor path, on a scene where the second anchor earns its keep.
 
     Track 2 is occluded in camera 0 at time 0, so only the camera-1 anchor can
@@ -3124,7 +3084,6 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(
     )
 
     scene = _step_scene(
-        tmp_path,
         monkeypatch,
         query_anchors=((0, 0), (1, 0)),
         invisible=((0, 0, 2),),
@@ -3226,7 +3185,6 @@ def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
     """
 
     scene = _step_scene(
-        tmp_path,
         monkeypatch,
         query_anchors=((0, 0), (1, 0)),
         invisible=((0, 0, 2),),
@@ -3262,7 +3220,7 @@ def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
 
 
 def test_a_zero_supervision_scene_raises_the_typed_skip_before_any_gpu_work(
-    tmp_path, monkeypatch
+    monkeypatch
 ):
     """An anchor set that reaches nothing raises the typed skip, citing the split.
 
@@ -3276,7 +3234,7 @@ def test_a_zero_supervision_scene_raises_the_typed_skip_before_any_gpu_work(
     as inert, so nothing may have moved.
     """
 
-    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 2),))
+    scene = _step_scene(monkeypatch, query_anchors=((0, 2),))
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
     optimizer = torch.optim.AdamW([{"params": list(model.parameters()), "lr": 1e-3}])
@@ -3441,8 +3399,8 @@ def test_a_step_with_no_eligible_query_is_skipped_and_recorded(
     # the scene it builds, and the good scene's pointmaps must be the ones in
     # force when the executed steps reach the loss. The bad scene never reaches
     # a forward, so it needs none.
-    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
-    good = _step_scene(tmp_path / "good", monkeypatch)
+    bad = _step_scene(monkeypatch, query_anchors=((0, 2),))
+    good = _step_scene(monkeypatch)
     height, width = good.views[0]["img"].shape[-2:]
     model = _FakeArc(good.num_observations, height, width)
     plans = _plans(4)
@@ -3479,7 +3437,7 @@ def test_a_step_with_no_eligible_query_is_skipped_and_recorded(
 # ------------------------------------------- the confidence and sync terms ---
 
 
-def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
+def _weighted_step(monkeypatch, *, scene=None, **weights):
     """One real train_step at the given weights, plus what it was handed.
 
     Records every ``weighted_anchor_total`` and ``tracking_only`` call, which is
@@ -3492,7 +3450,7 @@ def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
     weights.setdefault("velocity_weight", 0.0)
 
     scene = scene or _step_scene(
-        tmp_path, monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
     )
     height, width = scene.views[0]["img"].shape[-2:]
     torch.manual_seed(0)
@@ -3533,9 +3491,7 @@ def _weighted_step(tmp_path, monkeypatch, *, scene=None, **weights):
     return outcome, totals, kept, scene
 
 
-def test_every_weight_zero_leaves_the_step_exactly_position_only(
-    tmp_path, monkeypatch
-):
+def test_every_weight_zero_leaves_the_step_exactly_position_only(monkeypatch):
     """The zeros control, which every archived comparison is against.
 
     `compose_tracking_loss` omits a zero-weight term rather than multiplying by
@@ -3545,7 +3501,6 @@ def test_every_weight_zero_leaves_the_step_exactly_position_only(
     """
 
     outcome, totals, kept, _ = _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
@@ -3569,9 +3524,7 @@ def test_every_weight_zero_leaves_the_step_exactly_position_only(
     assert sum(call["position_weight"] for call in totals) == pytest.approx(1.0)
 
 
-def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(
-    tmp_path, monkeypatch
-):
+def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(monkeypatch):
     """The share is the CONFIDENCE sample share, not the position one.
 
     The confidence term deliberately does not mask on visibility, so with an
@@ -3585,7 +3538,6 @@ def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(
     from arc.training.runtime import anchor_confidence_counts, anchor_sample_counts
 
     outcome, totals, kept, scene = _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.25,
         confidence_alpha=3.0,
@@ -3622,9 +3574,7 @@ def test_the_confidence_term_keeps_its_field_and_splits_by_its_own_mask(
     }
 
 
-def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(
-    tmp_path, monkeypatch
-):
+def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(monkeypatch):
     """What makes the term safe under --adaptive_query_anchors.
 
     Every anchor's sync_loss is a mean over an identical element count -- P, H
@@ -3638,7 +3588,6 @@ def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(
     """
 
     _, two_anchor, _, _ = _weighted_step(
-        tmp_path / "two",
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
@@ -3647,9 +3596,8 @@ def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(
     assert [call["sync_weight"] for call in two_anchor] == pytest.approx([0.25, 0.25])
     assert sum(call["sync_weight"] for call in two_anchor) == pytest.approx(0.5)
 
-    single = _step_scene(tmp_path / "one", monkeypatch)
+    single = _step_scene(monkeypatch)
     _, one_anchor, _, _ = _weighted_step(
-        tmp_path / "one",
         monkeypatch,
         scene=single,
         confidence_weight=0.0,
@@ -3662,7 +3610,7 @@ def test_the_sync_share_is_one_over_the_anchors_the_step_actually_runs(
     assert sum(call["sync_weight"] for call in one_anchor) == pytest.approx(0.5)
 
 
-def test_the_undivided_sync_weight_is_what_reaches_the_loss(tmp_path, monkeypatch):
+def test_the_undivided_sync_weight_is_what_reaches_the_loss(monkeypatch):
     """The gate and the share are different numbers and must not be conflated.
 
     ``sparse_tracking_loss``'s ``sync_weight`` only decides whether the term is
@@ -3686,7 +3634,6 @@ def test_the_undivided_sync_weight_is_what_reaches_the_loss(tmp_path, monkeypatc
 
     monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
     _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
@@ -3696,9 +3643,7 @@ def test_the_undivided_sync_weight_is_what_reaches_the_loss(tmp_path, monkeypatc
     assert seen == [0.5, 0.5], "the loss gets the undivided weight, not the share"
 
 
-def test_the_velocity_share_is_the_pair_sample_share_not_the_position_one(
-    tmp_path, monkeypatch
-):
+def test_the_velocity_share_is_the_pair_sample_share_not_the_position_one(monkeypatch):
     """A third mask, and a third set of shares.
 
     The velocity term reduces over PAIRS of slots -- both endpoints visible --
@@ -3713,7 +3658,6 @@ def test_the_velocity_share_is_the_pair_sample_share_not_the_position_one(
     from arc.training.runtime import anchor_sample_counts, anchor_velocity_counts
 
     outcome, totals, _, scene = _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
@@ -3743,9 +3687,7 @@ def test_the_velocity_share_is_the_pair_sample_share_not_the_position_one(
     assert sum(outcome.anchor_velocity_counts) > 0
 
 
-def test_the_undivided_velocity_weight_is_what_reaches_the_loss(
-    tmp_path, monkeypatch
-):
+def test_the_undivided_velocity_weight_is_what_reaches_the_loss(monkeypatch):
     """Gate and share are different numbers here too.
 
     ``sparse_tracking_loss``'s ``velocity_weight`` only decides whether the term
@@ -3765,7 +3707,6 @@ def test_the_undivided_velocity_weight_is_what_reaches_the_loss(
 
     monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
     _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
@@ -3776,9 +3717,7 @@ def test_the_undivided_velocity_weight_is_what_reaches_the_loss(
     assert seen == [0.5, 0.5], "the loss gets the undivided weight, not the share"
 
 
-def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
-    tmp_path, monkeypatch
-):
+def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(monkeypatch):
     """`SparseTrackingLossResult.loss` stays the position-only Huber.
 
     The run's curve and every archived comparison are that number, so it must
@@ -3787,14 +3726,12 @@ def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
     """
 
     baseline, base_totals, _, _ = _weighted_step(
-        tmp_path / "off",
         monkeypatch,
         confidence_weight=0.0,
         confidence_alpha=None,
         sync_weight=0.0,
     )
     enabled, _, _, _ = _weighted_step(
-        tmp_path / "on",
         monkeypatch,
         confidence_weight=0.25,
         confidence_alpha=3.0,
@@ -3816,7 +3753,7 @@ def test_the_reported_loss_does_not_move_when_the_extra_terms_are_enabled(
     )
 
 
-def test_auto_alpha_is_resolved_once_and_then_reused(tmp_path, monkeypatch):
+def test_auto_alpha_is_resolved_once_and_then_reused(monkeypatch):
     """A moving target is not one the optimizer can descend.
 
     ``sparse_tracking_loss`` re-resolves alpha on every call it is handed None,
@@ -3836,7 +3773,6 @@ def test_auto_alpha_is_resolved_once_and_then_reused(tmp_path, monkeypatch):
 
     monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
     outcome, _, _, _ = _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.25,
         confidence_alpha=None,
@@ -3849,7 +3785,7 @@ def test_auto_alpha_is_resolved_once_and_then_reused(tmp_path, monkeypatch):
     assert outcome.confidence_alpha > 0
 
 
-def test_an_explicit_alpha_is_never_re_resolved(tmp_path, monkeypatch):
+def test_an_explicit_alpha_is_never_re_resolved(monkeypatch):
     import arc.training as training_package
 
     seen: list[float | None] = []
@@ -3861,7 +3797,6 @@ def test_an_explicit_alpha_is_never_re_resolved(tmp_path, monkeypatch):
 
     monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
     outcome, _, _, _ = _weighted_step(
-        tmp_path,
         monkeypatch,
         confidence_weight=0.25,
         confidence_alpha=7.5,
@@ -4429,7 +4364,7 @@ def test_the_eval_is_position_only_whatever_the_training_flags_say(
         seen.append(kwargs)
         return real_loss(*args, **kwargs)
 
-    scene = _cpu_eval_scene(tmp_path, monkeypatch)
+    scene = _cpu_eval_scene(monkeypatch)
     monkeypatch.setattr(training_package, "sparse_tracking_loss", recording)
 
     height, width = scene.views[0]["img"].shape[-2:]
@@ -5323,7 +5258,7 @@ def test_an_unsupervisable_held_out_scene_is_skipped_and_recorded(
     a multi-day run, so it is skipped and recorded instead.
     """
 
-    scene = _step_scene(tmp_path, monkeypatch, query_anchors=((0, 2),))
+    scene = _step_scene(monkeypatch, query_anchors=((0, 2),))
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
 
@@ -5370,8 +5305,8 @@ def test_one_unsupervisable_held_out_scene_leaves_the_others_scored(
 ):
     """The skip is per scene: the rest of the held-out set still makes a point."""
 
-    good = _cpu_eval_scene(tmp_path / "good", monkeypatch)
-    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    good = _cpu_eval_scene(monkeypatch)
+    bad = _step_scene(monkeypatch, query_anchors=((0, 2),))
     height, width = good.views[0]["img"].shape[-2:]
     model = _FakeArc(good.num_observations, height, width)
 
@@ -5409,8 +5344,8 @@ def test_an_unsupervisable_val_scene_does_not_end_the_run(tmp_path, monkeypatch)
     """
 
     train_cli._STOP_REQUESTED.clear()
-    good = _cpu_eval_scene(tmp_path / "good", monkeypatch)
-    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    good = _cpu_eval_scene(monkeypatch)
+    bad = _step_scene(monkeypatch, query_anchors=((0, 2),))
     height, width = good.views[0]["img"].shape[-2:]
     model = _FakeArc(good.num_observations, height, width)
 
@@ -5456,7 +5391,7 @@ def test_a_wholly_unsupervisable_held_out_set_dies_at_step_zero(
     the preflight exists to prevent.
     """
 
-    bad = _step_scene(tmp_path / "bad", monkeypatch, query_anchors=((0, 2),))
+    bad = _step_scene(monkeypatch, query_anchors=((0, 2),))
     stepped = []
 
     with pytest.raises(RuntimeError, match="held-out scenes can be supervised"):
@@ -5498,7 +5433,7 @@ def test_every_step_is_flushed_to_the_history_file(tmp_path, monkeypatch):
     """
 
     train_cli._STOP_REQUESTED.clear()
-    scene = _step_scene(tmp_path / "scene", monkeypatch)
+    scene = _step_scene(monkeypatch)
     height, width = scene.views[0]["img"].shape[-2:]
     model = _FakeArc(scene.num_observations, height, width)
 
@@ -5755,7 +5690,6 @@ def test_the_eval_reports_the_velocity_residual_at_weight_zero(
     """
 
     scene = _step_scene(
-        tmp_path,
         monkeypatch,
         query_anchors=((0, 0), (1, 0)),
         invisible=((0, 0, 2),),
@@ -5807,7 +5741,7 @@ def test_a_window_with_nothing_to_shuffle_reports_none_not_zero(
 
     import arc.training.runtime as runtime_module
 
-    scene = _step_scene(tmp_path, monkeypatch)
+    scene = _step_scene(monkeypatch)
     # evaluate_held_out imports the helper inside the function, so the
     # runtime module is the only interception point.
     monkeypatch.setattr(runtime_module, "shuffled_index_views", lambda _s: None)

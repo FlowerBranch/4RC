@@ -441,7 +441,7 @@ def velocity_consistency_loss(
     observation budget, the embedding table and the clip length, so raising would
     end a run on a window the stream is entitled to produce.  This is the only
     function here that signals a degenerate input with ``None``; the callers that
-    would otherwise have to pre-check it are the two drivers and the eval.
+    would otherwise have to pre-check it are the trainer's step and its eval.
     """
 
     if predicted.shape != target.shape:

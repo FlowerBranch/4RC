@@ -24,46 +24,6 @@ def _trainable_parameters(model) -> dict[str, torch.nn.Parameter]:
     }
 
 
-def save_temporal_tracking_checkpoint(model, path: str | Path) -> Path:
-    """Save exactly the parameters enabled by the model's temporal freeze mode.
-
-    The saved set is keyed off ``requires_grad`` at call time, so the model's
-    freeze mode must still be the one it was trained under -- re-asserting a
-    narrower mode before saving would silently drop trained tensors from the
-    patch. The mode is recorded so the loader can demand it back; whether a
-    mode name is *valid* is ``set_freeze``'s business, the single authority on
-    mode names.
-
-    ``late_global_blocks`` is recorded for the same reason and read off the
-    same object: under ``temporal_tracking_late_global`` the mode name alone
-    does not determine the parameter set, so without it a k=4 patch would pass
-    the loader's mode check against a k=8 model and fail as a wall of missing
-    keys instead of as one sentence about k.
-    """
-
-    freeze_mode = getattr(model, "freeze", None)
-    if not freeze_mode or freeze_mode == "none":
-        raise ValueError(
-            "Patch checkpoints need a temporal freeze mode; call "
-            f"model.set_freeze(...) first (model.freeze is {freeze_mode!r})"
-        )
-    parameters = _trainable_parameters(model)
-    if not parameters:
-        raise ValueError("Model has no trainable temporal-tracking parameters")
-    payload = {
-        "freeze_mode": freeze_mode,
-        "late_global_blocks": getattr(model, "late_global_blocks", None),
-        "state_dict": {
-            name: parameter.detach().cpu()
-            for name, parameter in parameters.items()
-        },
-    }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
-    return path
-
-
 def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
@@ -74,8 +34,8 @@ def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
         raise RuntimeError(
             "Not a temporal-tracking patch checkpoint. Patches written before "
             "the freeze_mode field also predate the motion-decoder gradient "
-            "fix and are not worth loading; re-run the overfit to produce a "
-            "new one."
+            "fix and are not worth loading; train a new one with "
+            "train_temporal_tracking.py."
         )
     # A patch written before this field existed genuinely has no k, and None is
     # its true value: every mode that predates it is fully determined by its
@@ -96,15 +56,15 @@ def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
         raise RuntimeError(
             "Patch declares freeze mode 'temporal_tracking_late_global' but "
             "records no late_global_blocks, so the trained block set cannot be "
-            "reconstructed; re-run the overfit to produce a new one."
+            "reconstructed."
         )
     # The iteration count reads the same way, with a sharper reason for its
     # default: a patch without the field trained exactly one iteration -- one
     # written before the field existed because the unrolled loop did not
-    # exist either, and one from save_temporal_tracking_checkpoint (the
-    # overfit's saver, which records no count) because the overfit never
-    # refines. So absence IS 1, not unknown, and archived patches keep
-    # loading. A stored None reads as absent, as late_global_blocks does.
+    # exist either, and one from the retired one-scene driver's saver, which
+    # recorded no count, because that driver never refined. So absence IS 1,
+    # not unknown, and archived patches keep loading. A stored None reads as
+    # absent, as late_global_blocks does.
     refine_iters = payload.get("refine_iters")
     if refine_iters is None:
         refine_iters = 1
@@ -128,11 +88,9 @@ def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
     # never trained. Checked here, where the key set is already in hand,
     # so the loader -- the trainer's --resume and every test load -- refuses
     # it as well as the metadata reader. No in-repo writer produces the
-    # disagreement: the trainer records the count beside the tensors, and
-    # the overfit never passes refine (its saver also refuses freeze 'none',
-    # the one mode whose blanket trains the refiner at K=1); this refuses
-    # hand-edited and foreign payloads, and a refine=True model saved through
-    # that count-less saver, which is how a test manufactures one.
+    # disagreement: the trainer, the only one, records the count beside the
+    # tensors from the same args.refine_iters its freeze reads. This refuses
+    # hand-edited and foreign payloads, which is how a test manufactures one.
     refine = _REFINER_KEY in payload["state_dict"]
     if refine != (refine_iters > 1):
         raise ValueError(
@@ -169,8 +127,8 @@ def read_temporal_patch_metadata(path: str | Path) -> dict:
     tensors are in the patch exactly when ``set_freeze(refine=True)`` trained
     them -- and ``refine_iters`` is the recorded iteration count, 1 when the
     field is absent: a patch without it trained one iteration, whether
-    written before the field existed or by the overfit's saver, which never
-    refines. Unlike the pairs above these two CAN disagree, since one is a
+    written before the field existed or by the retired one-scene driver,
+    which never refined. Unlike the pairs above these two CAN disagree, since one is a
     key set and the other a stored number; ``_parse_payload`` refuses the
     disagreement with a ``ValueError`` before either caller sees the values.
     A loader passes ``refine`` into ``set_freeze`` and ``refine_iters`` into

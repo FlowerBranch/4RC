@@ -6,8 +6,8 @@ vectors ride the reference reorder, all four arms are constructible. Loader
 level: the depth channels are gathered (never interpolated), sanitised and
 invalidated beyond --kubric_max_depth; the camera vector is the model-grid
 camera-to-world encoding plus the principal point. Guard level: the gradient
-guards under single-flag arms, the CUDA move, the keyword-only surfaces, the
-sidecar refusals, and the Arc-to-backbone route pin.
+guards under single-flag arms, the CUDA move, the keyword-only surfaces, and
+the Arc-to-backbone route pin.
 """
 
 import ast
@@ -22,12 +22,10 @@ from torch import nn
 
 import arc.training.dumped_kubric as dumped_kubric
 import arc.training.runtime as runtime
-import overfit_temporal_tracking as overfit_cli
 from arc.models.arc.arc import Arc
 from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
 from arc.models.arc.utils.transform import pose_encoding_to_extri_intri
-from arc.training import load_dumped_kubric_scene
-from test_sparse_tracking import _write_scene
+from scene_fixtures import fixture_scene
 from test_time_indexing import (
     _PassThroughTimeTransformer,
     _arc_shell,
@@ -378,23 +376,21 @@ def test_view_key_constants_cannot_drift():
     assert Arc.CAMERA_VECTOR_KEY == dumped_kubric.CAMERA_VECTOR_KEY
 
 
-def test_depth_input_is_gathered_not_interpolated(tmp_path):
+def test_depth_input_is_gathered_not_interpolated():
     """Landmine 11: a depth discontinuity must never be blended into a depth
     that exists nowhere. Exactly two planted values must survive the resize
     exactly; bilinear resampling would forge intermediates at the boundary."""
 
-    _write_scene(tmp_path, depth_sidecar=False)
     # size=504 makes the transform NON-IDENTITY (scale 9.0, nonzero crop): at
     # the fixture's native 56 the gather is a 1:1 copy and a bilinear
     # resampler would be indistinguishable. The discontinuity sits at an odd
     # original column so an upscale blend has something to forge.
-    scene = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0,), size=504
-    )
+    scene = fixture_scene(cameras=(0, 1), times=(0,), size=504)
     with torch.no_grad():
-        planted = torch.full_like(scene.depth0, 10.0)
+        planted = torch.full_like(scene.depth, 10.0)
         planted[..., :27] = 1.0
-        scene.depth0.copy_(planted)
+        scene.depth.copy_(planted)
+        scene.depth0.copy_(scene.depth[:, 0])
 
     dumped_kubric._attach_view_geometry(
         scene, input_depth_max=24.0, input_camera_vectors=False
@@ -408,25 +404,23 @@ def test_depth_input_is_gathered_not_interpolated(tmp_path):
         assert np.isin(channel, allowed).all()
 
 
-def test_depth_input_sanitises_invalidates_and_scales(tmp_path):
+def test_depth_input_sanitises_invalidates_and_scales():
     """Landmine 8 plus the settled far-depth semantics: --kubric_max_depth is
     an INVALIDITY threshold. nan, inf, negative, zero and beyond-max all read
     (0, 0); at-max saturates valid at 1.0; metric scale is kept, so two maxes
     scale one shared depth in exact ratio and nothing is median-normalised."""
 
-    _write_scene(tmp_path, depth_sidecar=False)
-    scene = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0,), size=56
-    )
+    scene = fixture_scene(cameras=(0, 1), times=(0,), size=56)
     observation = scene.observations[0]
     rows, columns = observation.image_transform.output_to_original_indices()
     specials = [float("nan"), float("inf"), -3.0, 0.0, 30.0, 24.0]
     with torch.no_grad():
-        scene.depth0.fill_(12.0)
+        scene.depth.fill_(12.0)
         # Well-separated output rows, one shared column, so the planted
         # original pixels cannot collide under the rounding gather.
         for index, value in enumerate(specials):
-            scene.depth0[0, 0, rows[index * 8], columns[0]] = value
+            scene.depth[0, 0, 0, rows[index * 8], columns[0]] = value
+        scene.depth0.copy_(scene.depth[:, 0])
 
     dumped_kubric._attach_view_geometry(
         scene, input_depth_max=24.0, input_camera_vectors=False
@@ -441,10 +435,9 @@ def test_depth_input_sanitises_invalidates_and_scales(tmp_path):
     assert float(channel[20, 30]) == 0.5
     assert float(validity[20, 30]) == 1.0
 
-    other = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0,), size=56
-    )
+    other = fixture_scene(cameras=(0, 1), times=(0,), size=56)
     with torch.no_grad():
+        other.depth.fill_(12.0)
         other.depth0.fill_(12.0)
     dumped_kubric._attach_view_geometry(
         other, input_depth_max=12.0, input_camera_vectors=False
@@ -452,7 +445,7 @@ def test_depth_input_sanitises_invalidates_and_scales(tmp_path):
     assert float(other.views[0]["depth_map"][0, 0, 20, 30]) == 1.0
 
 
-def test_camera_vector_is_model_grid_c2w_with_principal_point(tmp_path):
+def test_camera_vector_is_model_grid_c2w_with_principal_point():
     """Landmines 11 and 12, index by index against independent recomputation.
 
     vec[:3] is the camera CENTRE -- true only for the camera-to-world pose, so
@@ -465,13 +458,11 @@ def test_camera_vector_is_model_grid_c2w_with_principal_point(tmp_path):
     trip shows why terms 9-10 exist at all.
     """
 
-    _write_scene(tmp_path, rotated_camera=1)
     # size=504: a NON-IDENTITY transform (scale 9.0, nonzero crop), or the
     # model-grid half of the encoding is vacuous -- raw original intrinsics,
     # swapped (h, w) and a wrong-axis principal point all pass at identity.
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=504,
@@ -582,81 +573,6 @@ def test_model_grid_intrinsics_match_the_direct_affine_formula():
     )
     np.testing.assert_allclose(
         principal[1], cy * transform.scale_y - transform.crop_top, rtol=1e-12
-    )
-
-
-def test_depth_input_on_a_sidecarless_dump_refuses_at_load(tmp_path):
-    """Landmine 13's load-time half, through the ONE shared message."""
-
-    _write_scene(tmp_path, depth_sidecar=False)
-    with pytest.raises(ValueError) as excinfo:
-        load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
-            cameras=(0, 1),
-            times=(0, 1, 2, 3),
-            size=56,
-            input_depth_max=24.0,
-        )
-    assert dumped_kubric.DEPTH_SIDECAR_NAME in str(excinfo.value)
-    assert dumped_kubric.DEPTH_SIDECAR_FLAG in str(excinfo.value)
-    # The refusal names the actual need, not the anchoring path it would
-    # otherwise surface through.
-    assert "--depth_input" in str(excinfo.value)
-
-    scene = load_dumped_kubric_scene(
-        tmp_path, "0000", cameras=(0, 1), times=(0,), size=56, input_depth_max=24.0
-    )
-    assert all("depth_map" in view for view in scene.views)
-
-
-def test_overfit_refuses_depth_input_without_the_sidecar_at_submit_time(tmp_path):
-    """Landmine 13's submit-time half: finding out after the model loads
-    wastes a node allocation. Both refusals share the helper's exact prose,
-    which is the drift pin the shared function makes possible."""
-
-    _write_scene(tmp_path, depth_sidecar=False)
-
-    def args(*extra):
-        return overfit_cli.build_arg_parser().parse_args(
-            [
-                "--data_root",
-                str(tmp_path),
-                "--scene",
-                "0000",
-                "--parse_only",
-                *extra,
-            ]
-        )
-
-    with pytest.raises(ValueError) as excinfo:
-        overfit_cli._validate_args(
-            args("--depth_input", "--times", "0", "2")
-        )
-    expected = dumped_kubric.missing_depth_sidecar_message(
-        "--depth_input at original times [0, 2]", "0000"
-    )
-    assert str(excinfo.value) == expected
-
-    overfit_cli._validate_args(args("--depth_input", "--times", "0"))
-
-    sidecar_root = tmp_path / "with_sidecar"
-    sidecar_root.mkdir()
-    _write_scene(sidecar_root, depth_sidecar=True)
-    overfit_cli._validate_args(
-        overfit_cli.build_arg_parser().parse_args(
-            [
-                "--data_root",
-                str(sidecar_root),
-                "--scene",
-                "0000",
-                "--parse_only",
-                "--depth_input",
-                "--times",
-                "0",
-                "2",
-            ]
-        )
     )
 
 

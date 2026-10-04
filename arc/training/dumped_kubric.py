@@ -1,24 +1,18 @@
-"""Adapter for one scene produced by the cluster repository's dump scripts.
+"""The camera-major scene a training step consumes, and the one builder for it.
 
-The adapter is intentionally camera-major.  It keeps every selected camera/time
+The scene is intentionally camera-major.  It keeps every selected camera/time
 pair as a separate 4RC observation while assigning equal ``time_index`` values
 to synchronized observations.
 
-Two files are read.  ``meta.npz`` is required and carries the sparse metric
-metadata.  ``depth_full.npz`` is an optional sibling holding per-frame depth; it
-is emitted only when the dump ran with ``RCMV_DUMP_DEPTH=1``, so a dump made
-without it is complete-looking but supports anchors at original time 0 only.
-
-Frames arrive in one of two layouts and the adapter reads either.  The training
-dump packs them into a single ``frames.zip``; the benchmark dump leaves them
-loose under ``view_<v>/``.  Both are permanently live, and which one applies is
-decided by what is on disk -- there is no flag and no config key.
+:func:`build_scene` owns every derivation that turns arrays plus frames into a
+scene; :func:`scene_from_datapoint` is its front-end for a live MVTracker
+``Datapoint``.  A live sample always carries per-frame depth, so an anchor may
+sit at any original time.  (The ``dumped_kubric`` and ``DumpedKubricScene``
+names predate the live path; nothing here reads a dump.)
 """
 
 from __future__ import annotations
 
-import io
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -27,33 +21,12 @@ import numpy as np
 import torch
 from PIL import Image
 
-# The optional per-frame depth sidecar. Its ``t`` axis is 1:1 with the frame
-# names, and ``depth[:, 0]`` is what ``meta.npz`` stores as ``depth0``.
-DEPTH_SIDECAR_NAME = "depth_full.npz"
-DEPTH_SIDECAR_KEY = "depth"
-DEPTH_SIDECAR_FLAG = "RCMV_DUMP_DEPTH=1"
-
 # The optional geometry-input view keys --depth_input / --camera_input attach.
 # Spelled to match Arc.DEPTH_KEY / Arc.CAMERA_VECTOR_KEY; duplicated rather
 # than imported so this loader stays import-light, and pinned against drift by
 # a test.
 DEPTH_INPUT_KEY = "depth_map"
 CAMERA_VECTOR_KEY = "camera_vector"
-
-
-def missing_depth_sidecar_message(needs: str, scene_name: str) -> str:
-    """The one copy of the sidecar refusal, shared by surface_depth_map and
-    the overfit driver's submit-time check so the two cannot drift."""
-    return (
-        f"{needs} needs per-frame depth, but {DEPTH_SIDECAR_NAME} is absent "
-        f"for scene '{scene_name}'. The sidecar is opt-in: re-run the dump "
-        f"with {DEPTH_SIDECAR_FLAG} to emit it. Without it only original "
-        "time 0 can be anchored, because meta.npz carries depth0 alone."
-    )
-
-# The packed frame layout. Present for a dump whose frames were packed, absent
-# for one that left them loose; nothing else distinguishes the two.
-FRAMES_ARCHIVE_NAME = "frames.zip"
 
 
 @dataclass(frozen=True)
@@ -113,17 +86,14 @@ class Observation:
     """One selected camera/time pair.
 
     ``camera`` is the *view index*: the position along the ``V`` axis of every
-    dumped array and the ``view_<camera>`` directory number.  ``camera_id`` is
-    the original camera this view was rendered from, recorded by ``view_ids``.
-    The two coincide for every dump taken with an ascending, complete view
-    list, which is all of them so far, but only ``camera`` may index an array.
+    scene array and the ``view_<camera>`` in the frame's label.  ``camera_id``
+    is the original camera this view was rendered from, recorded by
+    ``view_ids``.  The two coincide whenever the view list is ascending and
+    complete, but only ``camera`` may index an array.
 
-    ``path`` is a *diagnostic label, not a locator*, and is not guaranteed to
-    exist on disk: a frame read out of ``frames.zip`` is labelled
-    ``<scene>/frames.zip/view_<v>/<t>.png``, naming the archive and the member
-    it came from.  Nothing stats or reopens it today.  A consumer that needs to
-    is the moment to give this field an explicit archive spelling and change its
-    type -- with that caller in hand, not before.
+    ``path`` is a *diagnostic label, not a locator*: a live frame is labelled
+    ``<scene>/<live>/view_<v>/<t>.png`` and names no file.  Nothing stats or
+    reopens it.
     """
 
     slot: int
@@ -158,8 +128,7 @@ class DumpedKubricScene:
     intrinsics: torch.Tensor
     extrinsics_world_to_camera: torch.Tensor
     depth0: torch.Tensor
-    depth: torch.Tensor | None
-    depth_sidecar_path: Path | None
+    depth: torch.Tensor
     track_upscaling_factor: float
 
     @property
@@ -174,10 +143,6 @@ class DumpedKubricScene:
         )
 
     @property
-    def has_time_varying_depth(self) -> bool:
-        return self.depth is not None
-
-    @property
     def anchor_observation_slots(self) -> tuple[int, ...]:
         return tuple(
             int(slot) for slot in self.track_query_observation_slots.tolist()
@@ -186,10 +151,9 @@ class DumpedKubricScene:
     def surface_depth_map(self, camera: int, original_time: int) -> torch.Tensor:
         """The ``(H,W)`` camera-z depth map anchoring queries in one observation.
 
-        This is the single place the depth0/sidecar branch lives, so every
-        consumer -- the Sim(3) target pointmap and the sparse anchor projection
-        alike -- reads the same map for the same observation, and neither has to
-        know which file it came from.
+        The Sim(3) target pointmap, the sparse anchor projection and the depth
+        input all read depth through here, so they read the same map for the
+        same observation.
         """
 
         camera = int(camera)
@@ -199,14 +163,6 @@ class DumpedKubricScene:
                 f"Camera view index {camera} is out of range for "
                 f"{self.depth0.shape[0]} dumped views"
             )
-        if self.depth is None:
-            if original_time != 0:
-                raise ValueError(
-                    missing_depth_sidecar_message(
-                        f"Anchoring at original time {original_time}", self.name
-                    )
-                )
-            return self.depth0[camera, 0]
         if not 0 <= original_time < self.depth.shape[1]:
             raise ValueError(
                 f"Original time {original_time} is out of range for "
@@ -327,13 +283,13 @@ def _resolve_view_indices(
     camera_ids: Sequence[int],
     view_ids: np.ndarray,
 ) -> tuple[int, ...]:
-    """Map original camera ids onto positions along the dumped ``V`` axis.
+    """Map original camera ids onto positions along the scene's ``V`` axis.
 
-    Every dumped array is indexed by view position, not by camera id.  The two
-    coincide whenever the dump was taken with an ascending, complete view list,
-    which is every dump so far -- but resolving through the recorded ``view_ids``
-    makes ``--cameras`` and ``--query_anchor`` rest on a recorded fact instead of
-    on that convention holding forever.
+    Every scene array is indexed by view position, not by camera id.  The two
+    coincide whenever the view list is ascending and complete, but a live
+    sample's ``sample_views`` need be neither, so cameras and anchors are
+    resolved through the recorded ``view_ids`` rather than assumed to be
+    positions.
     """
 
     lookup: dict[int, int] = {}
@@ -357,172 +313,52 @@ def _resolve_view_indices(
 
 
 def _frame_member_name(camera: int, time_index: int) -> str:
-    """Where one frame lives, in the single spelling both layouts share.
+    """The ``view_<v>/<t>.png`` part of a frame's label.
 
-    Zip member names are ``/``-separated by specification, so this is built as a
-    string; the loose layout then derives its path from it, which is what keeps
-    the packed and loose names from ever drifting apart.  ``camera`` is the
-    resolved view index -- the position along the dumped ``V`` axis -- exactly as
-    it is for the loose directory name.
+    ``camera`` is the resolved view index -- the position along the scene's
+    ``V`` axis -- not the original camera id.
     """
 
     return f"view_{camera}/{time_index:04d}.png"
 
 
-def _iter_frames(
-    scene_path: Path,
-    cameras: Sequence[int],
-    times: Sequence[int],
-):
-    """Yield ``(camera, time, path, image)`` for the selected grid, camera-major.
-
-    The camera and time travel with the frame so ``build_scene`` can check each
-    one against the slot it is filling.  They are redundant for this source,
-    which generates the grid itself -- but the core accepts any frame source, and
-    a source that yields in the wrong order would otherwise produce a scene whose
-    every slot holds the right metadata and the wrong picture.
-
-    Frames are packed into ``frames.zip`` or loose under ``view_<v>/``, and which
-    it is depends on nothing but what is on disk.  Packing exists because the
-    cluster quota caps file *count*: a ten-view scene costs 241 loose files
-    against three packed.  The benchmark dump stays loose, so both layouts are
-    live simultaneously and the archive wins wherever it is present.
-
-    Each image is decoded here rather than handed on unread, so its source handle
-    is released before the next frame opens instead of one being held open per
-    observation.
-    """
-
-    archive_path = scene_path / FRAMES_ARCHIVE_NAME
-    if archive_path.is_file():
-        try:
-            archive = zipfile.ZipFile(archive_path)
-        except zipfile.BadZipFile as error:
-            raise ValueError(
-                f"{archive_path} is not a readable zip archive ({error}); the "
-                "packed frames are truncated or were not transferred completely"
-            ) from error
-        # One handle for the whole window. Opening per member would re-read the
-        # archive's central directory once per observation.
-        with archive:
-            for camera in cameras:
-                for time_index in times:
-                    member = _frame_member_name(camera, time_index)
-                    try:
-                        payload = archive.read(member)
-                    except KeyError:
-                        raise FileNotFoundError(
-                            f"Observation image not found: member '{member}' is "
-                            f"missing from {archive_path}"
-                        ) from None
-                    image = Image.open(io.BytesIO(payload))
-                    image.load()
-                    yield camera, time_index, archive_path / member, image
-    else:
-        for camera in cameras:
-            for time_index in times:
-                path = scene_path / _frame_member_name(camera, time_index)
-                if not path.is_file():
-                    raise FileNotFoundError(f"Observation image not found: {path}")
-                image = Image.open(path)
-                image.load()
-                yield camera, time_index, path, image
-
-
-def _load_view_ids(
-    meta: np.lib.npyio.NpzFile,
-    *,
-    view_count: int,
-) -> np.ndarray:
-    """``view_ids`` when the dump records it, else the identity it replaced.
-
-    Dumps predating the field are indistinguishable from ones whose views are
-    cameras 0..V-1, which is exactly what the identity default expresses.
-    """
-
-    if "view_ids" not in meta.files:
-        return np.arange(view_count, dtype=np.int64)
-    view_ids = np.asarray(meta["view_ids"]).reshape(-1).astype(np.int64)
-    if view_ids.shape != (view_count,):
-        raise ValueError(
-            f"view_ids must have shape ({view_count},) matching the dumped "
-            f"views, got {view_ids.shape}"
-        )
-    if np.any(view_ids < 0):
-        raise ValueError(f"view_ids must be non-negative, got {view_ids.tolist()}")
-    return view_ids
-
-
-def _validate_depth_sidecar(
+def _validate_depth(
     depth: np.ndarray,
     *,
-    sidecar_path: Path | str,
+    source: str,
     view_count: int,
     time_count: int,
     depth0: np.ndarray,
 ) -> None:
-    """Check the per-frame depth sidecar against the metadata it extends.
+    """Check per-frame depth against the window's arrays and ``depth0``.
 
-    The dtype is deliberately not checked.  It comes from Kubric's depth TIFFs
-    through imageio and the dump passes it through untouched, so anything from
-    float16 to float64 is legitimate; both sides are cast identically on load,
-    which is what keeps the ``depth[:, 0] == depth0`` comparison below exact.
+    The dtype is deliberately not checked: ``build_scene`` casts both depth
+    arrays to float32 the same way before this runs, which is what keeps the
+    ``depth[:, 0] == depth0`` comparison below exact.
     """
 
     if depth.ndim != 5 or depth.shape[2] != 1:
         raise ValueError(
-            f"{sidecar_path} '{DEPTH_SIDECAR_KEY}' must have shape (V,T,1,H,W), "
-            f"got {depth.shape}"
+            f"{source} depth must have shape (V,T,1,H,W), got {depth.shape}"
         )
     if depth.shape[:2] != (view_count, time_count):
         raise ValueError(
-            f"{sidecar_path} '{DEPTH_SIDECAR_KEY}' covers "
-            f"{depth.shape[0]} views x {depth.shape[1]} frames, but meta.npz "
-            f"describes {view_count} x {time_count}"
+            f"{source} depth covers {depth.shape[0]} views x {depth.shape[1]} "
+            f"frames, but the scene arrays describe {view_count} x {time_count}"
         )
     if depth.shape[-2:] != depth0.shape[-2:]:
         raise ValueError(
-            f"{sidecar_path} depth grid {depth.shape[-2:]} does not match "
-            f"meta.npz depth0 grid {depth0.shape[-2:]}"
+            f"{source} depth grid {depth.shape[-2:]} does not match the depth0 "
+            f"grid {depth0.shape[-2:]}"
         )
-    # depth0 is assigned depth[:, 0] on the producing side, so this is an
-    # invariant rather than a tolerance question; a mismatch means the two files
-    # came from different runs and nothing downstream would be trustworthy.
+    # depth0 is depth[:, 0] by construction (scene_from_datapoint slices it), so
+    # this is an invariant rather than a tolerance question; a mismatch means
+    # the two arrays describe different frames.
     if not np.array_equal(depth[:, 0], depth0):
         raise ValueError(
-            f"{sidecar_path} depth[:, 0] differs from meta.npz depth0; the "
-            "sidecar and the metadata are from different dumps"
+            f"{source} depth[:, 0] differs from depth0; the two arrays describe "
+            "different frames"
         )
-
-
-def _validate_meta(
-    meta: np.lib.npyio.NpzFile,
-    *,
-    scene_path: Path,
-) -> None:
-    expected = {
-        "query_points",
-        "traj3d_world",
-        "visibility",
-        "intrs",
-        "extrs",
-        "depth0",
-        "track_upscaling_factor",
-    }
-    missing = expected - set(meta.files)
-    if missing:
-        raise ValueError(
-            f"{scene_path / 'meta.npz'} is missing required fields: {sorted(missing)}"
-        )
-
-    _validate_scene_arrays(
-        query_points=meta["query_points"],
-        trajectories=meta["traj3d_world"],
-        visibility=meta["visibility"],
-        intrinsics=meta["intrs"],
-        extrinsics=meta["extrs"],
-        depth0=meta["depth0"],
-    )
 
 
 def _validate_scene_arrays(
@@ -534,13 +370,11 @@ def _validate_scene_arrays(
     extrinsics,
     depth0,
 ) -> None:
-    """The shape contract, checked the same way whatever the arrays came from.
+    """The shape contract every scene's arrays are held to.
 
-    Split out of ``_validate_meta`` so a scene assembled in memory is held to the
-    identical contract as one read off disk.  A live sample that has been
-    transposed or has picked up a batch axis fails here rather than three frames
-    later inside the slot arithmetic, where the message would name a grid
-    mismatch instead of the actual fault.
+    A live sample that has been transposed or has picked up a batch axis fails
+    here rather than three frames later inside the slot arithmetic, where the
+    message would name a grid mismatch instead of the actual fault.
     """
 
     if query_points.ndim != 2 or query_points.shape[1] != 4:
@@ -595,12 +429,10 @@ def _attach_view_geometry(scene, *, input_depth_max, input_camera_vectors):
     depth discontinuity cannot be blended into a depth that exists nowhere.
     ``input_depth_max`` is an INVALIDITY threshold, not a normalisation
     ceiling: the live loader zeroes label depth beyond it unconditionally, so
-    a beyond-max pixel must read invalid here too, or the same metre would
-    encode as 1.0/valid from a dump and 0.0/invalid from the live path -- a
-    source fingerprint the model could learn instead of geometry. After
-    invalidation every valid depth is in (0, max], so channel 0 maps to
-    (0, 1] and the clip is a saturation guard at the boundary, and channel 1
-    is the validity. Metric scale is kept: no per-view normalisation.
+    a beyond-max pixel reads invalid here too rather than saturating to
+    1.0/valid. After invalidation every valid depth is in (0, max], so
+    channel 0 maps to (0, 1] and the clip is a saturation guard at the
+    boundary, and channel 1 is the validity. Metric scale is kept: no per-view normalisation.
 
     The camera vector is the fork's own 9-dim pose encoding of the
     camera-to-world pose (the scene stores world-to-camera; ``affine_inverse``
@@ -617,20 +449,6 @@ def _attach_view_geometry(scene, *, input_depth_max, input_camera_vectors):
         if not np.isfinite(input_depth_max) or input_depth_max <= 0:
             raise ValueError(
                 f"input_depth_max must be finite and positive, got {input_depth_max}"
-            )
-        # Named for the actual need: without this, the surface_depth_map raise
-        # below would blame "Anchoring at original time N" for a failure the
-        # depth INPUT caused, while the submit-time twin names --depth_input.
-        if scene.depth is None and any(
-            observation.original_time != 0 for observation in scene.observations
-        ):
-            times = sorted(
-                {int(observation.original_time) for observation in scene.observations}
-            )
-            raise ValueError(
-                missing_depth_sidecar_message(
-                    f"--depth_input at original times {times}", scene.name
-                )
             )
         for observation, view in zip(scene.observations, scene.views):
             depth = (
@@ -741,9 +559,8 @@ def build_scene(
     extrinsics,
     depth0,
     track_upscaling_factor: float,
-    view_ids=None,
-    depth=None,
-    depth_sidecar_path: Path | None = None,
+    view_ids,
+    depth,
     cameras: Sequence[int] = (0, 1),
     times: Sequence[int] = (0, 1, 2, 3),
     query_anchors: Sequence[tuple[int, int]] | None = None,
@@ -761,17 +578,18 @@ def build_scene(
     pile of arrays lives here: camera-id resolution, the camera-major slot
     arithmetic, the anchor slots, and the two cross-checks that catch a frame
     source which reordered or dropped images.  None of it depends on where the
-    pixels came from, which is the whole point -- a dump on disk and a live
-    MVTracker sample must not be able to disagree about what a window *is*.
+    pixels came from, so every frame source gets the same window from the same
+    arrays.
 
-    ``open_frames(view_positions, times)`` yields ``(label, PIL image)`` in
-    camera-major order.  It is a callable rather than an iterable because the
-    resolution from original camera ids to view positions happens here, and the
-    frame source needs the resolved positions.  ``label`` is used for error
-    messages and for ``Observation.path``; it need not name a real file.
+    ``open_frames(view_positions, times)`` yields ``(camera, time, label, PIL
+    image)`` in camera-major order.  It is a callable rather than an iterable
+    because the resolution from original camera ids to view positions happens
+    here, and the frame source needs the resolved positions.  ``label`` is used
+    for error messages and for ``Observation.path``; it need not name a real
+    file.
 
-    Arrays may be numpy or torch, and are copied.  ``view_ids`` defaults to the
-    identity, which is what a dump predating the field means.
+    Arrays may be numpy or torch, and are copied.  ``depth`` is per-frame,
+    ``(V,T,1,H,W)``, and ``depth0`` is its first frame.
     """
 
     query_points = _as_numpy(query_points, np.float32)
@@ -780,8 +598,7 @@ def build_scene(
     intrinsics = _as_numpy(intrinsics, np.float32)
     extrinsics = _as_numpy(extrinsics, np.float32)
     depth0 = _as_numpy(depth0, np.float32)
-    if depth is not None:
-        depth = _as_numpy(depth, np.float32)
+    depth = _as_numpy(depth, np.float32)
     _validate_scene_arrays(
         query_points=query_points,
         trajectories=trajectories,
@@ -813,17 +630,14 @@ def build_scene(
             )
 
     view_count, time_count = visibility.shape[:2]
-    if view_ids is None:
-        view_ids = np.arange(view_count, dtype=np.int64)
-    else:
-        view_ids = _as_numpy(view_ids, np.int64).reshape(-1)
-        if view_ids.shape != (view_count,):
-            raise ValueError(
-                f"view_ids must have shape ({view_count},) matching the dumped "
-                f"views, got {view_ids.shape}"
-            )
-        if np.any(view_ids < 0):
-            raise ValueError(f"view_ids must be non-negative, got {view_ids.tolist()}")
+    view_ids = _as_numpy(view_ids, np.int64).reshape(-1)
+    if view_ids.shape != (view_count,):
+        raise ValueError(
+            f"view_ids must have shape ({view_count},) matching the dumped "
+            f"views, got {view_ids.shape}"
+        )
+    if np.any(view_ids < 0):
+        raise ValueError(f"view_ids must be non-negative, got {view_ids.tolist()}")
 
     camera_ids = cameras
     cameras = _resolve_view_indices(camera_ids, view_ids)
@@ -841,14 +655,13 @@ def build_scene(
             "track_upscaling_factor must be finite and positive, got "
             f"{track_upscaling_factor}"
         )
-    if depth is not None:
-        _validate_depth_sidecar(
-            depth,
-            sidecar_path=depth_sidecar_path if depth_sidecar_path is not None else source,
-            view_count=view_count,
-            time_count=time_count,
-            depth0=depth0,
-        )
+    _validate_depth(
+        depth,
+        source=source,
+        view_count=view_count,
+        time_count=time_count,
+        depth0=depth0,
+    )
 
     # Each frame is read and decoded exactly once here: its size feeds the
     # transform, and the same decoded image is then handed to the preprocessor.
@@ -984,8 +797,8 @@ def build_scene(
     output_shapes = {tuple(view["img"].shape[-2:]) for view in views}
     if len(output_shapes) != 1:
         raise ValueError(
-            "The bounded overfit harness requires all observations to have the "
-            f"same processed shape, got {sorted(output_shapes)}"
+            "A window requires all observations to have the same processed "
+            f"shape, got {sorted(output_shapes)}"
         )
 
     scene = DumpedKubricScene(
@@ -1008,13 +821,12 @@ def build_scene(
         intrinsics=torch.from_numpy(intrinsics),
         extrinsics_world_to_camera=torch.from_numpy(extrinsics),
         depth0=torch.from_numpy(depth0),
-        depth=None if depth is None else torch.from_numpy(depth),
-        depth_sidecar_path=depth_sidecar_path,
+        depth=torch.from_numpy(depth),
         track_upscaling_factor=track_upscaling_factor,
     )
     # Attached post-construction so the helper reuses surface_depth_map and
-    # scene.observations instead of re-deriving the depth0/sidecar branch and
-    # the slot arithmetic.
+    # scene.observations instead of re-deriving the depth lookup and the slot
+    # arithmetic.
     if input_depth_max is not None or input_camera_vectors:
         _attach_view_geometry(
             scene,
@@ -1037,17 +849,17 @@ def scene_from_datapoint(
     input_camera_vectors: bool = False,
     verbose: bool = False,
 ) -> DumpedKubricScene:
-    """Build a scene from a live MVTracker ``Datapoint``, with no dump on disk.
+    """Build a scene from a live MVTracker ``Datapoint``.
 
-    The same :func:`build_scene` core as the dump reader, so a window assembled
-    here and the same window read back from a dump are the same object -- which
-    is asserted, not assumed, by the live-vs-dump equivalence test.
+    A thin front-end over :func:`build_scene`: frames come out of ``video``,
+    camera ids out of ``sample_views``, and ``depth0`` is ``videodepth``'s first
+    frame, so a window built here is the one its arrays make directly -- which
+    is asserted, not assumed, by ``tests/test_scene_sources.py``.
 
-    A live sample always carries per-frame depth (``videodepth``), so
-    :attr:`DumpedKubricScene.has_time_varying_depth` is true and an anchor at a
-    time other than 0 needs no sidecar.  ``cameras`` are original camera ids and
-    default to the sample's own ``sample_views``; ``times`` default to every
-    frame the sample holds.
+    A live sample always carries per-frame depth (``videodepth``), so an anchor
+    may sit at any time.  ``cameras`` are original camera ids and default to the
+    sample's own ``sample_views``; ``times`` default to every frame the sample
+    holds.
     """
 
     video = sample.video
@@ -1083,8 +895,7 @@ def scene_from_datapoint(
                 if hasattr(frame, "detach"):
                     frame = frame.detach().cpu()
                 array = np.asarray(frame).transpose(1, 2, 0).astype(np.uint8)
-                # Labelled the way a packed dump labels its members, so an error
-                # message reads the same whichever source produced the frame.
+                # A label for error messages and Observation.path, not a file.
                 yield (
                     view_position,
                     time_index,
@@ -1117,102 +928,3 @@ def scene_from_datapoint(
     )
 
 
-def load_dumped_kubric_scene(
-    data_root: str | Path,
-    scene_name: str,
-    *,
-    cameras: Sequence[int] = (0, 1),
-    times: Sequence[int] = (0, 1, 2, 3),
-    query_anchors: Sequence[tuple[int, int]] | None = None,
-    size: int = 512,
-    patch_size: int = 14,
-    square_ok: bool = False,
-    input_depth_max: float | None = None,
-    input_camera_vectors: bool = False,
-    verbose: bool = False,
-) -> DumpedKubricScene:
-    """Load one camera-major window from the existing evaluation dump.
-
-    The disk front-end of :func:`build_scene`: it owns ``meta.npz``, the optional
-    depth sidecar and the frames-or-archive branch, and nothing else.  Every
-    derivation the scene depends on lives in the core, so this and
-    :func:`scene_from_datapoint` cannot drift apart.
-
-    ``cameras`` and the camera half of ``query_anchors`` are original camera
-    ids, resolved against the dump's ``view_ids``; every array is indexed by the
-    resolved view position.  ``query_anchors`` names the observations that own a
-    dense query field, in priority order -- the first is the primary anchor and
-    owns the scene Sim(3).  It defaults to the first selected camera and time.
-
-    Anchoring at an original time other than 0 needs the per-frame depth
-    sidecar; :meth:`DumpedKubricScene.surface_depth_map` is where that is
-    enforced, so parsing and ordinary Arc forwarding stay unrestricted.
-    """
-
-    scene_path = Path(data_root) / scene_name
-    meta_path = scene_path / "meta.npz"
-    if not meta_path.is_file():
-        raise FileNotFoundError(f"Scene metadata not found: {meta_path}")
-
-    with np.load(meta_path, allow_pickle=False) as meta:
-        _validate_meta(meta, scene_path=scene_path)
-        query_points = np.array(meta["query_points"], dtype=np.float32, copy=True)
-        trajectories = np.array(meta["traj3d_world"], dtype=np.float32, copy=True)
-        visibility = np.array(meta["visibility"], dtype=bool, copy=True)
-        intrinsics = np.array(meta["intrs"], dtype=np.float32, copy=True)
-        extrinsics = np.array(meta["extrs"], dtype=np.float32, copy=True)
-        depth0 = np.array(meta["depth0"], dtype=np.float32, copy=True)
-        view_ids = _load_view_ids(meta, view_count=visibility.shape[0])
-        track_upscaling_factor = float(
-            np.asarray(meta["track_upscaling_factor"]).reshape(()).item()
-        )
-
-    # Optional per-frame depth. Absent is the normal case for a dump taken
-    # without RCMV_DUMP_DEPTH=1, and leaves every path below at depth0 only.
-    sidecar_path = scene_path / DEPTH_SIDECAR_NAME
-    depth = None
-    depth_sidecar_path = None
-    if sidecar_path.exists():
-        with np.load(sidecar_path, allow_pickle=False) as sidecar:
-            if DEPTH_SIDECAR_KEY not in sidecar.files:
-                raise ValueError(
-                    f"{sidecar_path} is missing the '{DEPTH_SIDECAR_KEY}' array; "
-                    f"found {sorted(sidecar.files)}"
-                )
-            # Cast before comparing: the sidecar's dtype is whatever Kubric's
-            # depth TIFFs carried, and depth0 was already cast the same way.
-            depth = np.array(
-                sidecar[DEPTH_SIDECAR_KEY],
-                dtype=np.float32,
-                copy=True,
-            )
-        depth_sidecar_path = sidecar_path
-
-    return build_scene(
-        name=scene_name,
-        open_frames=lambda view_positions, selected_times: _iter_frames(
-            scene_path,
-            view_positions,
-            selected_times,
-        ),
-        query_points=query_points,
-        trajectories=trajectories,
-        visibility=visibility,
-        intrinsics=intrinsics,
-        extrinsics=extrinsics,
-        depth0=depth0,
-        depth=depth,
-        depth_sidecar_path=depth_sidecar_path,
-        view_ids=view_ids,
-        track_upscaling_factor=track_upscaling_factor,
-        cameras=cameras,
-        times=times,
-        query_anchors=query_anchors,
-        size=size,
-        patch_size=patch_size,
-        square_ok=square_ok,
-        input_depth_max=input_depth_max,
-        input_camera_vectors=input_camera_vectors,
-        verbose=verbose,
-        source=str(scene_path),
-    )

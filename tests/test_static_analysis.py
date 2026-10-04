@@ -1,11 +1,11 @@
 """The check that would have caught the run_summary UnboundLocalError.
 
-``overfit_temporal_tracking.main()`` shipped reading two names that a ``del``
-earlier in the function had already unbound, so every run crashed before writing
-``run_summary.json``.  492 tests passed against a guaranteed crash: the three
-summary tests in ``test_sparse_tracking.py`` AST-parse the ``summary`` dict
-literal and assert key *presence*, which never evaluates the value expressions,
-so an unbound name inside the literal is invisible to them.
+The retired one-scene driver's ``main()`` shipped reading two names that a
+``del`` earlier in the function had already unbound, so every run crashed before
+writing ``run_summary.json``.  492 tests passed against a guaranteed crash: its
+three summary tests AST-parsed the ``summary`` dict literal and asserted key
+*presence*, which never evaluates the value expressions, so an unbound name
+inside the literal was invisible to them.
 
 This is static too, but it is the right static: name resolution rather than key
 presence.  ``pyrightconfig.json`` already declares this class fatal
@@ -13,11 +13,11 @@ presence.  ``pyrightconfig.json`` already declares this class fatal
 suite and is not a dev dependency.  pyflakes enforces the same declaration in
 CI without adding a node toolchain.
 
-Scoped to the two drivers because that is where the class bites: they are the
-only modules with a ``main()`` too GPU-bound for the suite to execute in full,
-so an unbound name in one of them has nothing else catching it.  Widening to the
-whole repo is cheap if it is ever wanted -- under ``pyrightconfig.json``'s own
-exclude set the repo currently has no ``UndefinedName`` hits at all.
+Scoped to the trainer because that is where the class bites: it is the only
+module with a ``main()`` too GPU-bound for the suite to execute in full, so an
+unbound name in it has nothing else catching it.  Widening to the whole repo is
+cheap if it is ever wanted -- under ``pyrightconfig.json``'s own exclude set the
+repo currently has no ``UndefinedName`` hits at all.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ _UNBOUND_NAME_MESSAGES = (
     pyflakes_messages.UndefinedLocal,
 )
 
-_DRIVERS = ("overfit_temporal_tracking.py", "train_temporal_tracking.py")
+_DRIVERS = ("train_temporal_tracking.py",)
 
 
 class _UnboundNameReporter:

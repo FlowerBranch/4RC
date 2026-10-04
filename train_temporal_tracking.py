@@ -8,9 +8,9 @@ all here, so ``--manifest`` trains end to end.  Scenes arrive through
 record against MVTracker's own loader rather than a reimplementation.
 
 ``--query_anchors`` supervises several query anchors per step, as relative
-slots into each step's own window; the memory mechanism is the overfit's
-per-anchor track-head pass behind the encoder/head boundary, shared via
-``arc.training.runtime`` (see ``train_step``).
+slots into each step's own window; the memory mechanism is the per-anchor
+track-head pass behind the encoder/head boundary in ``arc.training.runtime``
+(see ``train_step``).
 
 **What "replaying the sample stream" claims, at its honest granularity:** the same
 scenes, windows, view sets and step ordering as the run being replayed -- and each
@@ -226,12 +226,7 @@ class StepOutcome:
     # --refine_iters 1, like loss_breakdown on a position-only step: a
     # one-pass row carries null here. This is the instrument that says
     # whether pass k+1 came in below pass k, readable from step 1 of any
-    # trainer run on real data -- the cheap reading the overfit driver would
-    # otherwise have offered. The overfit stays one-pass: the geometry inputs
-    # (59d1537) went into it only because it was the sole dumped-source driver
-    # the sidecar refusal could live in, which does not apply here, and a
-    # second unrolled loop inside its inline step loop is the shape that
-    # reintroduced the late-binding checkpoint bug once already.
+    # trainer run on real data.
     iteration_losses: list[float] | None = None
 
 
@@ -550,7 +545,7 @@ def train_step(
     refine_iters: int = 1,
     refine_gamma: float = DEFAULT_REFINE_GAMMA,
 ) -> StepOutcome:
-    """One micro-step over one scene, with every guard the harness runs.
+    """One micro-step over one scene, with every guard in ``arc.training.runtime``.
 
     Reuses the existing machinery unchanged — this adds nothing to
     ``arc/training``'s semantics. There is no within-scene split: `ef8bcff`
@@ -567,14 +562,14 @@ def train_step(
     claim. At ``accum_steps=1`` every call is a whole window and the step is
     bit-identical to the pre-accumulation one.
 
-    Several anchors are supervised the way the overfit does it: the encoder and
+    Several anchors are supervised one track-head pass at a time: the encoder and
     the frozen reconstruction run once, each anchor's track-head pass backwards
     immediately onto a detached cut of the backbone taps, and the summed cut
     gradients flow through the encoder exactly once afterwards
     (:func:`arc.training.runtime.cut_features` — the chain rule makes that
     identical to one combined backward, while only one track-head graph is ever
-    alive; the overfit measured the marginal anchor at a flat ~2.3 GiB where a
-    widened Q axis would not fit the card). At a single active anchor the cut
+    alive; the marginal anchor was measured at a flat ~2.3 GiB where a widened
+    Q axis would not fit the card). At a single active anchor the cut
     is bypassed -- at ``--refine_iters 1``; see below -- and the step runs the
     exact pre-multi-anchor graph: ``Arc._forward`` is encode → reconstruct →
     per-query track with no other glue, so the decomposition changes no kernel
@@ -1002,7 +997,7 @@ def train_step(
         del previous_field
 
     # Unweighted, in the order sparse_tracking_loss composes its own terms, so
-    # this reads like the overfit's loss_breakdown. None when nothing but
+    # this reads like its loss_breakdown. None when nothing but
     # position ran: an all-None dict would claim a breakdown that has no terms.
     loss_breakdown = {"position": step_loss}
     if step_sync_loss is not None:
@@ -1829,7 +1824,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Observations owning a dense query field, as relative slot pairs "
             "into each replayed step's ordered view list and time window -- "
-            "unlike the overfit's absolute --query_anchor CAMERA:TIME, because "
+            "not absolute CAMERA:TIME pairs, because "
             "every step has its own cameras and times. In priority order; the "
             "first is primary and owns the scene Sim(3). Every planned step "
             "must seat every slot: view slots are validated against "
@@ -1969,7 +1964,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "0 (the default) skips the term entirely, keeping archived runs "
             "reproducible. The term builds a dense difference over every "
             "synchronized pair per anchor, and that cost has never been measured "
-            "in THIS trainer -- the overfit measured anchors, not this field -- "
+            "-- only the per-anchor cost has been -- "
             "against the committed run's 20 GiB of headroom (peak 119.5 GiB of "
             "139.8 on its 5-view steps). A 6-step smoke at the committed window "
             "is what settles it."
@@ -2971,7 +2966,7 @@ def run_training(
     evaluations: list[dict] = []
     # Per-stage eligibility, summed over this invocation's executed steps, so
     # whether an anchor set saturates eligibility on the real stream is read
-    # off run_summary.json instead of extrapolated from the one-scene overfit.
+    # off run_summary.json instead of extrapolated from a single scene.
     # steps_counted is the denominator; injected step functions that report no
     # eligibility contribute nothing, and neither does a skipped step -- a lost
     # scene, or one no anchor could supervise, whose split is recorded in
@@ -2991,10 +2986,10 @@ def run_training(
     # already records it exactly, naming the anchor.
     seated_anchor_counts: Counter = Counter()
     anchor_count_steps = 0
-    # Summed over the run, and warned about ONCE. The overfit warns twice because
-    # it scores twice; a 20k-step trainer that warned per step would bury the
-    # first occurrence -- which is the one worth reading -- under thousands of
-    # repeats. Every step's own counts stay in history.jsonl regardless.
+    # Summed over the run, and warned about ONCE: a 20k-step trainer that warned
+    # per step would bury the first occurrence -- which is the one worth reading
+    # -- under thousands of repeats. Every step's own counts stay in
+    # history.jsonl regardless.
     confidence_dropped_totals: Counter = Counter()
     # Steps the velocity term ran on, split by whether the window offered it a
     # pair. Both stay 0 on a run that never enabled it, which
@@ -3462,8 +3457,6 @@ def _write_checkpoint(
     model, optimizer, scaler, base_learning_rates, *, step, output_dir, args
 ) -> Path:
     """The temporal patch plus everything a resume needs, in one atomic file."""
-
-    from arc.training.checkpoint import save_temporal_tracking_checkpoint  # noqa: F401
 
     state = build_trainer_state(
         step=step,

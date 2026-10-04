@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-import ast
 import dataclasses
-import io
-import json
-import sys
-import zipfile
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -18,25 +13,20 @@ from PIL import Image
 import arc.models.arc.utils.transform as transform_module
 import arc.training.runtime as runtime_module
 import arc.training.sparse_tracking as sparse_module
-import overfit_temporal_tracking as overfit_cli
 from arc.models.arc.arc import Arc
 from arc.training import (
     DetachedSim3,
     SparseCorrespondences,
     adjacent_pair_indices,
-    SparseTrackingLossResult,
     build_anchor_correspondences,
+    build_scene,
     compose_predicted_metric,
     fit_scene_sim3,
     gather_query_anchor_points,
-    load_dumped_kubric_scene,
     load_temporal_tracking_checkpoint,
     reconstruction_drift_report,
-    save_temporal_tracking_checkpoint,
     sparse_tracking_loss,
 )
-from arc.models.arc.dinov2.vision_transformer import DinoVisionTransformer
-from arc.models.arc.heads.dpt_head import DPTHead
 from arc.models.arc.heads.head_act import activate_head
 from arc.models.arc.utils.transform import mat_to_quat, quat_to_mat
 from arc.training import (
@@ -50,246 +40,19 @@ from arc.training import (
 )
 from arc.training.runtime import anchor_sample_counts, anchor_velocity_counts
 from arc.training.dumped_kubric import compute_image_transform
-from test_time_indexing import _LinearMotionDecoder
-
-
-# Every track lies on this world plane, so depth0 can be rendered analytically
-# for any camera pose instead of being hard-coded to a constant.
-_PLANE_Z = 5.0
-
-
-def _yaw_rotation(degrees: float) -> np.ndarray:
-    angle = np.deg2rad(degrees)
-    cos, sin = np.cos(angle), np.sin(angle)
-    return np.array(
-        [
-            [cos, 0.0, sin],
-            [0.0, 1.0, 0.0],
-            [-sin, 0.0, cos],
-        ],
-        dtype=np.float64,
-    )
-
-
-def _pitch_rotation(degrees: float) -> np.ndarray:
-    angle = np.deg2rad(degrees)
-    cos, sin = np.cos(angle), np.sin(angle)
-    return np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, cos, -sin],
-            [0.0, sin, cos],
-        ],
-        dtype=np.float64,
-    )
-
-
-def _world_to_camera(camera: int, rotated_camera: int | None):
-    """Return world-to-camera (R, t) with ``X_cam = R @ X_world + t``.
-
-    The default poses are identity-rotation with a pure-x baseline, which makes
-    a w2c/c2w flip and an R/R^T transpose numerically invisible. ``rotated_camera``
-    opts one camera into a real yaw and a z offset so those mistakes change the
-    projected pixels.
-    """
-
-    if camera != rotated_camera:
-        rotation = np.eye(3, dtype=np.float64)
-        centre = np.array([float(camera), 0.0, 0.0])
-    else:
-        # Yaw and pitch together, plus y and z offsets, so the projected pixels
-        # move non-uniformly in both axes and camera-space z stops being constant.
-        rotation = _pitch_rotation(-12.0) @ _yaw_rotation(25.0)
-        centre = np.array([float(camera), 0.45, -0.6])
-    return rotation, -rotation @ centre
-
-
-def _render_plane_depth(rotation, translation, intrinsics, height, width):
-    """Per-pixel camera-space z of the world plane ``z = _PLANE_Z``.
-
-    For an identity camera with no z offset this is exactly the constant
-    ``_PLANE_Z``, so the unrotated fixture is unchanged.
-    """
-
-    columns, rows = np.meshgrid(np.arange(width), np.arange(height))
-    pixels = np.stack(
-        (columns, rows, np.ones_like(columns)),
-        axis=-1,
-    ).astype(np.float64)
-    # X_cam = depth * direction, and X_world = R^T (X_cam - t).
-    directions = pixels @ np.linalg.inv(intrinsics).T
-    normal = rotation[:, 2]  # third row of R^T
-    return ((_PLANE_Z + normal @ translation) / (directions @ normal)).astype(
-        np.float32
-    )
-
-
-def _frame_png_bytes(camera: int, time_index: int, height: int, width: int) -> bytes:
-    """The PNG one frame holds, identical whichever layout stores it.
-
-    Both layouts are written from this one function, so a packed-versus-loose
-    comparison measures the loader rather than two encodings that happened to
-    agree.  The fill is distinct per (camera, time), which is what lets such a
-    comparison catch a frame landing in the wrong slot.
-    """
-
-    pixels = np.full(
-        (height, width, 3),
-        fill_value=20 * camera + time_index,
-        dtype=np.uint8,
-    )
-    buffer = io.BytesIO()
-    Image.fromarray(pixels).save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def _write_scene(
-    root: Path,
-    *,
-    scene_name: str = "0000",
-    time_count: int = 4,
-    view_count: int = 2,
-    rotated_camera: int | None = None,
-    depth_sidecar: bool = False,
-    sidecar_dtype=np.float32,
-    view_ids=None,
-    query_times=None,
-    invisible=(),
-    packed: bool = False,
-) -> Path:
-    """Write a dump.
-
-    ``depth_sidecar`` also emits ``depth_full.npz``.  The fixture plane is
-    static, so per-frame depth is the same analytic render at every time --
-    which is the point: ``depth0`` is taken from ``depth[:, 0]`` here exactly as
-    the producing side derives it, so the fixture cannot drift away from the
-    contract it is used to test.
-
-    ``query_times`` gives each track its own query frame, ``view_ids`` records
-    original camera ids that need not be ``range(view_count)``, and
-    ``invisible`` marks ``(camera, time, track)`` triples as occluded.
-
-    ``packed`` writes the frames into one ``frames.zip`` instead of loose
-    ``view_<v>/`` directories, mirroring the training dump.  This is not a
-    fixture convenience: both layouts are permanently live -- the benchmark dump
-    stays loose while the training dump packs to fit the cluster's file-count
-    quota -- so the flag reproduces a real bimodality the loader must handle.
-    ``meta.npz`` and ``depth_full.npz`` stay loose either way.
-    """
-
-    scene_path = root / scene_name
-    track_count = 3
-    height = width = 56
-
-    if packed:
-        scene_path.mkdir(parents=True)
-        # STORED matches the producing side: PNGs are already compressed, so
-        # deflating them again buys nothing.
-        with zipfile.ZipFile(
-            scene_path / "frames.zip", "w", zipfile.ZIP_STORED
-        ) as archive:
-            for camera in range(view_count):
-                for time_index in range(time_count):
-                    archive.writestr(
-                        f"view_{camera}/{time_index:04d}.png",
-                        _frame_png_bytes(camera, time_index, height, width),
-                    )
-    else:
-        for camera in range(view_count):
-            view_path = scene_path / f"view_{camera}"
-            view_path.mkdir(parents=True)
-            for time_index in range(time_count):
-                (view_path / f"{time_index:04d}.png").write_bytes(
-                    _frame_png_bytes(camera, time_index, height, width)
-                )
-
-    initial_points = np.array(
-        [
-            [-1.0, -0.5, 5.0],
-            [0.0, 0.4, 5.0],
-            [1.0, -0.2, 5.0],
-        ],
-        dtype=np.float32,
-    )
-    trajectory = np.stack(
-        [
-            initial_points + np.array([0.1 * time, 0.02 * time, 0.0])
-            for time in range(time_count)
-        ],
-        axis=0,
-    ).astype(np.float32)
-    if query_times is None:
-        query_times = np.zeros(track_count, dtype=np.int64)
-    query_times = np.asarray(query_times, dtype=np.int64)
-    query_points = np.concatenate(
-        (
-            query_times.astype(np.float32)[:, None],
-            trajectory[query_times, np.arange(track_count)],
-        ),
-        axis=-1,
-    )
-    visibility = np.ones(
-        (view_count, time_count, track_count),
-        dtype=bool,
-    )
-    for camera, time_index, track in invisible:
-        visibility[camera, time_index, track] = False
-    intrinsics = np.zeros((view_count, time_count, 3, 3), dtype=np.float32)
-    intrinsics[..., 0, 0] = 30.0
-    intrinsics[..., 1, 1] = 30.0
-    intrinsics[..., 0, 2] = width / 2
-    intrinsics[..., 1, 2] = height / 2
-    intrinsics[..., 2, 2] = 1.0
-    extrinsics = np.zeros((view_count, time_count, 3, 4), dtype=np.float32)
-    depth_full = np.zeros(
-        (view_count, time_count, 1, height, width),
-        dtype=np.float32,
-    )
-    for camera in range(view_count):
-        rotation, translation = _world_to_camera(camera, rotated_camera)
-        extrinsics[camera, :, :3, :3] = rotation.astype(np.float32)
-        extrinsics[camera, :, :3, 3] = translation.astype(np.float32)
-        # Depth must agree with the pose: build_anchor_correspondences gates on
-        # |depth - camera_z| <= 10 cm, so a pose change without a matching
-        # depth render rejects every candidate. The plane is static, so the
-        # same render is the truth at every time.
-        depth_full[camera, :, 0] = _render_plane_depth(
-            rotation,
-            translation,
-            intrinsics[camera, 0].astype(np.float64),
-            height,
-            width,
-        )
-    depth_full = depth_full.astype(sidecar_dtype)
-    # Exactly how the producing side derives it, which is what makes
-    # depth[:, 0] == depth0 an invariant rather than a coincidence.
-    depth0 = depth_full[:, 0]
-
-    meta = {
-        "query_points": query_points,
-        "traj3d_world": trajectory,
-        "visibility": visibility,
-        "intrs": intrinsics,
-        "extrs": extrinsics,
-        "depth0": depth0,
-        "track_upscaling_factor": np.float64(1.0),
-    }
-    if view_ids is not None:
-        meta["view_ids"] = np.asarray(view_ids, dtype=np.int64)
-    np.savez_compressed(scene_path / "meta.npz", **meta)
-    if depth_sidecar:
-        np.savez_compressed(
-            scene_path / "depth_full.npz",
-            depth=depth_full,
-            seq_name=scene_name,
-        )
-    return scene_path
+from scene_fixtures import (
+    _PLANE_Z,
+    _pitch_rotation,
+    _world_to_camera,
+    _yaw_rotation,
+    fixture_scene,
+    scene_arrays,
+)
+from test_time_indexing import _LinearMotionDecoder, _trainer_patch
 
 
 @pytest.fixture
-def dumped_scene(tmp_path, monkeypatch):
-    _write_scene(tmp_path)
-
+def dumped_scene(monkeypatch):
     def fake_preprocess_images(
         frames,
         size,
@@ -328,13 +91,7 @@ def dumped_scene(tmp_path, monkeypatch):
         "arc.dust3r.utils.image.preprocess_images",
         fake_preprocess_images,
     )
-    return load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        size=56,
-    )
+    return fixture_scene(cameras=(0, 1), times=(0, 1, 2, 3), size=56)
 
 
 def _identity_alignment() -> DetachedSim3:
@@ -389,11 +146,11 @@ def test_square_512_preprocessing_geometry_is_exact():
 
 
 def test_production_crop_geometry_is_exact():
-    """Cover the geometry the overfit actually runs.
+    """Cover the geometry a real Kubric frame takes.
 
     Every adapter test uses 56x56 at size=56, where crop is (0,0) and scale is 1,
     so output_to_original_indices degenerates to the identity and a crop-offset
-    sign flip or a crop_top/crop_left swap is invisible. The real dump is
+    sign flip or a crop_top/crop_left swap is invisible. A real Kubric frame is
     384x512 at size=512 -> 378x504 with crop (3,4), asserted nowhere else.
     """
 
@@ -641,7 +398,7 @@ def test_load_images_is_unchanged_by_the_preprocess_split(tmp_path, case):
 
 
 def test_load_images_still_honours_exif_orientation(tmp_path):
-    """A dropped `exif_transpose` is invisible on the dump's own frames.
+    """A dropped `exif_transpose` is invisible on the fixture's own frames.
 
     Kubric writes PNGs with no EXIF, so every other case here passes with the
     call removed -- and it sits on the line the split moved between functions.
@@ -728,15 +485,13 @@ def test_load_images_still_rejects_a_folder_with_no_images(tmp_path):
         load_images(str(tmp_path), size=512, patch_size=14, verbose=False)
 
 
-def test_adapter_rejects_a_loader_that_reorders_its_output(tmp_path, monkeypatch):
+def test_adapter_rejects_a_loader_that_reorders_its_output(monkeypatch):
     """Slot s must hold the pixels of paths[s].
 
-    _validate_scene_layout re-derives camera and time from the same slot
-    arithmetic the loader used, so it is an identity over the whole input space
-    and cannot see a permuted image list.
+    Re-deriving camera and time from the slot arithmetic is an identity over
+    the whole input space and cannot see a permuted image list; the loader-index
+    check is what does.
     """
-
-    _write_scene(tmp_path)
 
     def reversing_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
@@ -772,9 +527,7 @@ def test_adapter_rejects_a_loader_that_reorders_its_output(tmp_path, monkeypatch
     )
 
     with pytest.raises(RuntimeError, match="out of step"):
-        load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
+        fixture_scene(
             cameras=(0, 1),
             times=(0, 1, 2, 3),
             size=56,
@@ -851,16 +604,12 @@ def test_arc_public_forward_keeps_all_eight_observations(dumped_scene):
     assert torch.equal(output["track_query_idx"], torch.tensor([0]))
 
 
-def test_single_camera_window_runs_through_arc_and_sparse_loss(tmp_path):
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_single_camera_window_runs_through_arc_and_sparse_loss():
+    scene = fixture_scene(
         cameras=(1,),
         times=(0, 2, 3),
         size=56,
     )
-    overfit_cli._validate_scene_layout(scene)
 
     assert scene.num_observations == 3
     assert scene.time_indices == (0, 1, 2)
@@ -886,11 +635,8 @@ def test_single_camera_window_runs_through_arc_and_sparse_loss(tmp_path):
     assert result.sample_count == correspondences.count * 3
 
 
-def test_nonfirst_query_camera_owns_alignment_correspondence(tmp_path):
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_nonfirst_query_camera_owns_alignment_correspondence():
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((1, 0),),
@@ -902,6 +648,7 @@ def test_nonfirst_query_camera_owns_alignment_correspondence(tmp_path):
 
     # If correspondence construction accidentally uses camera 0, every
     # candidate will fail its depth-consistency gate.
+    scene.depth[0].fill_(100.0)
     scene.depth0[0].fill_(100.0)
     correspondences, _ = build_anchor_correspondences(scene)
 
@@ -912,16 +659,12 @@ def test_nonfirst_query_camera_owns_alignment_correspondence(tmp_path):
     ))) == correspondences.count
 
 
-def test_selected_camera_order_is_preserved_camera_major(tmp_path):
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_selected_camera_order_is_preserved_camera_major():
+    scene = fixture_scene(
         cameras=(1, 0),
         times=(0, 3),
         size=56,
     )
-    overfit_cli._validate_scene_layout(scene)
 
     assert [
         (observation.camera, observation.original_time)
@@ -931,16 +674,14 @@ def test_selected_camera_order_is_preserved_camera_major(tmp_path):
     assert scene.query_observation_slot == 0
 
 
-def test_adapter_supports_more_than_two_selected_cameras(tmp_path):
-    _write_scene(tmp_path, time_count=3, view_count=4)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_adapter_supports_more_than_two_selected_cameras():
+    scene = fixture_scene(
+        time_count=3,
+        view_count=4,
         cameras=(3, 1, 0),
         times=(0, 2),
         size=56,
     )
-    overfit_cli._validate_scene_layout(scene)
 
     assert scene.num_observations == 6
     assert [
@@ -951,12 +692,8 @@ def test_adapter_supports_more_than_two_selected_cameras(tmp_path):
     assert scene.slot_cameras.tolist() == [3, 3, 1, 1, 0, 0]
 
 
-def test_adapter_uses_the_real_image_loader(tmp_path):
-    _write_scene(tmp_path)
-
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_adapter_uses_the_real_image_loader():
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
@@ -967,306 +704,8 @@ def test_adapter_uses_the_real_image_loader(tmp_path):
     assert scene.time_indices == (0, 1, 2, 3, 0, 1, 2, 3)
 
 
-def test_packed_and_loose_dumps_load_identically(tmp_path):
-    """The layout on disk must not reach the tensors.
-
-    Deliberately unmocked: a fake preprocessor would skip the pixel path, which
-    is the only thing this test is about.  Both dumps are written from the same
-    `_frame_png_bytes`, so any difference is the loader's doing.
-    """
-
-    _write_scene(tmp_path, scene_name="loose")
-    _write_scene(tmp_path, scene_name="packed", packed=True)
-
-    assert (tmp_path / "packed" / "frames.zip").is_file()
-    assert not (tmp_path / "packed" / "view_0").exists()
-    assert (tmp_path / "packed" / "meta.npz").is_file()
-
-    window = dict(cameras=(0, 1), times=(0, 1, 2, 3), size=56)
-    loose = load_dumped_kubric_scene(tmp_path, "loose", **window)
-    packed = load_dumped_kubric_scene(tmp_path, "packed", **window)
-
-    assert len(packed.views) == len(loose.views) == 8
-    for slot, (from_loose, from_packed) in enumerate(zip(loose.views, packed.views)):
-        assert torch.equal(from_loose["img"], from_packed["img"]), (
-            f"slot {slot} pixels differ between layouts"
-        )
-        np.testing.assert_array_equal(
-            from_loose["true_shape"], from_packed["true_shape"]
-        )
-        assert from_loose["idx"] == from_packed["idx"] == slot
-        assert from_loose["instance"] == from_packed["instance"]
-        assert torch.equal(from_loose["time_index"], from_packed["time_index"])
-        assert torch.equal(
-            from_loose["track_query_idx"], from_packed["track_query_idx"]
-        )
-
-    # Equal tensors would prove nothing if every frame looked alike, so confirm
-    # the eight are mutually distinct -- that is what makes the loop above able
-    # to catch a frame landing in the wrong slot.
-    assert len({float(view["img"].mean()) for view in loose.views}) == 8
-
-    assert packed.slot_cameras.tolist() == loose.slot_cameras.tolist()
-    assert packed.slot_times.tolist() == loose.slot_times.tolist()
-    assert packed.time_indices == loose.time_indices
-    assert torch.equal(packed.depth0, loose.depth0)
-
-    # `path` is the one field that must differ: it records where the frame was
-    # read from, and for a packed scene that is a member inside the archive.
-    assert loose.observations[0].path == tmp_path / "loose" / "view_0" / "0000.png"
-    assert (
-        packed.observations[0].path
-        == tmp_path / "packed" / "frames.zip" / "view_0" / "0000.png"
-    )
-
-
-def test_a_missing_packed_frame_names_the_scene_and_the_member(tmp_path):
-    """A gap in the archive must say which frame of which scene is missing.
-
-    `ZipFile.read` raises a bare `KeyError` naming neither, which would surface
-    as an unhandled key error halfway through a cluster run.
-    """
-
-    _write_scene(tmp_path, scene_name="gappy", packed=True)
-    archive_path = tmp_path / "gappy" / "frames.zip"
-
-    with zipfile.ZipFile(archive_path) as source:
-        names = source.namelist()
-        kept = [
-            (name, source.read(name)) for name in names if name != "view_1/0002.png"
-        ]
-    # Without this the test would still pass if the writer's member spelling ever
-    # stopped matching the name above -- having deleted no frame at all.
-    assert len(kept) == len(names) - 1
-
-    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_STORED) as target:
-        for name, payload in kept:
-            target.writestr(name, payload)
-
-    # FileNotFoundError, not KeyError: same failure, same type, as a loose dump
-    # missing the same frame.
-    with pytest.raises(FileNotFoundError) as raised:
-        load_dumped_kubric_scene(
-            tmp_path,
-            "gappy",
-            cameras=(0, 1),
-            times=(0, 1, 2, 3),
-            size=56,
-        )
-
-    message = str(raised.value)
-    assert "view_1/0002.png" in message
-    assert str(archive_path) in message
-
-
-def test_the_frame_archive_wins_when_both_layouts_are_present(tmp_path):
-    """A scene carrying both layouts reads the archive.
-
-    Packing is a transition: a scene can be packed before its loose frames are
-    swept away.  Preferring the loose copy would silently read whichever half
-    went stale, so the rule is that the archive decides wherever it exists.
-    """
-
-    scene_path = _write_scene(tmp_path, scene_name="both")
-    # Offset fills, so which layout was read is visible in the pixels.
-    with zipfile.ZipFile(
-        scene_path / "frames.zip", "w", zipfile.ZIP_STORED
-    ) as archive:
-        for camera in range(2):
-            for time_index in range(4):
-                archive.writestr(
-                    f"view_{camera}/{time_index:04d}.png",
-                    _frame_png_bytes(camera + 5, time_index, 56, 56),
-                )
-
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "both",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        size=56,
-    )
-
-    # A 56x56 frame at size=56 is resized and cropped by the identity, and ImgNorm
-    # maps a constant fill f to 2f/255 - 1.
-    expected = [
-        2 * (20 * (camera + 5) + time_index) / 255 - 1
-        for camera in range(2)
-        for time_index in range(4)
-    ]
-    np.testing.assert_allclose(
-        [float(view["img"].mean()) for view in scene.views],
-        expected,
-        atol=1e-6,
-    )
-    assert "frames.zip" in str(scene.observations[0].path)
-
-
-def test_adapter_parses_nonzero_window_but_sparse_supervision_rejects_it(
-    tmp_path,
-):
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0,),
-        times=(1, 2, 3),
-        size=56,
-    )
-
-    assert scene.num_observations == 3
-    assert scene.time_indices == (0, 1, 2)
-    query = scene.observations[scene.query_observation_slot]
-    assert (query.camera, query.original_time) == (0, 1)
-    assert not scene.has_time_varying_depth
-    # The dump is complete-looking without the opt-in sidecar, so the failure
-    # has to name the flag that produces it rather than just refusing.
-    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
-        build_anchor_correspondences(scene)
-    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
-        scene.surface_depth_map(0, 1)
-    # Time 0 still resolves from meta.npz's depth0 alone.
-    assert scene.surface_depth_map(0, 0).shape == scene.depth0.shape[-2:]
-
-
-def test_overfit_cli_accepts_dynamic_layouts_and_its_flag_requirements():
-    """Camera/time layouts, and which flags a run may omit.
-
-    Named for what it checks now: --checkpoint_dir and --output_dir are required
-    for a training run and exempted by both --parse_only and --eligibility_only,
-    --max_time_indices bounds the semantic times, and an off-t0 anchor is
-    *accepted* here because whether it is supportable depends on the per-frame
-    depth sidecar, which only the loaded scene knows about.
-    """
-
-    parser = overfit_cli.build_arg_parser()
-    one_camera = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--checkpoint_dir",
-            "checkpoint",
-            "--output_dir",
-            "output",
-            "--cameras",
-            "1",
-            "--times",
-            "0",
-            "2",
-            "5",
-        ]
-    )
-    overfit_cli._validate_args(one_camera)
-
-    missing_checkpoint = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--cameras",
-            "1",
-            "--times",
-            "0",
-            "2",
-        ]
-    )
-    with pytest.raises(ValueError, match="checkpoint_dir"):
-        overfit_cli._validate_args(missing_checkpoint)
-
-    parse_only = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--cameras",
-            "1",
-            "--times",
-            "1",
-            "2",
-            "5",
-            "--parse_only",
-        ]
-    )
-    overfit_cli._validate_args(parse_only)
-    assert parse_only.checkpoint_dir is None
-    assert parse_only.output_dir is None
-
-    # --eligibility_only exempts them too, and the messages must say so.
-    eligibility_only = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--cameras",
-            "1",
-            "--times",
-            "1",
-            "2",
-            "5",
-            "--eligibility_only",
-        ]
-    )
-    overfit_cli._validate_args(eligibility_only)
-    assert eligibility_only.checkpoint_dir is None
-    with pytest.raises(ValueError, match="--parse_only or --eligibility_only"):
-        overfit_cli._validate_args(missing_checkpoint)
-
-    # An off-t0 anchor is no longer refused from the flags alone: whether it is
-    # supportable depends on the per-frame depth sidecar, which only the loaded
-    # scene knows about. The guard moved to DumpedKubricScene.surface_depth_map
-    # and names RCMV_DUMP_DEPTH=1 there; see
-    # test_adapter_parses_nonzero_window_but_sparse_supervision_rejects_it.
-    off_t0_anchor = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--checkpoint_dir",
-            "checkpoint",
-            "--output_dir",
-            "output",
-            "--cameras",
-            "1",
-            "--times",
-            "1",
-            "2",
-            "5",
-        ]
-    )
-    overfit_cli._validate_args(off_t0_anchor)
-    assert overfit_cli._resolve_query_anchors(off_t0_anchor) == ((1, 1),)
-
-    too_many_times = parser.parse_args(
-        [
-            "--data_root",
-            "data",
-            "--scene",
-            "1",
-            "--cameras",
-            "1",
-            "--times",
-            "0",
-            "2",
-            "5",
-            "--max_time_indices",
-            "2",
-            "--parse_only",
-        ]
-    )
-    with pytest.raises(ValueError, match="Selected 3 semantic times"):
-        overfit_cli._validate_args(too_many_times)
-
-
-def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
-    """A scene whose camera 1 has a real yaw/pitch and a matching depth0 render."""
-
-    _write_scene(tmp_path, rotated_camera=1)
+def _rotated_two_camera_scene(monkeypatch, *, query_camera=1):
+    """A scene whose camera 1 has a real yaw/pitch and a matching depth render."""
 
     def fake_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
@@ -1299,9 +738,8 @@ def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
     monkeypatch.setattr(
         "arc.dust3r.utils.image.preprocess_images", fake_preprocess_images
     )
-    return load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    return fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((query_camera, 0),),
@@ -1309,10 +747,7 @@ def _rotated_two_camera_scene(tmp_path, monkeypatch, *, query_camera=1):
     )
 
 
-def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(
-    tmp_path,
-    monkeypatch,
-):
+def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(monkeypatch):
     """Check the world lift against ground truth the fixture knows independently.
 
     The old Sim(3) test built its source by inverting a known transform applied to
@@ -1322,7 +757,7 @@ def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(
     that R vs R^T and any axis permutation break immediately.
     """
 
-    scene = _rotated_two_camera_scene(tmp_path, monkeypatch)
+    scene = _rotated_two_camera_scene(monkeypatch)
     world_points, valid = sparse_module._metric_pointmap_at_anchor(
         scene,
         scene.query_observation_slot,
@@ -1342,13 +777,10 @@ def test_metric_pointmap_lifts_depth0_onto_the_known_world_plane(
         assert np.linalg.norm(world_points[row, column] - expected) < 0.15
 
 
-def test_fit_scene_sim3_reads_the_query_observation_not_slot_zero(
-    tmp_path,
-    monkeypatch,
-):
+def test_fit_scene_sim3_reads_the_query_observation_not_slot_zero(monkeypatch):
     """Only the query observation's pointmap may drive the alignment."""
 
-    scene = _rotated_two_camera_scene(tmp_path, monkeypatch)
+    scene = _rotated_two_camera_scene(monkeypatch)
     query_slot = scene.query_observation_slot
     assert query_slot != 0
 
@@ -1430,10 +862,10 @@ def test_detached_sim3_rejects_improper_and_non_orthonormal_rotations():
         )
 
 
-def test_fit_scene_sim3_rejects_collinear_predictions(tmp_path, monkeypatch):
+def test_fit_scene_sim3_rejects_collinear_predictions(monkeypatch):
     """The collinearity guard exists but no test reached it."""
 
-    scene = _rotated_two_camera_scene(tmp_path, monkeypatch)
+    scene = _rotated_two_camera_scene(monkeypatch)
     target, _ = sparse_module._metric_pointmap_at_anchor(
         scene,
         scene.query_observation_slot,
@@ -1474,7 +906,7 @@ def _project_expected_anchors(scene, camera, rotated_camera, time_index):
     return expected
 
 
-def test_rotated_query_camera_projects_to_independently_derived_pixels(tmp_path):
+def test_rotated_query_camera_projects_to_independently_derived_pixels():
     """A real rotation makes the world-to-camera convention observable.
 
     With every camera at identity rotation and a pure-x baseline, inverting the
@@ -1483,10 +915,8 @@ def test_rotated_query_camera_projects_to_independently_derived_pixels(tmp_path)
     fires. Both mistakes move these pixels.
     """
 
-    _write_scene(tmp_path, rotated_camera=1)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((1, 0),),
@@ -1510,7 +940,7 @@ def test_rotated_query_camera_projects_to_independently_derived_pixels(tmp_path)
     assert actual == expected
 
 
-def test_sparse_loss_is_zero_for_a_nonzero_query_slot(tmp_path):
+def test_sparse_loss_is_zero_for_a_nonzero_query_slot():
     """Exercise the query-slot -> observation indirection off its identity.
 
     ``build_anchor_correspondences`` emits query_slot 0 (an index into the track
@@ -1519,10 +949,8 @@ def test_sparse_loss_is_zero_for_a_nonzero_query_slot(tmp_path):
     those are both 0, so dropping the indirection is numerically invisible.
     """
 
-    _write_scene(tmp_path, rotated_camera=1)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((1, 0),),
@@ -1546,13 +974,11 @@ def test_sparse_loss_is_zero_for_a_nonzero_query_slot(tmp_path):
     assert float(result.metric_error.item()) == pytest.approx(0.0, abs=1e-8)
 
 
-def test_query_anchor_gather_follows_the_observation_slot(tmp_path):
+def test_query_anchor_gather_follows_the_observation_slot():
     """Anchors must be read from the query observation, not from slot 0."""
 
-    _write_scene(tmp_path, rotated_camera=1)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((1, 0),),
@@ -1583,285 +1009,6 @@ def test_query_anchor_gather_follows_the_observation_slot(tmp_path):
     expected_value = float(scene.query_observation_slot + 1)
     assert torch.allclose(anchors, torch.full_like(anchors, expected_value))
     assert anchor_frame == "model"
-
-
-def test_exit_gate_requires_a_real_margin_not_just_any_decrease():
-    """A bare `final < initial` is dominated by reconstruction drift.
-
-    The time embedding is injected at alt_start and every head-feeding out-layer
-    is downstream of it, so refitting the Sim(3) moves the loss even when the
-    track head improved by exactly nothing. Require a margin.
-    """
-
-    common = dict(
-        baseline_loss=1.0,
-        final_shuffled_loss=None,
-        min_improvement=0.01,
-        min_index_advantage=0.0,
-    )
-
-    # Passes: a 5% drop clears the 1% default margin.
-    assert overfit_cli._exit_criteria_failure(
-        initial_loss=1.0,
-        final_loss=0.95,
-        embedding_change=0.5,
-        **common,
-    ) is None
-
-    # Fails: a 0.1% drop would have passed the old zero-margin comparison.
-    reason = overfit_cli._exit_criteria_failure(
-        initial_loss=1.0,
-        final_loss=0.999,
-        embedding_change=0.5,
-        **common,
-    )
-    assert reason is not None
-    assert "like-for-like position loss" in reason
-
-    # Fails: loss went up.
-    assert overfit_cli._exit_criteria_failure(
-        initial_loss=1.0,
-        final_loss=1.5,
-        embedding_change=0.5,
-        **common,
-    ) is not None
-
-    # A frozen embedding fails regardless of the loss.
-    reason = overfit_cli._exit_criteria_failure(
-        initial_loss=1.0,
-        final_loss=0.1,
-        embedding_change=0.0,
-        **common,
-    )
-    assert reason == "Temporal embedding did not change"
-
-
-def test_exit_gate_stays_on_position_but_names_the_confidence_term():
-    """The gate must not soften when a second term is added, only explain itself.
-
-    A confidence term that buys calibration by giving up track accuracy should
-    still read as a failure here -- but a reader who sees a bare position-loss
-    failure has no reason to suspect the term they just switched on.
-    """
-
-    references = dict(
-        baseline_loss=1.0,
-        final_shuffled_loss=None,
-        min_improvement=0.01,
-        min_index_advantage=0.0,
-    )
-    common = dict(
-        initial_loss=1.0, final_loss=0.999, embedding_change=0.5, **references
-    )
-
-    position_only = overfit_cli._exit_criteria_failure(**common)
-    with_confidence = overfit_cli._exit_criteria_failure(
-        **common, confidence_weight=0.001
-    )
-
-    # Same verdict either way: the threshold is untouched by the new term.
-    assert position_only is not None and with_confidence is not None
-    assert with_confidence.startswith(position_only)
-    assert "--confidence_weight=0.001" in with_confidence
-    assert "final_loss_breakdown" in with_confidence
-
-    # A passing run is silent about it, and a frozen embedding still wins.
-    assert overfit_cli._exit_criteria_failure(
-        initial_loss=1.0, final_loss=0.5, embedding_change=0.5,
-        confidence_weight=1.0, **references,
-    ) is None
-    assert overfit_cli._exit_criteria_failure(
-        initial_loss=1.0, final_loss=0.1, embedding_change=0.0,
-        confidence_weight=1.0, **references,
-    ) == "Temporal embedding did not change"
-
-
-def test_min_improvement_is_validated():
-    parser = overfit_cli.build_arg_parser()
-    base = [
-        "--data_root", "root", "--scene", "0000",
-        "--checkpoint_dir", "ckpt", "--output_dir", "out",
-    ]
-    args = parser.parse_args(base)
-    assert args.min_improvement == 0.01
-    overfit_cli._validate_args(args)
-
-    for bad in ("-0.1", "1.0", "nan"):
-        rejected = parser.parse_args(base + ["--min_improvement", bad])
-        with pytest.raises(ValueError, match="--min_improvement"):
-            overfit_cli._validate_args(rejected)
-
-
-def test_confidence_flags_default_off_and_are_validated():
-    """Defaulting off is what keeps existing invocations byte-for-byte unaffected."""
-
-    parser = overfit_cli.build_arg_parser()
-    base = [
-        "--data_root", "root", "--scene", "0000",
-        "--checkpoint_dir", "ckpt", "--output_dir", "out",
-    ]
-    args = parser.parse_args(base)
-    assert args.confidence_weight == 0.0
-    assert args.confidence_alpha == "auto"
-    overfit_cli._validate_args(args)
-    assert overfit_cli._parse_confidence_alpha(args.confidence_alpha) is None
-
-    for bad in ("-1.0", "nan"):
-        rejected = parser.parse_args(base + ["--confidence_weight", bad])
-        with pytest.raises(ValueError, match="--confidence_weight"):
-            overfit_cli._validate_args(rejected)
-
-    for bad in ("0", "-2", "nan", "sometimes"):
-        rejected = parser.parse_args(base + ["--confidence_alpha", bad])
-        with pytest.raises(ValueError, match="--confidence_alpha"):
-            overfit_cli._validate_args(rejected)
-
-    accepted = parser.parse_args(
-        base + ["--confidence_weight", "0.5", "--confidence_alpha", "330"]
-    )
-    overfit_cli._validate_args(accepted)
-    assert overfit_cli._parse_confidence_alpha(accepted.confidence_alpha) == 330.0
-
-
-# The fields run_summary.json carried before the confidence term existed. Anything
-# consuming an archived summary keeps working only if these all survive, so the
-# rule is add-only. Checked by reading the source: writing a real summary needs a
-# checkpoint and a GPU, and this must stay runnable in CI.
-_BASELINE_RUN_SUMMARY_FIELDS = frozenset({
-    "scene", "cameras", "times", "observation_count", "time_indices",
-    "max_time_indices", "query_observation_slot", "query_camera", "query_time",
-    "eligible_query_count", "initial_alignment", "initial_alignment_scale",
-    "initial_alignment_rotation", "initial_alignment_translation",
-    "final_alignment", "final_alignment_scale", "final_alignment_rotation",
-    "final_alignment_translation", "success", "failure_reason", "min_improvement",
-    "initial_position_loss", "final_position_loss", "final_position_loss_refit",
-    "initial_metric_error_m", "final_metric_error_m", "final_metric_error_refit_m",
-    "initial_track_confidence", "final_track_confidence",
-    "initial_temporal_embedding_norm", "final_temporal_embedding_norm",
-    "temporal_embedding_change", "gradient_norms", "trainable_tensor_count",
-    "trainable_parameter_count", "peak_gpu_memory_bytes", "checkpoint_path",
-    "seed", "precision", "steps", "learning_rate",
-})
-
-
-def test_run_summary_fields_are_only_ever_added_to():
-    source = Path(overfit_cli.__file__).read_text()
-    written = None
-    for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "summary"
-                for target in node.targets
-            )
-            and isinstance(node.value, ast.Dict)
-        ):
-            written = {key.value for key in node.value.keys}
-    assert written is not None, "could not find the run_summary dict literal"
-
-    assert _BASELINE_RUN_SUMMARY_FIELDS <= written
-    assert {
-        "confidence_weight",
-        "confidence_alpha",
-        "confidence_alpha_mode",
-        "initial_confidence_loss",
-        "final_confidence_loss",
-        "confidence_gradient_norms",
-        "confidence_sample_count",
-        "implied_optimal_confidence",
-        "initial_confidence_diagnostics",
-        "final_confidence_diagnostics",
-        "initial_loss_breakdown",
-        "final_loss_breakdown",
-        "initial_confidence_dropped",
-        "final_confidence_dropped",
-    } <= written
-    # The freeze mask a run actually trained under: the mode name alone does
-    # not fix it, and gpu_name is what makes a mixed-hardware comparison
-    # detectable in the archive rather than being read as a result.
-    # encoder_local_checkpointing joins them for the same reason: it changes what
-    # the encoder retains for backward, so it is part of what produced this run's
-    # step times and nothing else in the summary would show it.
-    assert {
-        "late_global_blocks",
-        "gpu_name",
-        "encoder_local_checkpointing",
-    } <= written
-
-
-def test_confidence_gradient_norms_split_the_shared_output_conv():
-    """Row 3 and rows 0-2 of the final conv are reported apart, with no extra backward."""
-
-    conv = nn.Conv2d(2, 4, kernel_size=1)
-    conv.weight.grad = torch.zeros_like(conv.weight)
-    conv.bias.grad = torch.zeros_like(conv.bias)
-    conv.weight.grad[3].fill_(3.0)
-    conv.bias.grad[0].fill_(4.0)
-    model = SimpleNamespace(
-        track_head=SimpleNamespace(
-            scratch=SimpleNamespace(output_conv2=[None, None, conv])
-        )
-    )
-
-    norms = overfit_cli._confidence_gradient_norms(model)
-
-    # Row 3 holds two weights of 3.0 and a zero bias.
-    assert norms["track_head_output_conv_confidence_row"] == pytest.approx(
-        (2 * 3.0**2) ** 0.5
-    )
-    assert norms["track_head_output_conv_position_rows"] == pytest.approx(4.0)
-
-
-def test_confidence_gradient_norms_resolve_against_a_real_dpt_head():
-    """The attribute path is the untested part, so walk a real DPTHead, not a stub.
-
-    `_confidence_gradient_norms` reaches `track_head.scratch.output_conv2[2]` and
-    assumes it is the 4-channel xyz+conf conv. The sibling test above checks the
-    arithmetic against a bare Conv2d; this checks that the path and the channel
-    count are actually what the shipped head builds.
-    """
-
-    head = DPTHead(
-        dim_in=8,
-        output_dim=4,
-        features=16,
-        out_channels=[8, 8, 8, 8],
-        intermediate_layer_idx=[0, 1, 2, 3],
-    )
-    output_conv = head.scratch.output_conv2[2]
-    assert isinstance(output_conv, nn.Conv2d)
-    assert output_conv.out_channels == 4
-    assert output_conv.kernel_size == (1, 1)
-
-    output_conv.weight.grad = torch.zeros_like(output_conv.weight)
-    output_conv.bias.grad = torch.zeros_like(output_conv.bias)
-    output_conv.weight.grad[3].fill_(2.0)
-    output_conv.bias.grad[1].fill_(5.0)
-
-    norms = overfit_cli._confidence_gradient_norms(
-        SimpleNamespace(track_head=head)
-    )
-
-    confidence_elements = output_conv.weight[3].numel()
-    assert norms["track_head_output_conv_confidence_row"] == pytest.approx(
-        (confidence_elements * 2.0**2) ** 0.5
-    )
-    assert norms["track_head_output_conv_position_rows"] == pytest.approx(5.0)
-
-
-def test_confidence_gradient_norms_reject_a_head_that_is_not_xyz_plus_conf():
-    """The split is meaningless for another output_dim, so it must fail loudly."""
-
-    head = DPTHead(
-        dim_in=8,
-        output_dim=2,
-        features=16,
-        out_channels=[8, 8, 8, 8],
-        intermediate_layer_idx=[0, 1, 2, 3],
-    )
-
-    with pytest.raises(RuntimeError, match="4-channel track output conv"):
-        overfit_cli._confidence_gradient_norms(SimpleNamespace(track_head=head))
 
 
 def test_diagnostics_can_be_skipped_without_touching_the_loss(dumped_scene):
@@ -2019,184 +1166,7 @@ def test_the_loss_modules_introduce_no_trainable_parameters():
             assert not isinstance(attribute, nn.Parameter), name
 
 
-def test_evaluate_scores_like_for_like_against_the_initial_alignment(monkeypatch):
-    """The gated number must reuse the initial alignment and anchors.
-
-    Otherwise `initial_loss` and `final_loss` are measured under two different
-    transforms and their difference is not attributable to tracking.
-    """
-
-    initial_alignment = _identity_alignment()
-    initial_anchors = torch.full((3, 3), 7.0)
-    refit_alignment = _identity_alignment()
-    refit_anchors = torch.full((3, 3), -1.0)
-
-    calls = []
-
-    # The real dataclass rather than a hand-rolled stub: a stub has to be updated
-    # every time the result grows a field, and silently fails the test when it is
-    # not. This test is about alignment reuse, so the confidence fields default off.
-    def _recorded_result(value):
-        return SparseTrackingLossResult(
-            loss=torch.tensor(value),
-            metric_error=torch.tensor(value * 2),
-            sample_count=0,
-        )
-
-    def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
-        calls.append((alignment, anchors))
-        return _recorded_result(0.25 if len(calls) == 1 else 0.75)
-
-    monkeypatch.setattr(overfit_cli, "sparse_tracking_loss", fake_loss)
-    monkeypatch.setattr(
-        overfit_cli,
-        "fit_scene_sim3",
-        lambda raw, scene: (refit_alignment, {"pair_count": 1}),
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "gather_query_anchor_points",
-        lambda raw, scene, correspondences: (refit_anchors, "model"),
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "_tracking_only",
-        lambda raw, keep_confidence=False: raw,
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "synchronized_consistency_stats",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "reconstruction_drift_report",
-        lambda *args, **kwargs: None,
-    )
-
-    class _StubModel:
-        def eval(self):
-            return self
-
-        def __call__(self, views, **kwargs):
-            return {
-                "conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0),
-                "track_multi": torch.zeros(1, 1, 2, 2, 2, 3),
-            }
-
-    evaluation = overfit_cli._evaluate(
-        _StubModel(),
-        SimpleNamespace(views=[], slot_time_indices=torch.zeros(0, dtype=torch.long)),
-        object(),
-        "32",
-        0.05,
-        initial_alignment,
-        initial_anchors,
-        sync_metric_scale=1.0,
-        shuffled_views=None,
-    )
-
-    assert len(calls) == 2
-    # First call is the refit (diagnostic), second is the gated like-for-like.
-    assert calls[0][0] is refit_alignment and calls[0][1] is refit_anchors
-    assert calls[1][0] is initial_alignment and calls[1][1] is initial_anchors
-    assert evaluation["loss_refit"] == pytest.approx(0.25)
-    assert evaluation["loss"] == pytest.approx(0.75)
-    assert evaluation["confidence"]["mean"] == pytest.approx(3.0)
-
-
-# ------------------------------------------------------------ device guard ---
-
-
-def test_resolve_device_gates_on_cuda_and_is_the_only_device_decision(monkeypatch):
-    """One resolved value, not a torch.cuda.is_available() call per site.
-
-    The sibling trainer guards each site with its own is_available() call, which
-    cannot work here: the gate is itself one of those sites, so anything that
-    stubs the predicate to clear it re-arms every other guard.  Routing them all
-    through one device is what lets the end-to-end test below execute main() at
-    all -- and a main() nothing could execute off-GPU is how an UnboundLocalError
-    in the run summary shipped behind a green suite.
-    """
-
-    parser = overfit_cli.build_arg_parser()
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    assert overfit_cli._resolve_device(parser) == torch.device("cuda")
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.raises(SystemExit):
-        overfit_cli._resolve_device(parser)
-
-    # And the decision stays centralised. A second is_available() call inside
-    # main() is exactly the shape that defeats the stub above, and it would fail
-    # no other test -- main() would simply drop back out of CPU reach.
-    source = Path(overfit_cli.__file__).read_text()
-    main_def = next(
-        node
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.FunctionDef) and node.name == "main"
-    )
-    assert not [
-        node
-        for node in ast.walk(main_def)
-        if isinstance(node, ast.Call)
-        and getattr(node.func, "attr", None) == "is_available"
-    ], "main() must take the device from _resolve_device, not re-ask torch.cuda"
-
-
-def test_parse_only_main_needs_neither_cuda_nor_checkpoint(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    _write_scene(tmp_path)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "overfit_temporal_tracking.py",
-            "--data_root",
-            str(tmp_path),
-            "--scene",
-            "0000",
-            "--cameras",
-            "1",
-            "--times",
-            "1",
-            "2",
-            "3",
-            "--parse_only",
-        ],
-    )
-
-    def unexpected_cuda_check():
-        raise AssertionError("parse-only mode must not inspect CUDA")
-
-    monkeypatch.setattr(torch.cuda, "is_available", unexpected_cuda_check)
-    monkeypatch.setattr(
-        Arc,
-        "from_pretrained",
-        lambda *args, **kwargs: pytest.fail(
-            "parse-only mode must not load an Arc checkpoint"
-        ),
-    )
-
-    overfit_cli.main()
-
-    output = capsys.readouterr().out
-    assert "observations=3" in output
-    assert "time_indices=[0, 1, 2]" in output
-    assert "query_observation=slot 0, camera 1, original_time 1" in output
-    assert "PASS mvtracker dump parsing" in output
-
-
-def test_nonconsecutive_frames_keep_local_semantic_time_indices(
-    tmp_path,
-    monkeypatch,
-):
-    _write_scene(tmp_path, time_count=7)
-
+def test_nonconsecutive_frames_keep_local_semantic_time_indices(monkeypatch):
     def fake_preprocess_images(frames, size, square_ok, verbose, patch_size):
         result = []
         for index, (_name, image) in enumerate(frames):
@@ -2226,9 +1196,8 @@ def test_nonconsecutive_frames_keep_local_semantic_time_indices(
         "arc.dust3r.utils.image.preprocess_images",
         fake_preprocess_images,
     )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        time_count=7,
         cameras=(0, 1),
         times=(0, 2, 4, 6),
         size=56,
@@ -2443,7 +1412,7 @@ def test_query_pointmap_anchor_is_gathered_and_detached(
         gather_query_anchor_points(raw, dumped_scene, stray)
 
 
-def test_the_oracle_anchor_returns_the_ground_truth_query_positions(tmp_path):
+def test_the_oracle_anchor_returns_the_ground_truth_query_positions():
     """With the oracle on, the anchor IS the tracked point's true position.
 
     Queries at t=2 rather than t=0, so the time index is load-bearing: the
@@ -2451,10 +1420,8 @@ def test_the_oracle_anchor_returns_the_ground_truth_query_positions(tmp_path):
     ``trajectories_world[0]`` would be 20 cm out.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        query_times=[2, 2, 2],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 2),),
@@ -2525,9 +1492,9 @@ def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
     ``ground_truth_query_anchor=False`` all return ``(points, frame)`` with
     the pointmap gather at the query pixels and frame ``"model"`` -- the
     snapshot the test above pins.  Both parameters are keyword-only with a
-    False default, which is what keeps the overfit's three positional call
-    sites and ``train_step``'s numerics byte-identical: their calls stay
-    bare, and only the mechanical tuple unpack changed.
+    False default, which is what keeps ``train_step``'s numerics
+    byte-identical: its calls stay bare, and only the mechanical tuple unpack
+    changed.
     """
 
     import inspect
@@ -2676,7 +1643,7 @@ def test_a_world_frame_anchor_is_composed_in_world_not_double_transformed(
         )
 
 
-def test_the_ground_truth_anchor_unprojects_the_anchor_depth(tmp_path):
+def test_the_ground_truth_anchor_unprojects_the_anchor_depth():
     """--ground_truth_query_anchor is the pixel's GT-depth unprojection.
 
     Two anchors on purpose -- track 1 is invisible to camera 0 at t=0, so
@@ -2691,10 +1658,8 @@ def test_the_ground_truth_anchor_unprojects_the_anchor_depth(tmp_path):
     value there; nothing is claimed about the lateral component.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        invisible=[(0, 0, 1)],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -2994,6 +1959,7 @@ def test_depth_inconsistent_rounded_anchor_is_rejected(dumped_scene):
     original_column = int(
         np.rint((column + transform.crop_left) / transform.scale_x)
     )
+    dumped_scene.depth[0, 0, 0, original_row, original_column] = 8.0
     dumped_scene.depth0[0, 0, original_row, original_column] = 8.0
 
     filtered, _ = build_anchor_correspondences(dumped_scene)
@@ -3403,10 +2369,7 @@ def test_save_reload_preserves_temporal_embedding(tmp_path):
         source.backbone.pretrained.time_index_embedding.weight.fill_(3.25)
         source.motion_decoder.weight.fill_(1.5)
         source.track_head.bias.fill_(-2.0)
-    checkpoint = save_temporal_tracking_checkpoint(
-        source,
-        tmp_path / "temporal_tracking.pt",
-    )
+    checkpoint = _trainer_patch(source, tmp_path / "patch")
     target = _tiny_arc()
 
     load_temporal_tracking_checkpoint(target, checkpoint)
@@ -3589,12 +2552,12 @@ def test_sparse_loss_sync_term_is_zero_for_view_consistent_fields(
 
 
 # ------------------------------------------------------------------------------
-# reconstruction drift vs. dump ground truth
+# reconstruction drift vs. ground truth
 # ------------------------------------------------------------------------------
 
 
 def _ground_truth_raw_reconstruction(scene):
-    """depth and pose_enc that reproduce the dump exactly under identity Sim(3)."""
+    """depth and pose_enc reproducing the ground truth exactly under identity Sim(3)."""
 
     height, width = scene.views[0]["img"].shape[-2:]
     depth = torch.full((1, scene.num_observations, height, width), 5.0)
@@ -3685,7 +2648,7 @@ def test_drift_report_reads_a_camera_translation_as_center_error(dumped_scene):
 
 
 def _apply_predicted_gauge(raw, rotation, scale):
-    """Rotate and rescale the *predicted* world frame, leaving the dump alone."""
+    """Rotate and rescale the *predicted* world frame; the ground truth stays put."""
 
     pose_encoding = raw["pose_enc"].clone()
     rotation = torch.as_tensor(rotation, dtype=torch.float64)
@@ -3856,7 +2819,7 @@ def test_drift_report_relative_figures_stay_finite_under_wander(dumped_scene):
                 assert np.isfinite(value)
 
 
-def test_drift_report_relative_rotation_survives_a_single_camera_window(tmp_path):
+def test_drift_report_relative_rotation_survives_a_single_camera_window():
     """One camera means no baseline anywhere, and rotation must outlive that.
 
     A fit taken over every slot would make the numerator identically zero here,
@@ -3865,10 +2828,7 @@ def test_drift_report_relative_rotation_survives_a_single_camera_window(tmp_path
     Restricting the fit empties its input instead, which reaches ``None``.
     """
 
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(1,),
         times=(0, 2, 3),
         size=56,
@@ -3943,7 +2903,7 @@ def test_drift_report_relative_pose_ignores_the_alignment_entirely(dumped_scene)
                 )
 
 
-def test_drift_report_relative_pose_is_anchored_at_the_query_observation(tmp_path):
+def test_drift_report_relative_pose_is_anchored_at_the_query_observation():
     """The reference is the anchor, not slot 0.
 
     ``rotated_camera=1`` gives the anchor camera a real yaw, pitch and offset, so
@@ -3954,10 +2914,8 @@ def test_drift_report_relative_pose_is_anchored_at_the_query_observation(tmp_pat
     below would swap.
     """
 
-    _write_scene(tmp_path, rotated_camera=1)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        rotated_camera=1,
         cameras=(0, 1),
         times=(0, 3),
         query_anchors=((1, 0),),
@@ -3986,74 +2944,8 @@ def test_drift_report_relative_pose_is_anchored_at_the_query_observation(tmp_pat
 
 
 # ------------------------------------------------------------------------------
-# the three-reference exit gate and the shuffled-index control
+# the shuffled-index control
 # ------------------------------------------------------------------------------
-
-
-def test_exit_gate_requires_beating_the_baseline():
-    passing = overfit_cli._exit_criteria_failure(
-        baseline_loss=1.0,
-        initial_loss=2.0,
-        final_loss=0.9,
-        final_shuffled_loss=None,
-        embedding_change=0.5,
-        min_improvement=0.01,
-        min_index_advantage=0.0,
-    )
-    assert passing is None
-
-    # Beats the inflated initial handily, but not the released baseline: the
-    # improvement was recovery from a disruptive init, and the gate says so.
-    recovery_only = overfit_cli._exit_criteria_failure(
-        baseline_loss=1.0,
-        initial_loss=2.0,
-        final_loss=0.999,
-        final_shuffled_loss=None,
-        embedding_change=0.5,
-        min_improvement=0.01,
-        min_index_advantage=0.0,
-    )
-    assert recovery_only is not None
-    assert "zero-embedding baseline" in recovery_only
-
-
-def test_exit_gate_requires_an_index_advantage():
-    passing = overfit_cli._exit_criteria_failure(
-        baseline_loss=1.0,
-        initial_loss=1.0,
-        final_loss=0.5,
-        final_shuffled_loss=0.6,
-        embedding_change=0.5,
-        min_improvement=0.01,
-        min_index_advantage=0.01,
-    )
-    assert passing is None
-
-    # Shuffling the indices barely hurts: the improvement is decoder
-    # adaptation, and the run must fail even though both loss gates pass.
-    unexploited = overfit_cli._exit_criteria_failure(
-        baseline_loss=1.0,
-        initial_loss=1.0,
-        final_loss=0.5,
-        final_shuffled_loss=0.502,
-        embedding_change=0.5,
-        min_improvement=0.01,
-        min_index_advantage=0.01,
-    )
-    assert unexploited is not None
-    assert "Shuffling" in unexploited
-
-    # None skips the check: single-camera or single-time windows have no
-    # synchronization to break.
-    assert overfit_cli._exit_criteria_failure(
-        baseline_loss=1.0,
-        initial_loss=1.0,
-        final_loss=0.5,
-        final_shuffled_loss=None,
-        embedding_change=0.5,
-        min_improvement=0.01,
-        min_index_advantage=0.5,
-    ) is None
 
 
 def _shuffle_stub_scene(cameras, times):
@@ -4082,7 +2974,7 @@ def _shuffle_stub_scene(cameras, times):
 def test_shuffled_index_views_reverse_only_secondary_cameras():
     scene = _shuffle_stub_scene([0, 1], [0, 1, 2])
 
-    shuffled = overfit_cli._shuffled_index_views(scene)
+    shuffled = runtime_module.shuffled_index_views(scene)
 
     for position in range(3):
         # Primary camera keeps its indices; the copies share the same tensors.
@@ -4097,141 +2989,12 @@ def test_shuffled_index_views_reverse_only_secondary_cameras():
 
 
 def test_shuffled_index_views_skip_windows_with_nothing_to_break():
-    assert overfit_cli._shuffled_index_views(
+    assert runtime_module.shuffled_index_views(
         _shuffle_stub_scene([0], [0, 1, 2])
     ) is None
-    assert overfit_cli._shuffled_index_views(
+    assert runtime_module.shuffled_index_views(
         _shuffle_stub_scene([0, 1], [0])
     ) is None
-
-
-def test_evaluate_scores_the_shuffled_arm_against_the_initial_references(
-    monkeypatch,
-):
-    """The control arm must be scored exactly like the gated number."""
-
-    initial_alignment = _identity_alignment()
-    initial_anchors = torch.full((3, 3), 7.0)
-
-    calls = []
-
-    def _recorded_result(value):
-        return SparseTrackingLossResult(
-            loss=torch.tensor(value),
-            metric_error=torch.tensor(value * 2),
-            sample_count=0,
-        )
-
-    def fake_loss(raw, scene, correspondences, alignment, anchors, **kwargs):
-        calls.append((alignment, anchors))
-        return _recorded_result(0.25 * len(calls))
-
-    monkeypatch.setattr(overfit_cli, "sparse_tracking_loss", fake_loss)
-    monkeypatch.setattr(
-        overfit_cli,
-        "fit_scene_sim3",
-        lambda raw, scene: (_identity_alignment(), {"pair_count": 1}),
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "gather_query_anchor_points",
-        lambda raw, scene, correspondences: (torch.zeros(3, 3), "model"),
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "_tracking_only",
-        lambda raw, keep_confidence=False: raw,
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "synchronized_consistency_stats",
-        lambda *args, **kwargs: None,
-    )
-    monkeypatch.setattr(
-        overfit_cli,
-        "reconstruction_drift_report",
-        lambda *args, **kwargs: None,
-    )
-
-    class _StubModel:
-        def eval(self):
-            return self
-
-        def __call__(self, views, **kwargs):
-            return {
-                "conf_track_multi": torch.full((1, 1, 2, 2, 2), 3.0),
-                "track_multi": torch.zeros(1, 1, 2, 2, 2, 3),
-            }
-
-    shuffled_views = [{"time_index": torch.tensor([1])}]
-    evaluation = overfit_cli._evaluate(
-        _StubModel(),
-        SimpleNamespace(views=[], slot_time_indices=torch.zeros(0, dtype=torch.long)),
-        object(),
-        "32",
-        0.05,
-        initial_alignment,
-        initial_anchors,
-        sync_metric_scale=1.0,
-        shuffled_views=shuffled_views,
-    )
-
-    # refit, like-for-like, then the shuffled arm.
-    assert len(calls) == 3
-    assert calls[1][0] is initial_alignment and calls[1][1] is initial_anchors
-    assert calls[2][0] is initial_alignment and calls[2][1] is initial_anchors
-    assert evaluation["loss"] == pytest.approx(0.5)
-    assert evaluation["loss_shuffled"] == pytest.approx(0.75)
-
-
-def test_new_training_flags_default_to_the_archived_behaviour():
-    """Sync off, temporal_tracking mode: an old command line trains the same
-    parameters it always did; only the init default is deliberately new."""
-
-    parser = overfit_cli.build_arg_parser()
-    args = parser.parse_args(
-        [
-            "--data_root", "root", "--scene", "0000",
-            "--checkpoint_dir", "ckpt", "--output_dir", "out",
-        ]
-    )
-    overfit_cli._validate_args(args)
-
-    assert args.freeze_mode == "temporal_tracking"
-    assert args.sync_weight == 0.0
-    assert args.velocity_weight == 0.0
-    assert args.time_embedding_init == "orthogonal"
-    assert args.time_embedding_init_scale == 0.1
-    assert args.embedding_lr is None
-    assert args.encoder_lr is None
-    assert args.min_index_advantage == 0.01
-    assert args.late_global_blocks == overfit_cli.DEFAULT_LATE_GLOBAL_BLOCKS == 4
-    # Memory only, and off: the encoder retains exactly what it always retained.
-    assert args.encoder_local_checkpointing is False
-
-    for flag, bad in (
-        ("--time_embedding_init_scale", "0"),
-        ("--sync_weight", "-1"),
-        ("--velocity_weight", "-1"),
-        ("--min_index_advantage", "1.0"),
-        ("--embedding_lr", "nan"),
-        ("--encoder_lr", "0"),
-        ("--late_global_blocks", "0"),
-        ("--late_global_blocks", "15"),
-    ):
-        rejected = parser.parse_args(
-            [
-                "--data_root", "root", "--scene", "0000",
-                "--checkpoint_dir", "ckpt", "--output_dir", "out",
-                flag, bad,
-            ]
-        )
-        with pytest.raises(ValueError, match=flag.lstrip("-").replace("-", "_")):
-            overfit_cli._validate_args(rejected)
-
-
-def _optimizer_args(lr=1e-5, embedding_lr=None, encoder_lr=None):
-    return SimpleNamespace(lr=lr, embedding_lr=embedding_lr, encoder_lr=encoder_lr)
 
 
 def _optimizer_model(freeze, late_global_blocks=None):
@@ -4256,7 +3019,7 @@ def test_build_optimizer_gives_every_mode_the_same_encoder_rate_rule(
 ):
     """encoder_lr must reach the middle rung exactly as it reaches the full one.
 
-    _build_optimizer selects the encoder group by module membership and a name
+    build_optimizer selects the encoder group by module membership and a name
     filter, never by freeze mode or block index, so this holds by construction
     -- but "by construction" is what silently stops being true under a
     refactor, and a sweep over encoder_lr is worthless if the flag misses.
@@ -4264,18 +3027,17 @@ def test_build_optimizer_gives_every_mode_the_same_encoder_rate_rule(
 
     model = _optimizer_model(freeze, late_global_blocks)
 
-    _, defaulted, encoder_parameters = overfit_cli._build_optimizer(
-        model,
-        _optimizer_args(lr=1e-5),
-    )
+    _, defaulted, encoder_parameters = runtime_module.build_optimizer(model, lr=1e-5)
     assert defaulted["decoder"] == 1e-5
     assert defaulted["embedding"] == 1e-5
     assert defaulted["encoder_blocks"] == pytest.approx(1e-6)
     assert encoder_parameters
 
-    optimizer, explicit, _ = overfit_cli._build_optimizer(
+    optimizer, explicit, _ = runtime_module.build_optimizer(
         model,
-        _optimizer_args(lr=1e-5, encoder_lr=3e-6, embedding_lr=2e-5),
+        lr=1e-5,
+        encoder_lr=3e-6,
+        embedding_lr=2e-5,
     )
     assert explicit["encoder_blocks"] == 3e-6
     assert explicit["embedding"] == 2e-5
@@ -4291,9 +3053,10 @@ def test_build_optimizer_leaves_the_narrow_mode_without_an_encoder_group():
     """No unfrozen encoder block means no group and no rate to report."""
 
     model = _optimizer_model("temporal_tracking")
-    optimizer, learning_rates, encoder_parameters = overfit_cli._build_optimizer(
+    optimizer, learning_rates, encoder_parameters = runtime_module.build_optimizer(
         model,
-        _optimizer_args(lr=1e-5, encoder_lr=3e-6),
+        lr=1e-5,
+        encoder_lr=3e-6,
     )
     assert encoder_parameters == []
     assert learning_rates["encoder_blocks"] is None
@@ -4304,10 +3067,7 @@ def test_build_optimizer_encoder_group_is_the_unfrozen_blocks_only():
     """The embedding lives in its own group, never in the encoder one."""
 
     model = _optimizer_model("temporal_tracking_late_global", late_global_blocks=1)
-    _, _, encoder_parameters = overfit_cli._build_optimizer(
-        model,
-        _optimizer_args(),
-    )
+    _, _, encoder_parameters = runtime_module.build_optimizer(model, lr=1e-5)
 
     encoder_ids = {id(parameter) for parameter in encoder_parameters}
     blocks = model.backbone.pretrained.blocks
@@ -4325,7 +3085,7 @@ def test_build_optimizer_groups_cover_every_trainable_parameter(
     late_global_blocks,
 ):
     model = _optimizer_model(freeze, late_global_blocks)
-    optimizer, _, _ = overfit_cli._build_optimizer(model, _optimizer_args())
+    optimizer, _, _ = runtime_module.build_optimizer(model, lr=1e-5)
 
     grouped = sum(
         parameter.numel()
@@ -4349,7 +3109,7 @@ def test_build_optimizer_rejects_a_parameter_outside_every_group():
     model.head.requires_grad_(True)
 
     with pytest.raises(RuntimeError, match="escaped every group"):
-        overfit_cli._build_optimizer(model, _optimizer_args())
+        runtime_module.build_optimizer(model, lr=1e-5)
 
 
 def test_expected_trainable_set_derives_every_k():
@@ -4361,218 +3121,68 @@ def test_expected_trainable_set_derives_every_k():
     at the default.
     """
 
-    narrow_tensors, narrow_parameters = overfit_cli.EXPECTED_TRAINABLE_SETS[
+    narrow_tensors, narrow_parameters = runtime_module.EXPECTED_TRAINABLE_SETS[
         "temporal_tracking"
     ]
-    per_block_tensors, per_block_parameters = overfit_cli.LATE_GLOBAL_PER_BLOCK
+    per_block_tensors, per_block_parameters = runtime_module.LATE_GLOBAL_PER_BLOCK
+    # Every global-attention block the vitg encoder has (odd blocks from
+    # alt_start=13 to depth 40);
+    # test_late_global_at_full_k_reproduces_the_global_attention_mask pins the
+    # count on the real model.
+    all_global_blocks = 14
 
-    for k in range(1, overfit_cli.MAX_LATE_GLOBAL_BLOCKS + 1):
-        assert overfit_cli._expected_trainable_set(
+    for k in range(1, all_global_blocks + 1):
+        assert runtime_module.expected_trainable_set(
             "temporal_tracking_late_global", k
         ) == (
             narrow_tensors + per_block_tensors * k,
             narrow_parameters + per_block_parameters * k,
         )
 
-    assert overfit_cli._expected_trainable_set(
+    assert runtime_module.expected_trainable_set(
         "temporal_tracking_late_global",
-        overfit_cli.MAX_LATE_GLOBAL_BLOCKS,
-    ) == overfit_cli.EXPECTED_TRAINABLE_SETS["temporal_tracking_global_attention"]
+        all_global_blocks,
+    ) == runtime_module.EXPECTED_TRAINABLE_SETS["temporal_tracking_global_attention"]
 
     # The k-less modes ignore k entirely.
     for mode in ("temporal_tracking", "temporal_tracking_global_attention"):
         assert (
-            overfit_cli._expected_trainable_set(mode, None)
-            == overfit_cli.EXPECTED_TRAINABLE_SETS[mode]
+            runtime_module.expected_trainable_set(mode, None)
+            == runtime_module.EXPECTED_TRAINABLE_SETS[mode]
         )
-
-    assert (
-        "temporal_tracking_late_global"
-        in overfit_cli.build_arg_parser()
-        ._option_string_actions["--freeze_mode"]
-        .choices
-    )
-
-
-def test_run_summary_includes_the_baseline_and_control_fields():
-    source = Path(overfit_cli.__file__).read_text()
-    written = None
-    for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "summary"
-                for target in node.targets
-            )
-            and isinstance(node.value, ast.Dict)
-        ):
-            written = {key.value for key in node.value.keys}
-    assert written is not None
-
-    assert {
-        "freeze_mode",
-        "time_embedding_init",
-        "time_embedding_init_scale",
-        "time_embedding_target_row_norm",
-        "learning_rates",
-        "sync_weight",
-        "min_index_advantage",
-        "baseline_position_loss",
-        "baseline_metric_error_m",
-        "baseline_track_confidence",
-        "final_position_loss_shuffled",
-        "final_metric_error_shuffled_m",
-        "baseline_sync_consistency",
-        "initial_sync_consistency",
-        "final_sync_consistency",
-        "velocity_weight",
-        "baseline_velocity_consistency",
-        "initial_velocity_consistency",
-        "final_velocity_consistency",
-        "anchor_velocity_sample_counts",
-        "anchor_velocity_weights",
-        "temporal_injection",
-        "reconstruction_shift",
-        "baseline_reconstruction_drift",
-        "final_reconstruction_drift",
-    } <= written
 
 
 # ---------------------------------------------------------------------------
-# Per-frame depth sidecar
+# Per-frame depth
 # ---------------------------------------------------------------------------
 
 
-def test_depth0_only_dump_is_unchanged(tmp_path):
-    """No sidecar must mean exactly today's behaviour.
+def test_per_frame_depth_disagreeing_with_depth0_is_rejected():
+    arrays = scene_arrays()
+    arrays["depth"][0, 0, 0, 5, 5] += 1.0
 
-    A dump taken before the sidecar existed, or without RCMV_DUMP_DEPTH=1, is
-    still the common case, and it must keep producing the same correspondences
-    it always has.
-    """
-
-    _write_scene(tmp_path)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        size=56,
-    )
-
-    assert scene.depth is None
-    assert not scene.has_time_varying_depth
-    assert scene.depth_sidecar_path is None
-
-    correspondences, report = build_anchor_correspondences(scene)
-    assert correspondences.trajectory_indices.tolist() == [0, 1, 2]
-    assert correspondences.query_slots.tolist() == [0, 0, 0]
-    assert correspondences.query_times.tolist() == [0, 0, 0]
-    assert correspondences.rows.tolist() == [25, 30, 27]
-    assert correspondences.columns.tolist() == [22, 28, 34]
-    assert report["eligible_query_count"] == 3
-    assert report["supervised_pair_count"] == 3
-    assert report["anchor_count"] == 1
+    with pytest.raises(ValueError, match="differs from depth0"):
+        build_scene(**arrays, cameras=(0, 1), times=(0, 1, 2, 3), size=56)
 
 
-def test_time_varying_depth_sidecar_is_loaded_beside_meta(tmp_path):
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        size=56,
-    )
-
-    assert scene.has_time_varying_depth
-    assert scene.depth.shape == (2, 4, 1, 56, 56)
-    assert scene.depth_sidecar_path == tmp_path / "0000" / "depth_full.npz"
-    # depth[:, 0] is what meta.npz stores as depth0, by construction on the
-    # producing side; the adapter relies on that to anchor time 0 identically
-    # whether or not the sidecar is present.
-    assert torch.equal(scene.depth[:, 0], scene.depth0)
-    for time_index in range(4):
-        assert torch.equal(
-            scene.surface_depth_map(0, time_index),
-            scene.depth[0, time_index, 0],
-        )
-
-
-@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
-def test_sidecar_dtype_is_read_not_asserted(tmp_path, dtype):
-    """Kubric's depth TIFFs decide the dtype and the dump passes it through.
-
-    Anything the producing side emits must load, and must produce the same
-    correspondences, so nothing may hardcode or assert float32.
-    """
-
-    _write_scene(tmp_path, depth_sidecar=True, sidecar_dtype=dtype)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        size=56,
-    )
-
-    assert scene.depth.dtype == torch.float32
-    assert torch.equal(scene.depth[:, 0], scene.depth0)
-    correspondences, _ = build_anchor_correspondences(scene)
-    assert correspondences.trajectory_indices.tolist() == [0, 1, 2]
-    assert correspondences.rows.tolist() == [25, 30, 27]
-    assert correspondences.columns.tolist() == [22, 28, 34]
-
-
-def test_sidecar_disagreeing_with_depth0_is_rejected(tmp_path):
-    scene_path = _write_scene(tmp_path, depth_sidecar=True)
-    with np.load(scene_path / "depth_full.npz") as sidecar:
-        depth = np.array(sidecar["depth"])
-    depth[0, 0, 0, 5, 5] += 1.0
-    np.savez_compressed(scene_path / "depth_full.npz", depth=depth, seq_name="0000")
-
-    with pytest.raises(ValueError, match="different dumps"):
-        load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
-            cameras=(0, 1),
-            times=(0, 1, 2, 3),
-            size=56,
-        )
-
-
-def test_sidecar_shape_mismatch_is_rejected(tmp_path):
-    scene_path = _write_scene(tmp_path, depth_sidecar=True)
-    with np.load(scene_path / "depth_full.npz") as sidecar:
-        depth = np.array(sidecar["depth"])
-    np.savez_compressed(
-        scene_path / "depth_full.npz",
-        depth=depth[:, :2],
-        seq_name="0000",
-    )
+def test_per_frame_depth_shape_mismatch_is_rejected():
+    arrays = scene_arrays()
+    arrays["depth"] = arrays["depth"][:, :2]
 
     with pytest.raises(ValueError, match="views x .* frames"):
-        load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
-            cameras=(0, 1),
-            times=(0, 1, 2, 3),
-            size=56,
-        )
+        build_scene(**arrays, cameras=(0, 1), times=(0, 1, 2, 3), size=56)
 
 
-def test_view_ids_resolve_anchor_cameras(tmp_path):
-    """``--cameras`` and anchors speak original camera ids, not view positions.
+def test_view_ids_resolve_anchor_cameras():
+    """Cameras and anchors speak original camera ids, not view positions.
 
-    Dumps are taken with an ascending, complete view list so the two coincide
-    today. Resolving through the recorded ``view_ids`` is what stops that
-    convention from being load-bearing.
+    The two coincide only for an ascending, complete view list. Resolving
+    through the recorded ``view_ids`` is what stops that convention from being
+    load-bearing.
     """
 
-    _write_scene(tmp_path, view_ids=[4, 7], depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        view_ids=[4, 7],
         cameras=(4, 7),
         times=(0, 1, 2, 3),
         query_anchors=((7, 0),),
@@ -4588,9 +3198,8 @@ def test_view_ids_resolve_anchor_cameras(tmp_path):
     assert scene.query_observation_slot == 4
 
     with pytest.raises(ValueError, match="not among the dumped cameras"):
-        load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
+        fixture_scene(
+            view_ids=[4, 7],
             cameras=(0, 1),
             times=(0, 1),
             size=56,
@@ -4602,13 +3211,11 @@ def test_view_ids_resolve_anchor_cameras(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_nonzero_query_time_anchor_supervises_with_the_sidecar(tmp_path):
+def test_nonzero_query_time_anchor_supervises_from_its_own_frame():
     """A query that starts at t=2 is anchored at t=2, not discarded."""
 
-    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        query_times=[2, 2, 2],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 2),),
@@ -4629,12 +3236,11 @@ def test_nonzero_query_time_anchor_supervises_with_the_sidecar(tmp_path):
     assert list(zip(correspondences.rows.tolist(), correspondences.columns.tolist())) == expected
 
     # The same window anchored at t=0 reaches nothing: the queries are not at
-    # frame 0, which is exactly the loss the sidecar exists to recover. That is
+    # frame 0, which is exactly the loss per-frame depth recovers. That is
     # reported as an empty set with a split explaining it, not raised -- an
     # anchor set buying nothing is the case most worth measuring.
-    at_time_zero = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    at_time_zero = fixture_scene(
+        query_times=[2, 2, 2],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0),),
@@ -4646,26 +3252,8 @@ def test_nonzero_query_time_anchor_supervises_with_the_sidecar(tmp_path):
     assert empty_report["rejected"]["query_time_mismatch"] == 3
 
 
-def test_nonzero_query_time_needs_the_sidecar(tmp_path):
-    _write_scene(tmp_path, query_times=[2, 2, 2])
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        query_anchors=((0, 2),),
-        size=56,
-    )
-
-    with pytest.raises(ValueError, match="RCMV_DUMP_DEPTH=1"):
-        build_anchor_correspondences(scene)
-
-
-def test_nonzero_query_camera_anchor_uses_its_own_depth(tmp_path):
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_nonzero_query_camera_anchor_uses_its_own_depth():
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((1, 0),),
@@ -4682,7 +3270,7 @@ def test_nonzero_query_camera_anchor_uses_its_own_depth(tmp_path):
     assert scene.query_observation_slot == 4
 
 
-def test_a_query_visible_from_two_anchors_yields_one_row(tmp_path):
+def test_a_query_visible_from_two_anchors_yields_one_row():
     """One row per trajectory, whichever anchor wins it.
 
     Both anchors here can see every query, so under a per-(query, anchor) rule
@@ -4692,10 +3280,7 @@ def test_a_query_visible_from_two_anchors_yields_one_row(tmp_path):
     anchor supervises each query and the totals stay balanced.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -4721,7 +3306,7 @@ def test_a_query_visible_from_two_anchors_yields_one_row(tmp_path):
     assert sum(anchor["sole_anchor"] for anchor in report["per_anchor"]) == 0
 
 
-def test_best_fitting_anchor_wins_over_an_earlier_worse_one(tmp_path):
+def test_best_fitting_anchor_wins_over_an_earlier_worse_one():
     """Selection is by fit, not by declaration order.
 
     Anchor 0 is declared first but its depth map is nudged off the query's
@@ -4730,10 +3315,7 @@ def test_best_fitting_anchor_wins_over_an_earlier_worse_one(tmp_path):
     what distinguishes best-fit from first-eligible.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -4756,25 +3338,22 @@ def test_best_fitting_anchor_wins_over_an_earlier_worse_one(tmp_path):
     assert report["per_anchor"][1]["assigned"] == 3
 
 
-def test_second_anchor_recovers_a_query_the_first_cannot(tmp_path):
+def test_second_anchor_recovers_a_query_the_first_cannot():
     """The occlusion recovery, measured.
 
     Track 1 is invisible in camera 0 at t=0, so no camera-0 anchor can reach
     it -- its pixel there belongs to whatever occludes it. Camera 1 sees it.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
-    single = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    single = fixture_scene(
+        invisible=[(0, 0, 1)],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0),),
         size=56,
     )
-    both = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    both = fixture_scene(
+        invisible=[(0, 0, 1)],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -4797,19 +3376,13 @@ def test_second_anchor_recovers_a_query_the_first_cannot(tmp_path):
     assert both_report["per_anchor"][1]["rejected"]["not_visible_in_anchor"] == 0
 
 
-def test_eligibility_split_is_exclusive_and_exhaustive(tmp_path):
+def test_eligibility_split_is_exclusive_and_exhaustive():
     """Every query is accounted for exactly once, whatever the anchor set."""
 
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
-        query_times=[0, 2, 2],
-        invisible=[(0, 0, 0)],
-    )
     for anchors in (((0, 0),), ((0, 0), (1, 0)), ((0, 0), (1, 0), (0, 2))):
-        scene = load_dumped_kubric_scene(
-            tmp_path,
-            "0000",
+        scene = fixture_scene(
+            query_times=[0, 2, 2],
+            invisible=[(0, 0, 0)],
             cameras=(0, 1),
             times=(0, 1, 2, 3),
             query_anchors=anchors,
@@ -4821,13 +3394,11 @@ def test_eligibility_split_is_exclusive_and_exhaustive(tmp_path):
         assert accounted == report["total_query_count"] == 3
 
 
-def test_anchor_depth_gate_still_rejects_at_a_nonzero_time(tmp_path):
+def test_anchor_depth_gate_still_rejects_at_a_nonzero_time():
     """The 10 cm gate is unchanged, and applies to per-frame depth too."""
 
-    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
+        query_times=[2, 2, 2],
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 2),),
@@ -4847,13 +3418,10 @@ def test_anchor_depth_gate_still_rejects_at_a_nonzero_time(tmp_path):
     assert report["rejected"]["anchor_depth_gate"] == 1
 
 
-def test_out_of_bounds_projection_is_rejected(tmp_path):
+def test_out_of_bounds_projection_is_rejected():
     """A query projecting outside the crop is counted, not silently kept."""
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
@@ -4870,11 +3438,8 @@ def test_out_of_bounds_projection_is_rejected(tmp_path):
     assert report["eligible_query_count"] == 2
 
 
-def test_select_query_slot_slices_and_rebases(tmp_path):
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+def test_select_query_slot_slices_and_rebases():
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -4898,19 +3463,13 @@ def test_select_query_slot_slices_and_rebases(tmp_path):
         correspondences.select_query_slot(-1)
 
 
-def test_anchor_sample_counts_come_from_the_loss_masking(tmp_path):
+def test_anchor_sample_counts_come_from_the_loss_masking():
     """The per-anchor weights must be the loss's own mask, not a re-derivation."""
 
     # Track 1 is reachable only from camera 1, so each anchor owns rows and the
     # counts cannot both come from the same anchor.
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
+    scene = fixture_scene(
         invisible=[(1, 2, 0), (0, 0, 1)],
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -4918,7 +3477,7 @@ def test_anchor_sample_counts_come_from_the_loss_masking(tmp_path):
     )
     correspondences, _ = build_anchor_correspondences(scene)
 
-    counts = overfit_cli._anchor_sample_counts(scene, correspondences, 2)
+    counts = anchor_sample_counts(scene, correspondences, 2)
 
     for anchor_index, count in enumerate(counts):
         anchor = correspondences.select_query_slot(anchor_index)
@@ -4988,7 +3547,7 @@ def test_graph_cut_accumulation_equals_one_combined_backward():
     cut_model = _CutToy()
     cut_model.load_state_dict(combined.state_dict())
     feats = cut_model.encode(inputs)
-    cut_feats, pairs = overfit_cli._cut_features(feats)
+    cut_feats, pairs = runtime_module.cut_features(feats)
     assert pairs, "the cut must find differentiable taps to detach"
     cut_total = 0.0
     for anchor_index, weight in enumerate(weights):
@@ -5001,7 +3560,7 @@ def test_graph_cut_accumulation_equals_one_combined_backward():
     assert cut_model.encoder.weight.grad is None, (
         "nothing may reach the encoder until the cut is backwarded"
     )
-    overfit_cli._backward_through_cut(pairs)
+    runtime_module.backward_through_cut(pairs)
 
     assert cut_total == pytest.approx(float(total.detach()), rel=1e-6)
     for name, parameter in cut_model.named_parameters():
@@ -5014,13 +3573,13 @@ def test_graph_cut_leaves_untouched_taps_at_zero():
     inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4)
     model = _CutToy()
     feats = model.encode(inputs)
-    cut_feats, pairs = overfit_cli._cut_features(feats)
+    cut_feats, pairs = runtime_module.cut_features(feats)
 
     # Read exactly one tap, so every other leaf keeps grad None.
     model.anchor_loss(cut_feats, 0).backward()
     assert any(leaf.grad is None for _, leaf in pairs)
 
-    overfit_cli._backward_through_cut(pairs)
+    runtime_module.backward_through_cut(pairs)
 
     assert model.encoder.weight.grad is not None
     assert torch.isfinite(model.encoder.weight.grad).all()
@@ -5029,148 +3588,15 @@ def test_graph_cut_leaves_untouched_taps_at_zero():
 def test_graph_cut_passes_non_differentiable_values_through():
     feats = [(torch.ones(2), None, "tap"), 7]
 
-    cut, pairs = overfit_cli._cut_features(feats)
+    cut, pairs = runtime_module.cut_features(feats)
 
     assert pairs == []
     assert cut[0][1] is None and cut[0][2] == "tap" and cut[1] == 7
     # No pairs means nothing to push back; this must be a no-op, not a crash.
-    overfit_cli._backward_through_cut(pairs)
+    runtime_module.backward_through_cut(pairs)
 
 
-# ---------------------------------------------------------------------------
-# CLI surface
-# ---------------------------------------------------------------------------
-
-
-def test_query_anchor_parsing_and_defaults():
-    parser = overfit_cli.build_arg_parser()
-    base = [
-        "--data_root", "data", "--scene", "1",
-        "--cameras", "0", "1",
-        "--times", "0", "2", "6",
-        "--parse_only",
-    ]
-
-    default = parser.parse_args(base)
-    overfit_cli._validate_args(default)
-    assert default.query_anchor is None
-    assert overfit_cli._resolve_query_anchors(default) == ((0, 0),)
-
-    several = parser.parse_args(base + ["--query_anchor", "0:0", "1:0", "0:6"])
-    overfit_cli._validate_args(several)
-    assert overfit_cli._resolve_query_anchors(several) == ((0, 0), (1, 0), (0, 6))
-
-    for flags, message in (
-        (["--query_anchor", "3:0"], "camera 3 is not in --cameras"),
-        (["--query_anchor", "0:1"], "time 1 is not in --times"),
-        (["--query_anchor", "0:0", "0:0"], "listed more than once"),
-        (["--query_anchor", "0"], "CAMERA:TIME"),
-        (["--query_anchor", "0:0:0"], "CAMERA:TIME"),
-        (["--query_anchor", "a:0"], "integers"),
-        (["--query_anchor=-1:0"], "non-negative"),
-    ):
-        args = parser.parse_args(base + flags)
-        with pytest.raises(ValueError, match=message):
-            overfit_cli._validate_args(args)
-
-
-def test_eligibility_only_main_needs_neither_cuda_nor_checkpoint(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    """The recovery must be measurable without a GPU allocation."""
-
-    _write_scene(tmp_path, depth_sidecar=True, invisible=[(0, 0, 1)])
-    output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "overfit_temporal_tracking.py",
-            "--data_root", str(tmp_path),
-            "--scene", "0000",
-            "--cameras", "0", "1",
-            "--times", "0", "1", "2", "3",
-            "--query_anchor", "0:0", "1:0",
-            "--output_dir", str(output_dir),
-            "--eligibility_only",
-        ],
-    )
-    monkeypatch.setattr(
-        torch.cuda,
-        "is_available",
-        lambda: pytest.fail("eligibility-only mode must not inspect CUDA"),
-    )
-    monkeypatch.setattr(
-        Arc,
-        "from_pretrained",
-        lambda *args, **kwargs: pytest.fail(
-            "eligibility-only mode must not load an Arc checkpoint"
-        ),
-    )
-
-    overfit_cli.main()
-
-    printed = capsys.readouterr().out
-    assert "eligible_queries=3/3" in printed
-    # N is stated wherever a count or a share is, so a 512-query benchmark
-    # split can never be read against the training dump's 2048.
-    assert "total_query_count=3" in printed
-    assert "PASS eligibility report" in printed
-
-    written = json.loads((output_dir / "eligibility.json").read_text())
-    assert written["query_anchors"] == [[0, 0], [1, 0]]
-    assert written["time_varying_depth"]["present"] is True
-    report = written["eligibility"]
-    assert report["total_query_count"] == 3
-    assert report["eligible_query_count"] == 3
-    # One row per query, whatever the overlap, so pairs == queries.
-    assert report["supervised_pair_count"] == 3
-    # Camera 1 is the only anchor that can reach the query occluded in camera 0.
-    # Which anchor wins the other two is decided by sub-pixel fit and so depends
-    # on the crop; only the totals and the sole-anchor count are invariant.
-    assert report["per_anchor"][1]["sole_anchor"] == 1
-    assert report["per_anchor"][0]["sole_anchor"] == 0
-    assert sum(anchor["assigned"] for anchor in report["per_anchor"]) == 3
-    assert report["per_anchor"][1]["assigned"] >= 1
-    assert report["assignment_rule"] == ELIGIBILITY_ASSIGNMENT_RULE
-    assert report["rollup_rule"] == ELIGIBILITY_ROLLUP_RULE
-
-
-def test_run_summary_includes_the_anchor_and_eligibility_fields():
-    source = Path(overfit_cli.__file__).read_text()
-    written = None
-    for node in ast.walk(ast.parse(source)):
-        if (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name) and target.id == "summary"
-                for target in node.targets
-            )
-            and isinstance(node.value, ast.Dict)
-        ):
-            written = {key.value for key in node.value.keys}
-    assert written is not None, "could not find the run_summary dict literal"
-
-    assert {
-        "query_anchors",
-        "query_anchor_slots",
-        "anchor_count",
-        "anchor_sample_counts",
-        "anchor_weights",
-        "eligibility",
-        "view_ids",
-        "time_varying_depth",
-    } <= written
-    # The pre-existing keys keep their meaning; add-only, with one exception:
-    # `active_anchor_count` went because a zero in `anchor_sample_counts` above
-    # says it and names the anchor. No script in any repo read the key.
-    assert "active_anchor_count" not in written
-    assert _BASELINE_RUN_SUMMARY_FIELDS <= written
-
-
-def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
+def test_per_anchor_weighted_supervision_equals_one_combined_loss():
     """The training step's arithmetic, pinned against the loss it stands in for.
 
     A multi-anchor step never forms the stacked Q=A loss: it scores one anchor
@@ -5182,14 +3608,8 @@ def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
 
     # (0,0,1) makes track 1 reachable only from camera 1, so both anchors own
     # rows; (1,2,0) puts an occluded target in the mix so the masks differ.
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
+    scene = fixture_scene(
         invisible=[(1, 2, 0), (0, 0, 1)],
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -5197,7 +3617,7 @@ def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
     )
     correspondences, _ = build_anchor_correspondences(scene)
     anchor_slots = scene.anchor_observation_slots
-    counts = overfit_cli._anchor_sample_counts(scene, correspondences, len(anchor_slots))
+    counts = anchor_sample_counts(scene, correspondences, len(anchor_slots))
     assert all(count > 0 for count in counts), "both anchors must own rows"
     weights = [count / sum(counts) for count in counts]
     anchors = _anchors_for(scene, correspondences)
@@ -5241,21 +3661,23 @@ def test_per_anchor_weighted_supervision_equals_one_combined_loss(tmp_path):
             alignment,
             anchors[rows],
         )
-        overfit_cli._weighted_anchor_total(
+        runtime_module.weighted_anchor_total(
             result,
             position_weight=weight,
             confidence_weight=0.0,
             sync_weight=0.0,
             velocity_weight=0.0,
         ).backward()
-        accumulated = overfit_cli._accumulate(accumulated, result.loss, weight)
+        accumulated = runtime_module.accumulate_weighted(
+            accumulated, result.loss, weight
+        )
 
     assert accumulated == pytest.approx(float(combined.loss.detach()), rel=1e-6)
     torch.testing.assert_close(split_field.grad, combined_field.grad, rtol=1e-5, atol=1e-7)
     assert combined.sample_count == sum(counts)
 
 
-def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
+def test_per_anchor_confidence_weighting_equals_one_combined_loss():
     """The confidence term needs its own shares, not the position term's.
 
     It deliberately drops the visibility mask -- occluded samples are where the
@@ -5264,14 +3686,8 @@ def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
     make the multi-anchor objective quietly differ from the stacked-Q one.
     """
 
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
+    scene = fixture_scene(
         invisible=[(1, 2, 0), (0, 1, 2), (0, 0, 1)],
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -5280,10 +3696,10 @@ def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
     correspondences, _ = build_anchor_correspondences(scene)
     anchor_slots = scene.anchor_observation_slots
     anchor_count = len(anchor_slots)
-    position_counts = overfit_cli._anchor_sample_counts(
+    position_counts = anchor_sample_counts(
         scene, correspondences, anchor_count
     )
-    confidence_counts = overfit_cli._anchor_confidence_counts(
+    confidence_counts = runtime_module.anchor_confidence_counts(
         scene, correspondences, anchor_count
     )
     # The two masks really are different sets, or this test proves nothing.
@@ -5339,14 +3755,14 @@ def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
             torch.tensor([slot]),
             anchors[rows],
         )
-        overfit_cli._weighted_anchor_total(
+        runtime_module.weighted_anchor_total(
             result,
             position_weight=position_weights[anchor_index],
             confidence_weight=confidence_weights[anchor_index],
             sync_weight=0.0,
             velocity_weight=0.0,
         ).backward()
-        accumulated = overfit_cli._accumulate(
+        accumulated = runtime_module.accumulate_weighted(
             accumulated,
             result.confidence_loss,
             confidence_weights[anchor_index],
@@ -5360,312 +3776,7 @@ def test_per_anchor_confidence_weighting_equals_one_combined_loss(tmp_path):
     )
 
 
-def test_an_anchor_set_that_reaches_nothing_is_reported_not_raised(
-    tmp_path,
-    monkeypatch,
-    capsys,
-):
-    """The case most worth measuring must not be the one that crashes.
-
-    An anchor set recovering nothing is a finding about the anchor set. The
-    report has to survive it; only training refuses to start, and it says why.
-    """
-
-    _write_scene(tmp_path, depth_sidecar=True, query_times=[2, 2, 2])
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "overfit_temporal_tracking.py",
-            "--data_root", str(tmp_path),
-            "--scene", "0000",
-            "--cameras", "0", "1",
-            "--times", "0", "1", "2", "3",
-            "--query_anchor", "0:0",
-            "--eligibility_only",
-        ],
-    )
-
-    overfit_cli.main()
-
-    printed = capsys.readouterr().out
-    assert "eligible_queries=0/3" in printed
-    assert "rejected.query_time_mismatch=3/3" in printed
-    assert "accounted=3/3" in printed
-    assert "PASS eligibility report" in printed
-
-
-# --------------------------------------------- the summary write, end to end ---
-
-
-class _SummaryPathPretrained(nn.Module):
-    """``backbone.pretrained``: the handles main() reaches through by name."""
-
-    def __init__(self, max_time_indices: int) -> None:
-        super().__init__()
-        self.has_time_token = True
-        self.checkpoint_local_attention = False
-        self.time_token = nn.Parameter(
-            torch.ones(1, 1, runtime_module.TIME_EMBEDDING_DIM)
-        )
-        self.time_index_embedding = nn.Embedding(
-            max_time_indices, runtime_module.TIME_EMBEDDING_DIM
-        )
-        self.frozen_backbone_weight = nn.Parameter(torch.ones(1))
-        # The released checkpoint zero-fills the table; main() re-seeds it and
-        # then gates on the table having moved, so it must start where the real
-        # constructor leaves it.
-        nn.init.zeros_(self.time_index_embedding.weight)
-
-    # The production re-seeder, bound rather than reimplemented. main() calls it
-    # between the freeze and the step-0 snapshot, and a stub would let the
-    # embedding-moved gate score against a table this file invented.
-    reinitialize_time_index_embedding = (
-        DinoVisionTransformer.reinitialize_time_index_embedding
-    )
-
-
-class _SummaryPathBackbone(nn.Module):
-    """Tap tuples shaped as ``temporal_injection_report`` reads them."""
-
-    def __init__(self, max_time_indices: int) -> None:
-        super().__init__()
-        self.pretrained = _SummaryPathPretrained(max_time_indices)
-
-    def forward(self, images, ref_view_strategy="first", time_indices=None):
-        batch, observations = images.shape[:2]
-        dim = runtime_module.TIME_EMBEDDING_DIM
-        # Non-zero, so the report's relative-change denominators are live rather
-        # than short-circuiting to None on a zero base.
-        base = torch.linspace(0.1, 1.0, dim)
-        patches = base.expand(batch, observations, 4, dim).clone()
-        camera = base.expand(batch, observations, dim).clone()
-        time = self.pretrained.time_token.expand(batch, observations, dim).clone()
-        if time_indices is not None:
-            # The indexed forward really does differ from the unindexed one, and
-            # differs *by index*, which is what the report measures.
-            offsets = self.pretrained.time_index_embedding(time_indices)
-            time = time + offsets
-            patches = patches + offsets[:, :, None, :]
-        return [(patches, camera, time)], None
-
-
-class _SummaryPathArc(Arc):
-    """A real Arc whose ViT-G-sized pieces are stubs.
-
-    Subclassing rather than faking wholesale so ``set_freeze``,
-    ``set_encoder_local_checkpointing``, ``_preprocess_input`` and ``freeze``
-    are the production implementations -- the freeze mask main() saves the patch
-    from is real, and only the three forward pieces that would need 314M
-    parameters are replaced.
-    """
-
-    def __init__(self, observations, height, width, *, max_time_indices, freeze_mode):
-        nn.Module.__init__(self)
-        self.observations, self.height, self.width = observations, height, width
-        self.max_time_indices = max_time_indices
-        self._reported_freeze_mode = freeze_mode
-        # main() refuses to re-seed a table that came from the checkpoint.
-        self.consumed_legacy_missing_keys = {runtime_module.TIME_EMBEDDING_KEY}
-        self.backbone = _SummaryPathBackbone(max_time_indices)
-        self.head = nn.Linear(1, 1)
-        self.cam_dec = nn.Linear(1, 1)
-        # The overfit main's production set_freeze (overfit_temporal_tracking
-        # .py:1073) re-freezes motion_decoder.refiner by name; the overfit
-        # itself is untouched, so only the stub changes.
-        self.motion_decoder = _LinearMotionDecoder(1, 1)
-        self.track_head = nn.Linear(1, 1)
-
-    def get_trainable_parameter_report(self):
-        """The counts ``assert_trainable_parameter_set`` expects of ViT-G.
-
-        The one place this stub lies, and it is disclosed rather than patched
-        out: the production assertion still runs, but a 4-linear-layer model
-        cannot satisfy a 231-tensor / 314M-parameter expectation. The freeze
-        mask itself is covered for real in ``tests/test_runtime.py``; what this
-        test is for is everything downstream of that check.
-        """
-
-        report = super().get_trainable_parameter_report()
-        tensors, non_embedding = runtime_module.expected_trainable_set(
-            self._reported_freeze_mode, None
-        )
-        report["tensor_count"] = tensors
-        report["parameter_count"] = (
-            non_embedding + self.max_time_indices * runtime_module.TIME_EMBEDDING_DIM
-        )
-        return report
-
-    def encode_features(
-        self,
-        images,
-        ref_view_strategy="first",
-        time_indices=None,
-        depth_maps=None,
-        camera_vectors=None,
-    ):
-        # Every trainable tensor must take gradient or main()'s own guards fire.
-        return [
-            self.motion_decoder.weight.sum()
-            + self.motion_decoder.bias.sum()
-            + self.track_head.weight.sum()
-            + self.track_head.bias.sum()
-            + self.backbone.pretrained.time_index_embedding.weight.sum()
-        ]
-
-    def reconstruct(self, feats, images):
-        return {
-            "depth": torch.ones(1, self.observations, self.height, self.width),
-            "pose_enc": torch.zeros(1, self.observations, 9),
-        }
-
-    def track_for_query(self, feats, images, query_idx):
-        track = (
-            torch.ones(1, self.observations, self.height, self.width, 3) * feats[0]
-        )
-        # Strictly > 1 and varying, mirroring `expp1`: a flat channel would make
-        # the confidence stats degenerate. Independent of feats, so confidence
-        # stays out of the autograd graph the gradient norms are read from.
-        pixels = torch.arange(self.height * self.width, dtype=torch.float32)
-        confidence = 1.0 + 100.0 * (query_idx + pixels / pixels.numel())
-        confidence = (
-            confidence.reshape(1, 1, self.height, self.width)
-            .expand(1, self.observations, self.height, self.width)
-            .contiguous()
-        )
-        return track, confidence
-
-    def forward(self, views, force_no_output_conversion=False):
-        images, track_query_idx, time_indices, _, _ = self._preprocess_input(views)
-        feats = self.encode_features(images, time_indices=time_indices)
-        output = self.reconstruct(feats, images)
-        query_slots = [
-            int(value)
-            for value in torch.as_tensor(track_query_idx).flatten().tolist()
-        ]
-        tracks, confidences = zip(
-            *(self.track_for_query(feats, images, slot) for slot in query_slots)
-        )
-        output["track_multi"] = torch.stack(tracks, dim=1)
-        output["conf_track_multi"] = torch.stack(confidences, dim=1)
-        output["track_query_idx"] = torch.tensor(query_slots, dtype=torch.long)
-        return output
-
-
-def test_main_writes_a_run_summary_carrying_the_velocity_trio(tmp_path, monkeypatch):
-    """The test that would have caught the run_summary UnboundLocalError.
-
-    ``main()`` read ``baseline_result`` and ``initial_result`` inside the summary
-    dict literal after both had been ``del``-ed, so every run crashed at line
-    1638 -- after training, after saving temporal_tracking.pt, and before
-    run_summary.json. 492 tests passed against that: the three summary tests
-    above AST-parse the literal for key *presence* and never evaluate a value,
-    which is exactly the check an unbound name is invisible to.
-
-    So this executes the write. Three production seams, each a real gap in what
-    the test covers rather than scaffolding:
-
-      * ``_resolve_device``  -- the CUDA gate; without it main() exits at the top
-      * ``Arc.from_pretrained`` -- patched on the *class*, because main() imports
-        Arc function-locally and there is no module global to reach
-      * ``_predicted_pointmaps`` -- hands fit_scene_sim3 the scene's own metric
-        pointmap so the alignment is exact; a stub model's real geometry is
-        arbitrary and would make every gate downstream noise
-
-    Asserting the trio is non-None matters as much as asserting it is present:
-    a summary carrying three nulls where measurements belong is the failure
-    mode a name-resolution check cannot see.
-    """
-
-    _write_scene(tmp_path, depth_sidecar=True)
-    # Loaded exactly as main() loads it -- no `size`, so the fixture's 56x56
-    # frames come back at the model's own resolution. A 56x56 lever here would
-    # disagree with the scene main() builds, which is the whole reason the
-    # geometry seam has to be built from the same call.
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
-        cameras=(0, 1),
-        times=(0, 1, 2, 3),
-        query_anchors=((0, 0),),
-    )
-    target, _ = sparse_module._metric_pointmap_at_anchor(
-        scene, scene.query_observation_slot
-    )
-    pointmaps = (
-        torch.from_numpy(target)
-        .float()
-        .expand(1, scene.num_observations, *target.shape)
-        .contiguous()
-    )
-    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
-
-    height, width = scene.views[0]["img"].shape[-2:]
-    model = _SummaryPathArc(
-        scene.num_observations,
-        height,
-        width,
-        max_time_indices=32,
-        freeze_mode="temporal_tracking",
-    )
-    monkeypatch.setattr(Arc, "from_pretrained", lambda *args, **kwargs: model)
-    monkeypatch.setattr(
-        overfit_cli, "_resolve_device", lambda parser: torch.device("cpu")
-    )
-
-    output_dir = tmp_path / "out"
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "overfit_temporal_tracking.py",
-            "--data_root", str(tmp_path),
-            "--scene", "0000",
-            "--cameras", "0", "1",
-            "--times", "0", "1", "2", "3",
-            "--query_anchor", "0:0",
-            "--checkpoint_dir", str(tmp_path / "ckpt"),
-            "--output_dir", str(output_dir),
-            "--steps", "2",
-            # 32 makes _autocast_context a nullcontext, which is what keeps this
-            # off the CUDA autocast without touching the shared runtime helper.
-            "--precision", "32",
-        ],
-    )
-
-    try:
-        overfit_cli.main()
-    except SystemExit as exit_request:
-        # Two steps of a stub model are not expected to clear the improvement
-        # gates. main() writes the summary before it exits on them, and the
-        # summary is the whole point here.
-        assert exit_request.code == 1
-
-    written = json.loads((output_dir / "run_summary.json").read_text())
-
-    # The trio the crash was in. Measured whatever --velocity_weight is, which
-    # is why a run that never trains the term still has to record all three.
-    for key in (
-        "baseline_velocity_consistency",
-        "initial_velocity_consistency",
-        "final_velocity_consistency",
-    ):
-        stats = written[key]
-        assert stats is not None, f"{key} is null; the term was not measured"
-        assert set(stats) == {
-            "pair_count", "sample_count", "mean_m", "median_m", "p90_m"
-        }, key
-        assert stats["sample_count"] > 0, key
-
-    assert written["velocity_weight"] == 0.0
-    # And the file round-tripped through json, which is the other thing an AST
-    # key check cannot do: every value in that literal is bound AND serializable.
-    assert written["success"] in (True, False)
-    assert written["gpu_name"] is None
-    assert written["peak_gpu_memory_bytes"] == 0
-
-
-def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences(tmp_path):
+def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences():
     """``query_slots`` mean the anchor list to the gather, Q to the loss.
 
     ``select_query_slot`` rebases to 0 for the loss, so a rebased set handed to
@@ -5674,10 +3785,7 @@ def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences(tmp_path)
     this pins that it selects the same rows in the same order.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -5706,7 +3814,7 @@ def test_anchor_rows_pairs_the_gather_with_the_rebased_correspondences(tmp_path)
         correspondences.anchor_rows(-1)
 
 
-def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
+def test_per_anchor_sync_weighting_equals_one_combined_loss():
     """The sync term decomposes over anchors at 1/A, and that was unpinned.
 
     ``synchronized_consistency_loss`` reduces with ``reduction="mean"`` spanning
@@ -5715,14 +3823,8 @@ def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
     on that; the other two equivalence tests both run at sync_weight=0.
     """
 
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
+    scene = fixture_scene(
         invisible=[(1, 2, 0), (0, 0, 1)],
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -5769,14 +3871,14 @@ def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
             torch.tensor([slot]),
             anchors[rows],
         )
-        overfit_cli._weighted_anchor_total(
+        runtime_module.weighted_anchor_total(
             result,
             position_weight=0.0,
             confidence_weight=0.0,
             sync_weight=1.0 / anchor_count,
             velocity_weight=0.0,
         ).backward()
-        accumulated = overfit_cli._accumulate(
+        accumulated = runtime_module.accumulate_weighted(
             accumulated,
             result.sync_loss,
             1.0 / anchor_count,
@@ -5788,7 +3890,7 @@ def test_per_anchor_sync_weighting_equals_one_combined_loss(tmp_path):
     )
 
 
-def test_per_anchor_velocity_weighting_equals_one_combined_loss(tmp_path):
+def test_per_anchor_velocity_weighting_equals_one_combined_loss():
     """The claim the sample-share rests on, pinned on values and gradients.
 
     ``velocity_consistency_loss`` reduces with ``reduction="mean"`` over its
@@ -5799,14 +3901,8 @@ def test_per_anchor_velocity_weighting_equals_one_combined_loss(tmp_path):
     the fixture's invisible samples make the per-anchor pair counts differ.
     """
 
-    _write_scene(
-        tmp_path,
-        depth_sidecar=True,
+    scene = fixture_scene(
         invisible=[(1, 2, 0), (0, 0, 1)],
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -5864,14 +3960,14 @@ def test_per_anchor_velocity_weighting_equals_one_combined_loss(tmp_path):
         # The counts computed from the scene alone must be exactly what the
         # loss reduced over -- nothing in them reads a prediction.
         assert result.velocity_pair_count == counts[anchor_index]
-        overfit_cli._weighted_anchor_total(
+        runtime_module.weighted_anchor_total(
             result,
             position_weight=0.0,
             confidence_weight=0.0,
             sync_weight=0.0,
             velocity_weight=shares[anchor_index],
         ).backward()
-        accumulated = overfit_cli._accumulate(
+        accumulated = runtime_module.accumulate_weighted(
             accumulated,
             result.velocity_loss,
             shares[anchor_index],
@@ -5889,7 +3985,6 @@ def test_per_anchor_velocity_weighting_equals_one_combined_loss(tmp_path):
 @pytest.mark.parametrize("sync_weight", [0.0, 0.5])
 @pytest.mark.parametrize("velocity_weight", [0.0, 0.25])
 def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
-    tmp_path,
     confidence_weight,
     sync_weight,
     velocity_weight,
@@ -5904,10 +3999,7 @@ def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
     must also agree on the order of their terms.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
@@ -5928,7 +4020,7 @@ def test_single_anchor_total_is_bit_identical_to_the_unsplit_loss(
         velocity_weight=velocity_weight,
     )
 
-    combined = overfit_cli._weighted_anchor_total(
+    combined = runtime_module.weighted_anchor_total(
         result,
         position_weight=1.0,
         confidence_weight=confidence_weight,
@@ -5951,10 +4043,10 @@ def test_single_anchor_step_bypasses_the_cut_without_changing_gradients():
 
     cut_model = _CutToy()
     feats = cut_model.encode(inputs)
-    cut_feats, pairs = overfit_cli._cut_features(feats)
+    cut_feats, pairs = runtime_module.cut_features(feats)
     assert pairs
     cut_model.anchor_loss(cut_feats, 0).backward()
-    overfit_cli._backward_through_cut(pairs)
+    runtime_module.backward_through_cut(pairs)
     through_cut = {
         name: parameter.grad.clone()
         for name, parameter in cut_model.named_parameters()
@@ -5967,7 +4059,7 @@ def test_single_anchor_step_bypasses_the_cut_without_changing_gradients():
     bypass_feats, bypass_pairs = feats, []
     assert bypass_pairs == []
     direct_model.anchor_loss(bypass_feats, 0).backward()
-    overfit_cli._backward_through_cut(bypass_pairs)
+    runtime_module.backward_through_cut(bypass_pairs)
 
     assert {
         name for name, p in direct_model.named_parameters() if p.grad is not None
@@ -5976,10 +4068,7 @@ def test_single_anchor_step_bypasses_the_cut_without_changing_gradients():
         torch.testing.assert_close(parameter.grad, through_cut[name], msg=name)
 
 
-def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
-    tmp_path,
-    monkeypatch,
-):
+def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(monkeypatch):
     """Term order is load-bearing, because float addition is not associative.
 
     ``compose_tracking_loss`` sums in dict insertion order, so a single-anchor
@@ -5991,10 +4080,7 @@ def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
     the hazard stayed.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
@@ -6010,8 +4096,7 @@ def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
 
     monkeypatch.setattr(sparse_module, "compose_tracking_loss", recording_compose)
     # The helper lives in arc.training.runtime and resolves compose_tracking_loss
-    # from ITS module globals; patching the overfit module would intercept
-    # nothing since the move.
+    # from ITS module globals, so that is where it is patched.
     monkeypatch.setattr(runtime_module, "compose_tracking_loss", recording_compose)
 
     result = sparse_tracking_loss(
@@ -6025,7 +4110,7 @@ def test_weighted_anchor_total_sums_in_the_loss_s_own_term_order(
         sync_weight=0.5,
         velocity_weight=0.25,
     )
-    overfit_cli._weighted_anchor_total(
+    runtime_module.weighted_anchor_total(
         result,
         position_weight=1.0,
         confidence_weight=0.75,
@@ -6054,7 +4139,7 @@ def test_negative_stage_would_mislabel_which_is_why_the_rollup_guards_it():
     assert ELIGIBILITY_REJECTION_STAGES[-1] == "pixel_dedup"
 
 
-def test_report_records_the_label_quality_each_anchor_won(tmp_path):
+def test_report_records_the_label_quality_each_anchor_won():
     """Best-fit's justification, made visible without a training run.
 
     The rule exists because the surviving label is the least noisy one. Counts
@@ -6062,10 +4147,7 @@ def test_report_records_the_label_quality_each_anchor_won(tmp_path):
     it won and how much it beat the runner-up where there was one.
     """
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         query_anchors=((0, 0), (1, 0)),
@@ -6099,13 +4181,10 @@ def test_report_records_the_label_quality_each_anchor_won(tmp_path):
     assert winner["sole_anchor"] == 0
 
 
-def test_uncontested_wins_report_a_zero_contested_count(tmp_path):
+def test_uncontested_wins_report_a_zero_contested_count():
     """No runner-up anywhere must read as 'uncontested', not as missing data."""
 
-    _write_scene(tmp_path, depth_sidecar=True)
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 1, 2, 3),
         size=56,
@@ -6159,7 +4238,7 @@ def test_camera_major_layout_proves_the_grid(dumped_scene):
         camera_major_layout(dataclasses.replace(dumped_scene, cameras=(0,)))
 
 
-def test_camera_major_layout_handles_non_contiguous_times(dumped_scene, tmp_path):
+def test_camera_major_layout_handles_non_contiguous_times(dumped_scene):
     """slot_times repeats scene.times verbatim, not an arithmetic guess.
 
     A stride-2 window's times are (0, 2, ...) while slot_time_indices stays
@@ -6167,9 +4246,7 @@ def test_camera_major_layout_handles_non_contiguous_times(dumped_scene, tmp_path
     window or, worse, accept a tampered one.
     """
 
-    scene = load_dumped_kubric_scene(
-        tmp_path,
-        "0000",
+    scene = fixture_scene(
         cameras=(0, 1),
         times=(0, 2, 3),
         size=56,
@@ -6177,7 +4254,7 @@ def test_camera_major_layout_handles_non_contiguous_times(dumped_scene, tmp_path
     assert camera_major_layout(scene) == (2, 3)
 
 
-def test_sparse_targets_per_time_reduces_visibility_with_any(dumped_scene, tmp_path):
+def test_sparse_targets_per_time_reduces_visibility_with_any(dumped_scene):
     """Occluded in one camera of two is still visible merged; in both, not.
 
     This is gt_vis_any's convention, and the merged loss masks on it -- a
@@ -6186,13 +4263,12 @@ def test_sparse_targets_per_time_reduces_visibility_with_any(dumped_scene, tmp_p
     sample the other camera still sees.
     """
 
-    _write_scene(
-        tmp_path,
+    scene = fixture_scene(
         scene_name="occl",
         invisible=((0, 2, 2),),
-    )
-    scene = load_dumped_kubric_scene(
-        tmp_path, "occl", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
     )
     correspondences, _ = build_anchor_correspondences(scene)
     positions, visible, finite, mask = sparse_targets(scene, correspondences)
@@ -6212,13 +4288,12 @@ def test_sparse_targets_per_time_reduces_visibility_with_any(dumped_scene, tmp_p
     assert visible[row, 1 * 4 + 2]
     assert merged[1][row, 2]
 
-    _write_scene(
-        tmp_path,
+    both = fixture_scene(
         scene_name="occl2",
         invisible=((0, 2, 2), (1, 2, 2)),
-    )
-    both = load_dumped_kubric_scene(
-        tmp_path, "occl2", cameras=(0, 1), times=(0, 1, 2, 3), size=56
+        cameras=(0, 1),
+        times=(0, 1, 2, 3),
+        size=56,
     )
     both_correspondences, _ = build_anchor_correspondences(both)
     both_merged = sparse_targets_per_time(both, both_correspondences)
