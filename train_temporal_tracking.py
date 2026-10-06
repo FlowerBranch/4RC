@@ -1143,12 +1143,28 @@ def evaluate_held_out(
     forward, and the shuffled arm's
     right after its forward, and an eval that lands inside an accumulation
     window is folded into that window's ``peak_bytes`` (see StepOutcome).
+
+    Two readouts ride every scored scene, because every arm is judged on them.
+    ``drift`` is the plain arm's full ``reconstruction_drift_report`` against
+    the scene's own fitted Sim(3): the camera baseline, ``base_ratio`` per
+    anchor, and depth at time 0. ``anchor_error_m`` is the metric distance from
+    the MODEL's own query anchor to the tracked point's true position, per
+    anchor -- under either eval-only diagnostic the scored anchor is ground
+    truth, so the model's is gathered again with both flags off, and the
+    readout reads the same whatever flag is set. Both are keyed by absolute
+    ``camera:time``, not by the ``VIEWSLOT:TIMESLOT`` strings in
+    ``query_anchors``, and pooled over the scored scenes into the run-level
+    keys of :func:`_readout_aggregates`. Neither draws randomness, and every
+    other figure, ``history.jsonl`` and the written bundles are untouched by
+    them.
     """
 
     from arc.training import (
         build_anchor_correspondences,
         fit_scene_sim3,
         gather_query_anchor_points,
+        query_anchor_errors,
+        reconstruction_drift_report,
         sparse_tracking_loss,
     )
     from arc.training.predictions import reference_tau, write_scene_predictions
@@ -1158,6 +1174,9 @@ def evaluate_held_out(
     modes = {name: module.training for name, module in model.named_modules()}
     directory = Path(output_dir) / "eval" / f"step-{step}"
     per_scene: list[dict] = []
+    # Each scored scene's per-row anchor errors, beside per_scene, for the
+    # pooled statistics: a median does not pool from per-scene medians.
+    scene_anchor_errors: list[dict] = []
     skipped: list[dict] = []
     # Summed over the step's written bundles. `expp1` is 1+exp(x) and overflows to
     # inf in BF16, and a non-finite confidence is reported occluded -- so this is
@@ -1205,12 +1224,30 @@ def evaluate_held_out(
             with torch.no_grad(), autocast_context(precision):
                 raw = model(scene.views, force_no_output_conversion=True, **forward_kwargs)
                 alignment, alignment_report = fit_scene_sim3(raw, scene)
+                # The camera baseline every arm is judged on, from this plain
+                # arm alone: the shuffled arm below is a control on the time
+                # conditioning, not the model being measured. Reads only depth
+                # and pose_enc, against the alignment fitted just above.
+                drift = reconstruction_drift_report(raw, scene, alignment)
                 anchors, anchor_frame = gather_query_anchor_points(
                     raw,
                     scene,
                     correspondences,
                     oracle_query_anchor=oracle_query_anchor,
                     ground_truth_query_anchor=ground_truth_query_anchor,
+                )
+                # The anchor error describes the model's OWN anchor whatever
+                # anchored the scored tracks. A "world" frame means an
+                # eval-only diagnostic replaced it with ground truth, so the
+                # model's is gathered again with both flags off; otherwise the
+                # scored anchor is the model's and is reused.
+                model_anchors = (
+                    anchors
+                    if anchor_frame == "model"
+                    else gather_query_anchor_points(raw, scene, correspondences)[0]
+                )
+                anchor_errors = query_anchor_errors(
+                    model_anchors, scene, correspondences, alignment
                 )
                 result = sparse_tracking_loss(
                     tracking_only(raw),
@@ -1375,7 +1412,14 @@ def evaluate_held_out(
                     write_scene_predictions(
                         directory / "pred" / f"{plan.seq_name}.npz", arrays
                     )
+                # Last, so every field above keeps its position in the entry.
+                entry["drift"] = drift
+                entry["anchor_error_m"] = {
+                    key: _distance_summary(errors)
+                    for key, errors in anchor_errors.items()
+                }
             per_scene.append(entry)
+            scene_anchor_errors.append(anchor_errors)
             del raw, scene
     finally:
         restore_rng_state(rng)
@@ -1470,10 +1514,133 @@ def evaluate_held_out(
         # reducing over per_scene alone, would otherwise conflate.
         "skipped_scenes": skipped,
         "per_scene": per_scene,
+        # The camera-baseline and anchor-error readouts pooled over the scored
+        # scenes; after per_scene so every key above keeps its position.
+        **_readout_aggregates(per_scene, scene_anchor_errors),
     }
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
     return metrics
+
+
+def _distance_summary(values) -> dict:
+    """``{median, mean, p90, count}`` over per-row distances in metres.
+
+    Over no rows the three statistics are None and ``count`` is 0, so every
+    anchor carries the same four fields and the zero says why the numbers are
+    absent. A NaN row makes all three NaN rather than dropping out, so a broken
+    anchor cannot hide inside a median. ``p90`` is ``np.percentile(..., 90.0)``,
+    as the drift report's depth p90 is.
+    """
+
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return {"median": None, "mean": None, "p90": None, "count": 0}
+    return {
+        "median": float(np.median(values)),
+        "mean": float(np.mean(values)),
+        "p90": float(np.percentile(values, 90.0)),
+        "count": int(values.size),
+    }
+
+
+def _readout_aggregates(per_scene: list[dict], scene_anchor_errors: list[dict]) -> dict:
+    """The run-level camera-baseline and anchor-error readouts, over scored scenes.
+
+    ``per_scene`` entries carry each scene's ``drift`` and ``alignment_scale``;
+    ``scene_anchor_errors`` holds the same scenes' per-row anchor errors, in
+    the same order and keyed ``camera:time`` like ``drift["base_ratio"]``, kept
+    out of the entries because a median does not pool from per-scene medians.
+
+    * ``anchor_error_m``: ``{median, mean, p90, count}`` over every row of
+      every scene; ``anchor_error_m_by_camera`` the same per anchor camera.
+    * ``base_ratio``: ``{median, count}`` over every scene-anchor ratio there
+      is; ``base_ratio_by_camera`` the median per camera, None for a camera
+      that never had one -- the reference camera above all.
+    * ``alignment_scale_over_baseline_scale``: the median over scenes of the
+      pointmap-fitted scale over the camera-fitted one. It reads in
+      base_ratio's direction -- below 1 the predicted baseline is short --
+      pooled over every cross-camera slot instead of the anchors alone. A scene
+      whose ``baseline_scale`` is None or exactly 0.0 has no reciprocal and is
+      skipped; its own ``drift`` still shows the value.
+    * ``relative_rotation_deg`` and ``relative_center_error_m``: the mean over
+      scenes of each figure's ``cross_camera`` mean, the anchor-referenced pose
+      error between cameras.
+
+    Every one is None when no scene contributed to it -- none scored, or none
+    had the figure -- on ``position_loss``'s convention: a zero would read as
+    a measurement. Per-camera dicts list cameras in first-seen order, which is
+    spec order. Nothing here draws randomness: this runs after the eval has
+    restored the RNG streams.
+    """
+
+    rows_by_camera: dict[str, list[np.ndarray]] = {}
+    for anchor_errors in scene_anchor_errors:
+        for key, errors in anchor_errors.items():
+            rows_by_camera.setdefault(key.partition(":")[0], []).append(errors)
+    has_rows = any(errors.size for rows in rows_by_camera.values() for errors in rows)
+
+    ratios_by_camera: dict[str, list[float]] = {}
+    for entry in per_scene:
+        for key, ratio in entry["drift"]["base_ratio"].items():
+            ratios = ratios_by_camera.setdefault(key.partition(":")[0], [])
+            if ratio is not None:
+                ratios.append(ratio)
+    pooled_ratios = [ratio for ratios in ratios_by_camera.values() for ratio in ratios]
+
+    poses = [(entry["alignment_scale"], entry["drift"]["pose"]) for entry in per_scene]
+    scale_ratios = [
+        alignment_scale / pose["baseline_scale"]
+        for alignment_scale, pose in poses
+        if pose["baseline_scale"] is not None and pose["baseline_scale"] != 0.0
+    ]
+    rotations = [
+        pose["relative_rotation_deg"]["cross_camera"]["mean"]
+        for _, pose in poses
+        if pose["relative_rotation_deg"]["cross_camera"] is not None
+    ]
+    centers = [
+        pose["relative_center_error_m"]["cross_camera"]["mean"]
+        for _, pose in poses
+        if pose["relative_center_error_m"]["cross_camera"] is not None
+    ]
+    return {
+        "anchor_error_m": (
+            _distance_summary(
+                np.concatenate([e for rows in rows_by_camera.values() for e in rows])
+            )
+            if has_rows
+            else None
+        ),
+        "anchor_error_m_by_camera": (
+            {
+                camera: _distance_summary(np.concatenate(rows))
+                for camera, rows in rows_by_camera.items()
+            }
+            if has_rows
+            else None
+        ),
+        "base_ratio": (
+            {"median": float(np.median(pooled_ratios)), "count": len(pooled_ratios)}
+            if pooled_ratios
+            else None
+        ),
+        "base_ratio_by_camera": (
+            {
+                camera: float(np.median(ratios)) if ratios else None
+                for camera, ratios in ratios_by_camera.items()
+            }
+            if pooled_ratios
+            else None
+        ),
+        "alignment_scale_over_baseline_scale": (
+            float(np.median(scale_ratios)) if scale_ratios else None
+        ),
+        "relative_rotation_deg": (
+            sum(rotations) / len(rotations) if rotations else None
+        ),
+        "relative_center_error_m": sum(centers) / len(centers) if centers else None,
+    }
 
 
 def _prediction_arrays(

@@ -52,11 +52,17 @@ from arc.training.schedule import (
 )
 from arc.training.trainer_state import (
     build_trainer_state,
+    capture_rng_state,
     read_trainer_state,
     restore_rng_state,
     save_atomically,
 )
 from test_manifest_plan import _record
+from test_sparse_tracking import (
+    _assert_same_rng_state,
+    _ground_truth_raw_reconstruction,
+    _steered_to,
+)
 from arc.training.manifest_plan import plan_record
 
 
@@ -1507,7 +1513,7 @@ def test_the_headroom_guard_is_inert_without_cuda_and_names_the_step_with_it(mon
 # ------------------------------------------------------ the eval, end to end ---
 
 
-def _cpu_eval_scene(monkeypatch, *, gauge="identity"):
+def _cpu_eval_scene(monkeypatch, *, gauge="identity", **scene_kwargs):
     """A real two-camera window plus a planted alignment, ready for the eval.
 
     Two cameras is required rather than tidy: at one camera
@@ -1524,13 +1530,23 @@ def _cpu_eval_scene(monkeypatch, *, gauge="identity"):
     term, so a t=0 gauge cannot discriminate the points-vs-vectors half of a
     composition bug. 2.25 discriminates; it is not representative of the live
     regime, whose fitted scale medians 18.94 (range 6.87-39.02).
+
+    ``scene_kwargs`` override the window, as ``_step_scene``'s do; the planted
+    pointmap is always the reference anchor's, at every slot.
     """
 
     import arc.training.sparse_tracking as sparse_module
     from scene_fixtures import fixture_scene
 
     scene = fixture_scene(
-        time_count=4, view_count=2, cameras=(0, 1), times=(0, 1, 2, 3), size=56
+        **{
+            "time_count": 4,
+            "view_count": 2,
+            "cameras": (0, 1),
+            "times": (0, 1, 2, 3),
+            "size": 56,
+            **scene_kwargs,
+        }
     )
     target, _ = sparse_module._metric_pointmap_at_anchor(
         scene, scene.query_observation_slot
@@ -1657,7 +1673,7 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
 def test_evaluate_held_out_threads_the_anchor_diagnostics(
     tmp_path, monkeypatch, flag
 ):
-    """Each flag reaches the eval's gather and never train_step's.
+    """Each flag reaches the eval's scoring gather and never train_step's.
 
     Both functions import ``gather_query_anchor_points`` from the package at
     call time, so the package namespace is the one interception point -- the
@@ -1665,16 +1681,20 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
     recorded kwargs AND on the marker it writes, because the marker is what a
     later reader has; train_step is asserted on both kwargs' absence, since a
     step that so much as spelled one would be one keystroke from supervising
-    against ground truth.
+    against ground truth. With a flag on, the eval gathers a second time, bare:
+    the anchor-error readout describes the model's own anchor, which the flag
+    replaced for scoring.
     """
 
     import arc.training as training_package
 
     seen: list[dict] = []
+    raws: list = []
     real_gather = training_package.gather_query_anchor_points
 
     def recording(*args, **kwargs):
         seen.append(dict(kwargs))
+        raws.append(args[0])
         return real_gather(*args, **kwargs)
 
     monkeypatch.setattr(training_package, "gather_query_anchor_points", recording)
@@ -1689,6 +1709,7 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
         if flag == "oracle_query_anchor"
         else "oracle_query_anchor"
     )
+    expected: list[dict] = []
     for step, enabled in ((1, True), (2, False)):
         metrics = train_cli.evaluate_held_out(
             model=model,
@@ -1702,15 +1723,25 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
             confidence_alpha=_EVAL_ALPHA,
             **{flag: enabled},
         )
-        # One gather per scene: both arms and the writer reuse its result. The
-        # eval's one call site always spells both kwargs; the flag picks values.
-        assert len(seen) == step
-        assert seen[-1] == {
-            "oracle_query_anchor": flag == "oracle_query_anchor" and enabled,
-            "ground_truth_query_anchor": (
-                flag == "ground_truth_query_anchor" and enabled
-            ),
-        }
+        # One scoring gather per scene: both arms and the writer reuse its
+        # result, and its call site always spells both kwargs; the flag picks
+        # values. A flag that replaced the anchor adds the readout's gather of
+        # the model's own, spelling neither.
+        expected.append(
+            {
+                "oracle_query_anchor": flag == "oracle_query_anchor" and enabled,
+                "ground_truth_query_anchor": (
+                    flag == "ground_truth_query_anchor" and enabled
+                ),
+            }
+        )
+        if enabled:
+            expected.append({})
+        assert seen == expected
+        if enabled:
+            # The forward's own output, depth and pose_enc included: the fixture
+            # plants the pointmaps, so only identity tells a stripped dict apart.
+            assert raws[-1] is raws[-2]
         assert metrics[flag] is enabled
         assert metrics[other] is False
         written = json.loads(
@@ -1743,7 +1774,7 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
         window_start=True,
         window_end=True,
     )
-    assert len(seen) == 3
+    assert len(seen) == len(expected) + 1 == 4
     # No such keyword at all: the step's call site is verbatim.
     assert "oracle_query_anchor" not in seen[-1]
     assert "ground_truth_query_anchor" not in seen[-1]
@@ -2093,6 +2124,572 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
 
     assert {name: module.training for name, module in model.named_modules()} == before
     assert torch.equal(torch.random.get_rng_state(), state)
+
+
+# ----------------------------------------------------- the held-out readouts ---
+
+
+# The run-level readout keys, in the order the eval appends them after per_scene.
+_READOUT_KEYS = (
+    "anchor_error_m",
+    "anchor_error_m_by_camera",
+    "base_ratio",
+    "base_ratio_by_camera",
+    "alignment_scale_over_baseline_scale",
+    "relative_rotation_deg",
+    "relative_center_error_m",
+)
+# The live anchor count on a four-camera window, one anchor per camera at time
+# 0, listed out of camera order so a readout re-sorted anywhere fails; the
+# reference stays camera 0.
+_FOUR_CAMERA_WINDOW = dict(
+    view_count=4,
+    cameras=(0, 1, 2, 3),
+    query_anchors=((0, 0), (3, 0), (1, 0), (2, 0)),
+)
+_FOUR_ANCHOR_SPEC = ["0:0", "3:0", "1:0", "2:0"]
+
+
+def _baseline_scaled_reconstruction(scene, factors):
+    """Ground-truth depth and cameras, each camera's centres moved along its
+    baseline from the reference anchor's by ``factors[camera]`` (1 if absent)."""
+
+    raw = _ground_truth_raw_reconstruction(scene)
+    pose_encoding = raw["pose_enc"].clone()
+    reference = pose_encoding[0, scene.query_observation_slot, :3].clone()
+    for observation in scene.observations:
+        factor = factors.get(observation.camera, 1.0)
+        pose_encoding[0, observation.slot, :3] = reference + factor * (
+            pose_encoding[0, observation.slot, :3] - reference
+        )
+    return {"depth": raw["depth"], "pose_enc": pose_encoding}
+
+
+class _GroundTruthPoseArc(_FakeArc):
+    """_FakeArc reconstructing each scene's own depth and cameras.
+
+    The base fake's zero quaternion turns every drift rotation NaN, which no
+    readout assertion survives. This returns each scene's ground-truth
+    reconstruction with its cameras moved along their baselines by that
+    scene's factors, chosen by the views the forward receives -- and a rig
+    moved three times as far for views that are no scene's own, which are the
+    shuffled arm's copies, so a drift report read off that arm cannot equal
+    the plain arm's.
+    """
+
+    def __init__(self, scenes, factors):
+        height, width = scenes[0].views[0]["img"].shape[-2:]
+        super().__init__(scenes[0].num_observations, height, width)
+        self.reconstructions = {
+            id(scene.views): _baseline_scaled_reconstruction(scene, scene_factors)
+            for scene, scene_factors in zip(scenes, factors)
+        }
+        self.last_views = None
+
+    def forward(self, views, **kwargs):
+        self.last_views = views
+        return super().forward(views, **kwargs)
+
+    def reconstruct(self, feats, images):
+        own = self.reconstructions.get(id(self.last_views))
+        if own is None:
+            own = next(iter(self.reconstructions.values()))
+            pose_encoding = own["pose_enc"].clone()
+            pose_encoding[0, :, :3] *= 3.0
+            return {"depth": own["depth"].clone(), "pose_enc": pose_encoding}
+        return {key: value.clone() for key, value in own.items()}
+
+
+def _own_anchor_errors(scene):
+    """The model's own anchor error per anchor, built as the oracle test builds it.
+
+    The fixture plants the pointmaps, so ``{}`` serves the fit and the gather
+    exactly as the eval's raw output does; float64 throughout, as the
+    readout's contract states.
+    """
+
+    from arc.training import (
+        build_anchor_correspondences,
+        fit_scene_sim3,
+        gather_query_anchor_points,
+    )
+
+    correspondences, _ = build_anchor_correspondences(scene)
+    alignment, _ = fit_scene_sim3({}, scene)
+    predicted, frame = gather_query_anchor_points({}, scene, correspondences)
+    assert frame == "model"
+    truth = scene.trajectories_world[
+        correspondences.query_times, correspondences.trajectory_indices
+    ].double()
+    stored = alignment.to(device=torch.device("cpu"), dtype=torch.float64).apply_points(
+        predicted.double()
+    )
+    distances = (
+        torch.linalg.vector_norm(stored - truth, dim=-1)
+        * float(scene.track_upscaling_factor)
+    ).numpy()
+    slots = correspondences.query_slots.numpy()
+    return {
+        f"{camera}:{time}": distances[slots == index]
+        for index, (camera, time) in enumerate(scene.query_anchors)
+    }
+
+
+def _expected_summary(values):
+    """The four fields the eval must report over ``values``; None-filled when empty."""
+
+    if values.size == 0:
+        return {"median": None, "mean": None, "p90": None, "count": 0}
+    return {
+        "median": pytest.approx(float(np.median(values)), rel=1e-9),
+        "mean": pytest.approx(float(np.mean(values)), rel=1e-9),
+        "p90": pytest.approx(float(np.percentile(values, 90.0)), rel=1e-9),
+        "count": int(values.size),
+    }
+
+
+@pytest.mark.parametrize("emit_predictions", (True, False))
+def test_the_eval_reports_the_camera_baseline_and_the_anchor_error(
+    tmp_path, monkeypatch, emit_predictions
+):
+    """The readouts every arm is judged on, per scene and pooled, at four anchors.
+
+    Two scenes at the live anchor count: one steers its rows onto cameras 1
+    and 3 and leaves anchors 0:0 and 2:0 empty, the other leaves every row on
+    the reference, so the pooled median is not the median of the per-scene
+    medians. Each scene's cameras sit along their baselines at that scene's
+    own factors, read through the scaled gauge's Sim(3), so every base_ratio
+    is 2.25 times its factor; the shuffled arm sees a different rig. The spec
+    is out of camera order, so every key order below is spec order and not a
+    sort. Run with and without bundles: the readouts must not ride the
+    writer's branch.
+    """
+
+    from arc.training import fit_scene_sim3, reconstruction_drift_report
+
+    scenes = {
+        "0000": _cpu_eval_scene(
+            monkeypatch,
+            gauge="scaled",
+            invisible=_steered_to({0: 3, 1: 3, 2: 1}),
+            **_FOUR_CAMERA_WINDOW,
+        ),
+        "0001": _cpu_eval_scene(monkeypatch, gauge="scaled", **_FOUR_CAMERA_WINDOW),
+    }
+    factors = ({1: 0.9, 2: 1.25, 3: 0.6}, {1: 1.1, 2: 0.8, 3: 0.7})
+    model = _GroundTruthPoseArc(list(scenes.values()), factors)
+
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[
+            plan_record(_record(seq_name=name), budget=48, stride=2)
+            for name in scenes
+        ],
+        scene_provider=lambda plan: scenes[plan.seq_name],
+        precision="32",
+        huber_delta_m=0.05,
+        step=6,
+        output_dir=tmp_path / "out",
+        query_anchors=_FOUR_ANCHOR_SPEC,
+        confidence_alpha=_EVAL_ALPHA,
+        emit_predictions=emit_predictions,
+    )
+
+    rows = {}
+    for entry, (name, scene), scene_factors in zip(
+        metrics["per_scene"], scenes.items(), factors
+    ):
+        assert entry["scene"] == name
+        # Appended last, so every field before them keeps its place.
+        assert list(entry)[-2:] == ["drift", "anchor_error_m"]
+        alignment, _ = fit_scene_sim3({}, scene)
+        assert entry["drift"] == reconstruction_drift_report(
+            model.reconstructions[id(scene.views)], scene, alignment
+        )
+        assert entry["drift"]["base_ratio"]["0:0"] is None
+        for camera, factor in scene_factors.items():
+            assert entry["drift"]["base_ratio"][f"{camera}:0"] == pytest.approx(
+                2.25 * factor, rel=1e-5
+            )
+        rows[name] = _own_anchor_errors(scene)
+        assert list(entry["anchor_error_m"]) == _FOUR_ANCHOR_SPEC
+        assert entry["anchor_error_m"] == {
+            key: _expected_summary(values) for key, values in rows[name].items()
+        }
+
+    # Not vacuous: two of the steered scene's anchors are empty, and pooling
+    # the rows is far from taking the median of each scene's median.
+    assert [rows["0000"][key].size for key in _FOUR_ANCHOR_SPEC] == [0, 2, 1, 0]
+    assert [rows["0001"][key].size for key in _FOUR_ANCHOR_SPEC] == [3, 0, 0, 0]
+    pooled = np.concatenate(
+        [values for scene_rows in rows.values() for values in scene_rows.values()]
+    )
+    per_scene_medians = [
+        np.median(np.concatenate(list(scene_rows.values())))
+        for scene_rows in rows.values()
+    ]
+    assert abs(np.median(pooled) - np.median(per_scene_medians)) > 0.5
+
+    assert list(metrics)[-len(_READOUT_KEYS):] == list(_READOUT_KEYS)
+    # Cameras in first-seen order, which is spec order.
+    assert list(metrics["anchor_error_m_by_camera"]) == ["0", "3", "1", "2"]
+    assert list(metrics["base_ratio_by_camera"]) == ["0", "3", "1", "2"]
+    assert metrics["anchor_error_m"] == _expected_summary(pooled)
+    assert metrics["anchor_error_m_by_camera"] == {
+        str(camera): _expected_summary(
+            np.concatenate([scene_rows[f"{camera}:0"] for scene_rows in rows.values()])
+        )
+        for camera in range(4)
+    }
+    ratios = {
+        camera: [2.25 * scene_factors[camera] for scene_factors in factors]
+        for camera in (1, 2, 3)
+    }
+    assert metrics["base_ratio"] == {
+        "median": pytest.approx(
+            float(np.median([ratio for values in ratios.values() for ratio in values])),
+            rel=1e-5,
+        ),
+        "count": 6,
+    }
+    assert metrics["base_ratio_by_camera"] == {
+        "0": None,
+        **{
+            str(camera): pytest.approx(float(np.median(values)), rel=1e-5)
+            for camera, values in ratios.items()
+        },
+    }
+    poses = [entry["drift"]["pose"] for entry in metrics["per_scene"]]
+    assert metrics["alignment_scale_over_baseline_scale"] == pytest.approx(
+        float(
+            np.median(
+                [
+                    entry["alignment_scale"] / pose["baseline_scale"]
+                    for entry, pose in zip(metrics["per_scene"], poses)
+                ]
+            )
+        ),
+        rel=1e-12,
+    )
+    # Exactly zero, not merely small: the ground-truth cameras share one
+    # rotation, and a zero must still count as a scene's contribution.
+    assert metrics["relative_rotation_deg"] == 0.0
+    assert metrics["relative_center_error_m"] == pytest.approx(
+        float(
+            np.mean([pose["relative_center_error_m"]["cross_camera"]["mean"] for pose in poses])
+        ),
+        rel=1e-12,
+    )
+    written = json.loads(
+        (tmp_path / "out" / "eval" / "step-6" / "metrics.json").read_text()
+    )
+    assert written == metrics
+
+
+def test_the_anchor_readout_reads_the_models_own_anchor_under_either_diagnostic(
+    tmp_path, monkeypatch
+):
+    """Ground truth may anchor the scored tracks; the readout stays the model's.
+
+    On the steered window the model's own anchor at a camera-k pixel is the
+    reference camera's planted pointmap, about k metres from the truth, while
+    either diagnostic's anchor is the truth to within a pixel, so a readout of
+    the scored anchor would collapse toward zero. The scored loss must move,
+    or the flags never reached the scoring at all.
+    """
+
+    scene = _cpu_eval_scene(
+        monkeypatch,
+        gauge="scaled",
+        invisible=_steered_to({0: 3, 1: 3, 2: 1}),
+        **_FOUR_CAMERA_WINDOW,
+    )
+    model = _GroundTruthPoseArc([scene], ({1: 0.9, 2: 1.25, 3: 0.6},))
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    entries = []
+    for step, flags in enumerate(
+        ({}, {"oracle_query_anchor": True}, {"ground_truth_query_anchor": True})
+    ):
+        metrics = train_cli.evaluate_held_out(
+            model=model,
+            plans=[plan],
+            scene_provider=lambda _plan: scene,
+            precision="32",
+            huber_delta_m=0.05,
+            step=step,
+            output_dir=tmp_path / "out",
+            query_anchors=_FOUR_ANCHOR_SPEC,
+            confidence_alpha=_EVAL_ALPHA,
+            emit_predictions=False,
+            **flags,
+        )
+        entries.append(metrics["per_scene"][0])
+
+    plain = entries[0]
+    assert plain["anchor_error_m"]["3:0"]["median"] > 2.0
+    for entry in entries[1:]:
+        assert entry["anchor_error_m"] == plain["anchor_error_m"]
+        assert entry["drift"] == plain["drift"]
+        assert entry["position_loss"] != plain["position_loss"]
+
+
+def _inert_readouts(monkeypatch, calls):
+    """Both readouts replaced by recording stubs returning empty, well-formed values."""
+
+    import arc.training as training_package
+
+    def drift(*args, **kwargs):
+        calls.append("drift")
+        return {
+            "depth": {},
+            "pose": {
+                "baseline_scale": None,
+                "relative_rotation_deg": {"cross_camera": None, "static_camera": None},
+                "relative_center_error_m": {"cross_camera": None, "static_camera": None},
+            },
+            "base_ratio": {},
+        }
+
+    def anchor_errors(*args, **kwargs):
+        calls.append("anchor_errors")
+        return {}
+
+    monkeypatch.setattr(training_package, "reconstruction_drift_report", drift)
+    monkeypatch.setattr(training_package, "query_anchor_errors", anchor_errors)
+
+
+@pytest.mark.parametrize(
+    "arm", ("one_anchor", "two_anchors_oracle", "merged_ground_truth")
+)
+def test_the_readouts_leave_every_existing_eval_figure_unchanged(
+    tmp_path, monkeypatch, arm
+):
+    """Both code paths in one test: the readouts change nothing they did not add.
+
+    The eval runs as it is and again with both readouts stubbed inert; every
+    key that predates them must match in value and in order, at the top level
+    and in each scene's entry, and the bundle byte for byte. Each run must
+    leave every RNG stream where it found it, which covers the pooled
+    aggregates computed after the eval's own restore. The stubs record their
+    calls, so the second run cannot pass by never reaching them.
+    """
+
+    if arm == "two_anchors_oracle":
+        scene = _step_scene(
+            monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
+        )
+        spec, flags, views_per_time = ["0:0", "1:0"], {"oracle_query_anchor": True}, 1
+    elif arm == "merged_ground_truth":
+        scene = _cpu_eval_scene(monkeypatch)
+        spec, views_per_time = ["0:0"], 2
+        flags = {"merge_synchronized_slots": True, "ground_truth_query_anchor": True}
+    else:
+        scene = _cpu_eval_scene(monkeypatch)
+        spec, flags, views_per_time = ["0:0"], {}, 1
+    height, width = scene.views[0]["img"].shape[-2:]
+    model = _FakeArc(
+        scene.num_observations, height, width, views_per_time=views_per_time
+    )
+    plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
+
+    def evaluate(directory):
+        before = capture_rng_state()
+        metrics = train_cli.evaluate_held_out(
+            model=model,
+            plans=[plan],
+            scene_provider=lambda _plan: scene,
+            precision="32",
+            huber_delta_m=0.05,
+            step=5,
+            output_dir=tmp_path / directory,
+            query_anchors=spec,
+            confidence_alpha=_EVAL_ALPHA,
+            **flags,
+        )
+        _assert_same_rng_state(capture_rng_state(), before)
+        bundle = tmp_path / directory / "eval" / "step-5" / "pred" / "0000.npz"
+        return metrics, bundle.read_bytes()
+
+    def existing(metrics):
+        kept = {key: value for key, value in metrics.items() if key not in _READOUT_KEYS}
+        kept["per_scene"] = [
+            {
+                key: value
+                for key, value in entry.items()
+                if key not in ("drift", "anchor_error_m")
+            }
+            for entry in metrics["per_scene"]
+        ]
+        return kept
+
+    real, real_bundle = evaluate("real")
+    calls: list[str] = []
+    _inert_readouts(monkeypatch, calls)
+    stubbed, stubbed_bundle = evaluate("stubbed")
+
+    assert calls == ["drift", "anchor_errors"]
+    assert list(existing(real)) == list(existing(stubbed))
+    assert [list(entry) for entry in existing(real)["per_scene"]] == [
+        list(entry) for entry in existing(stubbed)["per_scene"]
+    ]
+    assert existing(real) == existing(stubbed)
+    assert real_bundle == stubbed_bundle
+
+
+def test_the_readout_aggregates_pool_rows_and_follow_the_none_rules():
+    """Each run-level readout is its definition, and None when nothing fed it.
+
+    Hand-built scenes, so every plausible alternative lands elsewhere: the
+    pooled anchor-error median (10) is not the median of the per-scene
+    medians (5), and no camera's median equals its mean; base_ratio pools
+    camera 1's two anchors, counts a collapsed camera's 0.0, and keeps camera
+    12 apart from camera 1; the scale ratio is alignment over baseline, keeps
+    a mirrored rig's negative value and skips a missing or zero
+    baseline_scale; and the pose figures average each scene's cross_camera
+    MEAN -- never static_camera, never max -- over the scenes that have one,
+    each figure on its own say. A one-anchor run, with rows but no ratio,
+    still pools its rows; and a NaN row reaches every statistic rather than
+    hiding inside a median.
+    """
+
+    aggregates = train_cli._readout_aggregates
+
+    def scene(*, alignment_scale, baseline_scale, ratios, rotation, center):
+        return {
+            "alignment_scale": alignment_scale,
+            "drift": {
+                "pose": {
+                    "baseline_scale": baseline_scale,
+                    "relative_rotation_deg": rotation,
+                    "relative_center_error_m": center,
+                },
+                "base_ratio": ratios,
+            },
+        }
+
+    def figure(cross, static=None):
+        return {"cross_camera": cross, "static_camera": static}
+
+    nothing = dict.fromkeys(_READOUT_KEYS)
+    assert list(aggregates([], [])) == list(_READOUT_KEYS)
+    assert aggregates([], []) == nothing
+    # Scored, but feeding nothing: no ratio, no baseline fit, no cross-camera
+    # slot (a static one is no stand-in), and an anchor without rows.
+    silent = scene(
+        alignment_scale=2.0,
+        baseline_scale=None,
+        ratios={"0:0": None},
+        rotation=figure(None, {"mean": 3.0, "max": 4.0}),
+        center=figure(None),
+    )
+    assert aggregates([silent], [{"0:0": np.empty(0)}]) == nothing
+    # A zero baseline_scale has no reciprocal: skipped, never divided by.
+    zero = scene(
+        alignment_scale=2.0,
+        baseline_scale=0.0,
+        ratios={"0:0": None},
+        rotation=figure(None),
+        center=figure(None),
+    )
+    assert aggregates([zero], [{"0:0": np.empty(0)}]) == nothing
+    # A one-anchor run: rows but no ratio anywhere. Each readout keeps its own
+    # gate, so the rows still pool and the ratios stay None.
+    lone = aggregates([silent], [{"0:0": np.array([0.25, 0.5])}])
+    assert lone["anchor_error_m"] == {
+        "median": 0.375,
+        "mean": 0.375,
+        "p90": pytest.approx(0.475),
+        "count": 2,
+    }
+    assert lone["anchor_error_m_by_camera"] == {"0": lone["anchor_error_m"]}
+    assert lone["base_ratio"] is None
+    assert lone["base_ratio_by_camera"] is None
+    # A NaN row reaches every statistic, so a broken anchor cannot hide.
+    summary = train_cli._distance_summary(np.array([1.0, np.nan, 3.0]))
+    assert summary["count"] == 3
+    assert all(np.isnan(summary[key]) for key in ("median", "mean", "p90"))
+
+    entries = [
+        scene(
+            alignment_scale=2.0,
+            baseline_scale=4.0,
+            ratios={"0:0": None, "1:0": 0.5, "1:4": 0.9, "12:0": 1.5},
+            rotation=figure({"mean": 1.0, "max": 7.0}, {"mean": 50.0, "max": 60.0}),
+            center=figure({"mean": 0.1, "max": 0.9}, {"mean": 5.0, "max": 6.0}),
+        ),
+        scene(
+            alignment_scale=3.0,
+            baseline_scale=1.0,
+            ratios={"0:0": None, "1:0": 0.7, "1:4": 0.0, "12:0": None},
+            rotation=figure({"mean": 10.0, "max": 11.0}),
+            center=figure({"mean": 0.2, "max": 0.3}),
+        ),
+        scene(
+            alignment_scale=5.0,
+            baseline_scale=0.5,
+            ratios={"0:0": None, "1:0": 3.0, "1:4": 0.8, "12:0": 1.1},
+            rotation=figure({"mean": 4.0, "max": 9.0}),
+            center=figure({"mean": 0.9, "max": 1.0}),
+        ),
+        # A mirrored rig whose centres have no cross-camera figure while its
+        # rotations do: the two pose figures each count the scenes they have.
+        scene(
+            alignment_scale=3.0,
+            baseline_scale=-2.0,
+            ratios={"0:0": None},
+            rotation=figure({"mean": 2.0, "max": 2.5}),
+            center=figure(None),
+        ),
+        zero,
+    ]
+    rows = [
+        {
+            "0:0": np.array([1.0]),
+            "1:0": np.array([2.0, 10.0]),
+            "1:4": np.array([8.0]),
+            "12:0": np.empty(0),
+        },
+        {
+            "0:0": np.array([20.0, 30.0, 100.0]),
+            "1:0": np.empty(0),
+            "1:4": np.empty(0),
+            "12:0": np.array([40.0]),
+        },
+        {
+            "0:0": np.empty(0),
+            "1:0": np.array([5.0]),
+            "1:4": np.empty(0),
+            "12:0": np.empty(0),
+        },
+        {"0:0": np.empty(0)},
+        {"0:0": np.empty(0)},
+    ]
+
+    assert aggregates(entries, rows) == {
+        "anchor_error_m": {
+            "median": 10.0,
+            "mean": 24.0,
+            "p90": pytest.approx(52.0),
+            "count": 9,
+        },
+        "anchor_error_m_by_camera": {
+            "0": {"median": 25.0, "mean": 37.75, "p90": pytest.approx(79.0), "count": 4},
+            "1": {"median": 6.5, "mean": 6.25, "p90": pytest.approx(9.4), "count": 4},
+            "12": {"median": 40.0, "mean": 40.0, "p90": 40.0, "count": 1},
+        },
+        # Eight ratios, the collapsed camera's 0.0 among them.
+        "base_ratio": {"median": pytest.approx(0.85), "count": 8},
+        "base_ratio_by_camera": {
+            "0": None,
+            "1": pytest.approx(0.75),
+            "12": pytest.approx(1.3),
+        },
+        # 0.5, 3, 10 and the mirrored -1.5; the zero-baseline scene is skipped.
+        "alignment_scale_over_baseline_scale": 1.75,
+        "relative_rotation_deg": 4.25,
+        "relative_center_error_m": pytest.approx(0.4),
+    }
 
 
 # ---------------------------------------------------------- the device seam ---

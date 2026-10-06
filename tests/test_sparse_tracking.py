@@ -20,10 +20,12 @@ from arc.training import (
     adjacent_pair_indices,
     build_anchor_correspondences,
     build_scene,
+    capture_rng_state,
     compose_predicted_metric,
     fit_scene_sim3,
     gather_query_anchor_points,
     load_temporal_tracking_checkpoint,
+    query_anchor_errors,
     reconstruction_drift_report,
     sparse_tracking_loss,
 )
@@ -2607,6 +2609,8 @@ def test_drift_report_is_zero_for_ground_truth_predictions(dumped_scene):
             assert pose[figure][group] is not None
             assert pose[figure][group]["max"] < 1e-3
     assert pose["baseline_scale"] == pytest.approx(1.0, rel=1e-5)
+    # The window's one anchor is the reference, which has no offset to measure.
+    assert report["base_ratio"] == {"0:0": None}
 
 
 def test_drift_report_reads_a_depth_inflation_as_relative_error(dumped_scene):
@@ -2941,6 +2945,409 @@ def test_drift_report_relative_pose_is_anchored_at_the_query_observation():
     )
     assert wandered["relative_center_error_m"]["cross_camera"]["max"] < 1e-4
     assert wandered["baseline_scale"] == pytest.approx(1.0, rel=1e-4)
+
+
+# ------------------------------------------------------------------------------
+# base_ratio and the query anchor's error, the held-out readouts
+# ------------------------------------------------------------------------------
+
+
+def _steered_to(cameras_by_track, view_count=4):
+    """``invisible=`` triples leaving track k visible at time 0 in one camera.
+
+    Every fixture query starts at time 0 and the planes tie on depth error and
+    rounding, so assignment falls to anchor order and every row lands on the
+    first anchor; hiding each track from all cameras but one steers it.
+    """
+
+    return tuple(
+        (camera, 0, track)
+        for track, target in cameras_by_track.items()
+        for camera in range(view_count)
+        if camera != target
+    )
+
+
+def _four_camera_scene(**scene_parameters):
+    """The fixture world from four cameras, one anchor each at time 0: the live spec."""
+
+    return fixture_scene(
+        view_count=4,
+        cameras=(0, 1, 2, 3),
+        times=(0, 1),
+        size=56,
+        query_anchors=((0, 0), (1, 0), (2, 0), (3, 0)),
+        **scene_parameters,
+    )
+
+
+def _skewed_alignment(scale: float = 0.37) -> DetachedSim3:
+    """Scale, rotation and translation all non-trivial, so points and vectors part."""
+
+    return DetachedSim3(
+        scale=torch.tensor(scale),
+        rotation=torch.from_numpy(_yaw_rotation(31.0) @ _pitch_rotation(17.0)).float(),
+        translation=torch.tensor([0.8, -1.3, 2.0]),
+    )
+
+
+def _preimage(alignment: DetachedSim3, points: torch.Tensor) -> torch.Tensor:
+    """The model-gauge points ``alignment.apply_points`` carries onto ``points``.
+
+    Inverted exactly in float64: the float32 rotation is orthonormal only to
+    about 1e-7, so its transpose is not quite its inverse.
+    """
+
+    rotation = alignment.rotation.double()
+    return (
+        (points.double() - alignment.translation.double()) / alignment.scale.double()
+    ) @ torch.linalg.inv(rotation.mT)
+
+
+def test_base_ratio_is_one_for_ground_truth_cameras_and_pointmaps(monkeypatch):
+    """Stage 0A's readout at its fixed point, at the live four-anchor spec.
+
+    The reference pointmap is planted as the scene's own metric one, so the
+    Sim(3) is fitted from ground-truth pointmaps -- scale exactly 1 -- and the
+    cameras are ground truth too, so every baseline has its true length.
+    """
+
+    scene = _four_camera_scene()
+    target, _ = sparse_module._metric_pointmap_at_anchor(
+        scene, scene.query_observation_slot
+    )
+    pointmaps = torch.from_numpy(target).float().expand(
+        1, scene.num_observations, *target.shape
+    ).contiguous()
+    monkeypatch.setattr(sparse_module, "_predicted_pointmaps", lambda raw: pointmaps)
+    raw = _ground_truth_raw_reconstruction(scene)
+    alignment, _ = fit_scene_sim3(raw, scene)
+    assert float(alignment.scale.item()) == pytest.approx(1.0, rel=1e-6)
+
+    ratios = reconstruction_drift_report(raw, scene, alignment)["base_ratio"]
+
+    assert list(ratios) == ["0:0", "1:0", "2:0", "3:0"]
+    assert ratios["0:0"] is None
+    for key in ("1:0", "2:0", "3:0"):
+        assert ratios[key] == pytest.approx(1.0, rel=1e-6)
+
+
+def test_base_ratio_scales_linearly_and_lands_on_its_own_anchor():
+    """Each anchor reads its own camera's baseline length times the Sim(3) scale.
+
+    Every non-reference anchor's centre moves along its baseline by its own
+    factor, so the ratios are distinct and one filed under the wrong anchor
+    fails. The cameras are recorded as ids 10-13 and the spec is permuted,
+    putting the reference on the second view: a key built from view indices
+    or spec positions, or anchors paired in camera order, cannot pass. Only
+    the alignment's scale may enter -- not its rotation or translation -- and
+    not the track upscaling factor (2.5 here), which cancels between lengths.
+    """
+
+    scene = dataclasses.replace(
+        fixture_scene(
+            view_count=4,
+            view_ids=(10, 11, 12, 13),
+            cameras=(10, 11, 12, 13),
+            times=(0, 1),
+            size=56,
+            query_anchors=((11, 0), (13, 0), (10, 0), (12, 0)),
+        ),
+        track_upscaling_factor=2.5,
+    )
+    factors = {"13:0": 0.6, "10:0": 1.25, "12:0": 0.9}
+    raw = _ground_truth_raw_reconstruction(scene)
+    pose_encoding = raw["pose_enc"].clone()
+    reference = pose_encoding[0, scene.query_observation_slot, :3].clone()
+    for (camera, time), slot in zip(
+        scene.query_anchors, scene.anchor_observation_slots
+    ):
+        factor = factors.get(f"{camera}:{time}")
+        if factor is not None:
+            pose_encoding[0, slot, :3] = reference + factor * (
+                pose_encoding[0, slot, :3] - reference
+            )
+
+    ratios = reconstruction_drift_report(
+        {**raw, "pose_enc": pose_encoding}, scene, _skewed_alignment(scale=2.0)
+    )["base_ratio"]
+
+    assert list(ratios) == ["11:0", "13:0", "10:0", "12:0"]
+    assert ratios["11:0"] is None
+    for key, factor in factors.items():
+        assert ratios[key] == pytest.approx(2.0 * factor, rel=1e-5)
+
+
+def test_base_ratio_is_none_without_a_baseline_and_zero_for_a_collapsed_camera():
+    """None where there is no length to compare against; 0.0 is a measurement.
+
+    The reference anchor has no offset of its own. Anchor 0:3 shares its
+    camera, with the ground-truth centre nudged 1.5e-6 off the reference: a
+    zero baseline under the fit's own test, 1e-6 of the largest baseline (2 m,
+    camera 2's), though neither under ``> 0`` nor under an absolute 1e-6, each
+    of which would divide the planted 30 cm wander by it. Anchor 1:3's
+    predicted centre is collapsed onto the reference: its baseline exists and
+    the prediction measures zero along it -- and still does when the whole rig
+    collapses and the fit has no baseline_scale left. Original time 3 sits at
+    semantic slot 2 of this window, so a key built from the slot cannot pass.
+    """
+
+    scene = fixture_scene(
+        view_count=3,
+        cameras=(0, 1, 2),
+        times=(0, 2, 3),
+        size=56,
+        query_anchors=((0, 0), (0, 3), (1, 0), (1, 3)),
+    )
+    extrinsics = scene.extrinsics_world_to_camera.clone()
+    extrinsics[0, 3, 0, 3] -= 1.5e-6  # camera 0 at time 3: centre x = +1.5e-6
+    scene.extrinsics_world_to_camera = extrinsics
+    slots = dict(zip(scene.query_anchors, scene.anchor_observation_slots))
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(scene),
+        slot=slots[(0, 3)],
+        offset=(0.3, 0.0, 0.0),
+    )
+    pose_encoding = raw["pose_enc"].clone()
+    pose_encoding[0, slots[(1, 3)], :3] = pose_encoding[0, slots[(0, 0)], :3]
+
+    ratios = reconstruction_drift_report(
+        {**raw, "pose_enc": pose_encoding}, scene, _identity_alignment()
+    )["base_ratio"]
+
+    assert list(ratios) == ["0:0", "0:3", "1:0", "1:3"]
+    assert ratios["0:0"] is None
+    assert ratios["0:3"] is None
+    assert ratios["1:0"] == pytest.approx(1.0, rel=1e-6)
+    assert ratios["1:3"] == 0.0
+
+    collapsed = raw["pose_enc"].clone()
+    collapsed[0, :, :3] = collapsed[0, slots[(0, 0)], :3]
+    report = reconstruction_drift_report(
+        {**raw, "pose_enc": collapsed}, scene, _identity_alignment()
+    )
+    assert report["pose"]["baseline_scale"] is None
+    assert report["base_ratio"] == {"0:0": None, "0:3": None, "1:0": 0.0, "1:3": 0.0}
+
+
+def test_base_ratio_reads_the_offsets_length_not_its_projection():
+    """Stage 0A's ratio is of lengths, so a camera moved across its baseline reads long.
+
+    Camera 1 keeps its 1 m along the baseline and gains 0.75 m across it: the
+    offset grows to 1.25 m (a 3-4-5 triangle) while its projection onto the
+    baseline stays 1 m.
+    """
+
+    scene = fixture_scene(
+        cameras=(0, 1), times=(0, 1), size=56, query_anchors=((0, 0), (1, 0))
+    )
+    slots = dict(zip(scene.query_anchors, scene.anchor_observation_slots))
+    raw = _moved_center(
+        _ground_truth_raw_reconstruction(scene),
+        slot=slots[(1, 0)],
+        offset=(0.0, 0.75, 0.0),
+    )
+
+    ratios = reconstruction_drift_report(raw, scene, _identity_alignment())["base_ratio"]
+
+    assert ratios["1:0"] == pytest.approx(1.25, rel=1e-6)
+
+
+def test_anchor_errors_refuse_misfiled_rows_and_take_an_empty_set(dumped_scene):
+    """One anchor per row, and every row's slot a seated anchor; nothing dropped.
+
+    A short anchor tensor would broadcast against the truth, and a slot past
+    the last anchor would file its rows under none -- both silently -- so both
+    refuse. An empty set is no error: every anchor reads an empty array.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    truth = _anchors_for(dumped_scene, correspondences)
+
+    with pytest.raises(ValueError, match="model_anchors must have shape"):
+        query_anchor_errors(
+            truth[:1], dumped_scene, correspondences, _identity_alignment()
+        )
+    stray = dataclasses.replace(
+        correspondences,
+        query_slots=torch.full_like(
+            correspondences.query_slots, len(dumped_scene.query_anchors)
+        ),
+    )
+    with pytest.raises(ValueError, match="must index the scene's"):
+        query_anchor_errors(truth, dumped_scene, stray, _identity_alignment())
+
+    empty = SparseCorrespondences(*(torch.empty(0, dtype=torch.long),) * 5)
+    errors = query_anchor_errors(
+        torch.empty(0, 3), dumped_scene, empty, _identity_alignment()
+    )
+    assert list(errors) == ["0:0"]
+    assert errors["0:0"].size == 0
+
+
+def test_drift_depth_reads_the_surface_depth_map():
+    """Time-0 depth comes through surface_depth_map, like every other consumer's.
+
+    build_scene refuses a depth0 that differs from depth[:, 0], so the two are
+    split after construction: each camera's time-0 map is inflated by its own
+    factor in ``depth`` alone. The prediction is depth0's values, so each
+    camera reads exactly its own inflation -- and nothing, were depth0 read.
+    """
+
+    scene = fixture_scene(cameras=(0, 1), times=(0, 1), size=56)
+    raw = _ground_truth_raw_reconstruction(scene)
+    factors = {0: 1.1, 1: 1.25}
+    depth = scene.depth.clone()
+    for camera, factor in factors.items():
+        depth[camera, 0] *= factor
+    scene.depth = depth
+
+    report = reconstruction_drift_report(raw, scene, _identity_alignment())
+
+    for camera, factor in factors.items():
+        assert report["depth"][str(camera)]["median_relative_error"] == (
+            pytest.approx(abs(1.0 - factor) / factor, rel=1e-5)
+        )
+
+
+def test_anchor_error_is_zero_at_the_true_position(dumped_scene):
+    """An anchor that IS the tracked point scores zero, through any gauge.
+
+    The skewed alignment's preimage of the truth comes back exactly through
+    apply_points; apply_vectors would drop the translation and miss by 2.5 m.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    truth = _anchors_for(dumped_scene, correspondences)
+    skewed = _skewed_alignment()
+
+    exact = query_anchor_errors(
+        truth, dumped_scene, correspondences, _identity_alignment()
+    )
+    gauged = query_anchor_errors(
+        _preimage(skewed, truth), dumped_scene, correspondences, skewed
+    )
+
+    for errors in (exact, gauged):
+        assert list(errors) == ["0:0"]
+        assert errors["0:0"].shape == (correspondences.count,)
+    assert np.all(exact["0:0"] == 0.0)
+    np.testing.assert_allclose(gauged["0:0"], 0.0, atol=1e-9)
+
+
+def test_anchor_error_reads_a_planted_offset_in_metres(dumped_scene):
+    """Each row reads its own planted miss, lifted to metres by the factor.
+
+    The factor is 2.5, not the fixture's 1.0, which would hide a missing
+    multiplication; every row's offset is distinct, so a row measured against
+    another row's truth fails too.
+    """
+
+    scene = dataclasses.replace(dumped_scene, track_upscaling_factor=2.5)
+    correspondences, _ = build_anchor_correspondences(scene)
+    offsets = torch.tensor(
+        [[0.01 * (row + 1), -0.02 * row, 0.005] for row in range(correspondences.count)],
+        dtype=torch.float64,
+    )
+    skewed = _skewed_alignment()
+    anchors = _preimage(skewed, _anchors_for(scene, correspondences).double() + offsets)
+
+    errors = query_anchor_errors(anchors, scene, correspondences, skewed)["0:0"]
+
+    np.testing.assert_allclose(
+        errors, torch.linalg.vector_norm(offsets, dim=-1).numpy() * 2.5, rtol=1e-9
+    )
+
+
+@pytest.mark.parametrize(
+    ("scene_parameters", "counts"),
+    (
+        # Camera ids and original times that are neither view indices nor
+        # semantic slots: track 1's query time 2 lands it on anchor (11, 2),
+        # whose view index is 1 and semantic time 1.
+        (
+            dict(
+                view_ids=(10, 11),
+                cameras=(10, 11),
+                times=(0, 2),
+                query_anchors=((10, 0), (11, 2)),
+                query_times=(0, 2, 0),
+            ),
+            {"10:0": 2, "11:2": 1},
+        ),
+        # The live spec, rows steered off the reference, which then
+        # supervises nothing.
+        (
+            dict(
+                view_count=4,
+                cameras=(0, 1, 2, 3),
+                times=(0, 1),
+                query_anchors=((0, 0), (1, 0), (2, 0), (3, 0)),
+                invisible=_steered_to({0: 3, 1: 1, 2: 2}),
+            ),
+            {"0:0": 0, "1:0": 1, "2:0": 1, "3:0": 1},
+        ),
+    ),
+)
+def test_anchor_error_lands_on_each_anchor(scene_parameters, counts):
+    """Rows group by query slot and file under that anchor's own camera:time.
+
+    Each anchor's rows carry that anchor's own planted miss, so a row filed
+    under another anchor -- or a group keyed by anything but the anchor's
+    camera id and original time -- fails. Every seated anchor is listed, in
+    spec order, an empty one included.
+    """
+
+    scene = fixture_scene(size=56, **scene_parameters)
+    correspondences, _ = build_anchor_correspondences(scene)
+    misses = torch.tensor([0.01, 0.02, 0.03, 0.04], dtype=torch.float64)
+    planted = _anchors_for(scene, correspondences).double()
+    planted[:, 0] += misses[correspondences.query_slots]
+
+    errors = query_anchor_errors(
+        planted, scene, correspondences, _identity_alignment()
+    )
+
+    assert list(errors) == list(counts)
+    assert {key: values.size for key, values in errors.items()} == counts
+    assert sum(values.size for values in errors.values()) == correspondences.count
+    for index, values in enumerate(errors.values()):
+        np.testing.assert_allclose(values, misses[index].item(), rtol=1e-9)
+
+
+def _assert_same_rng_state(after: dict, before: dict) -> None:
+    """Every stream ``capture_rng_state`` records, compared field by field."""
+
+    after, before = dict(after), dict(before)
+    assert torch.equal(after.pop("torch"), before.pop("torch"))
+    cuda_after = after.pop("torch_cuda", [])
+    cuda_before = before.pop("torch_cuda", [])
+    assert len(cuda_after) == len(cuda_before)
+    assert all(torch.equal(a, b) for a, b in zip(cuda_after, cuda_before))
+    assert after == before
+
+
+def test_the_readouts_draw_no_randomness(dumped_scene):
+    """No draw at all, rather than one the eval's RNG restore would hide.
+
+    evaluate_held_out restores every stream in a ``finally``, so an eval-level
+    check cannot see a draw made inside these; here nothing restores between
+    the two snapshots.
+    """
+
+    correspondences, _ = build_anchor_correspondences(dumped_scene)
+    raw = _ground_truth_raw_reconstruction(dumped_scene)
+    before = capture_rng_state()
+
+    reconstruction_drift_report(raw, dumped_scene, _identity_alignment())
+    query_anchor_errors(
+        _anchors_for(dumped_scene, correspondences),
+        dumped_scene,
+        correspondences,
+        _identity_alignment(),
+    )
+
+    _assert_same_rng_state(capture_rng_state(), before)
 
 
 # ------------------------------------------------------------------------------

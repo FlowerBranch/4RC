@@ -516,6 +516,18 @@ def _split_by_baseline(values: list[float], separated: list[bool]) -> dict:
     }
 
 
+def _anchor_key(camera: int, time: int) -> str:
+    """One query anchor's readout key, ``"<camera>:<time>"``.
+
+    Camera id and original time, as ``scene.query_anchors`` holds them -- not
+    the ``VIEWSLOT:TIMESLOT`` slot strings a run's ``--query_anchors`` spells.
+    Both per-anchor readouts key through here, so a reader can pool either by
+    camera with the same split.
+    """
+
+    return f"{int(camera)}:{int(time)}"
+
+
 def reconstruction_drift_report(
     raw_predictions: dict,
     scene: DumpedKubricScene,
@@ -525,12 +537,14 @@ def reconstruction_drift_report(
 
     The per-step Sim(3) report watches one observation at the top confidence
     quintile, which is nearly blind to where degradation starts.  This instead
-    compares, fully detached: predicted depth against the scene's ``depth0`` for
-    every camera's time-0 observation (relative error, median and p90), and the
-    token camera against the scene's extrinsics for every observation (rotation
-    geodesic plus metric camera-centre error), composed through the given
-    alignment.  Ground-truth depth and extrinsics live in stored units; the
-    scene's track upscaling factor lifts distances to metres.
+    compares, fully detached: predicted depth against the scene's ground-truth
+    depth for every camera's time-0 observation, read through
+    :meth:`DumpedKubricScene.surface_depth_map` as every other consumer reads
+    it (relative error, median and p90), and the token camera against the
+    scene's extrinsics for every observation (rotation geodesic plus metric
+    camera-centre error), composed through the given alignment.  Ground-truth
+    depth and extrinsics live in stored units; the scene's track upscaling
+    factor lifts distances to metres.
 
     ``rotation_error_deg`` and ``camera_center_error_m`` are those
     alignment-composed figures, and the alignment is fitted from the predicted
@@ -584,6 +598,23 @@ def reconstruction_drift_report(
     ``relative_rotation_deg`` survives those cases.  A non-positive
     ``baseline_scale`` is reported as fitted rather than clamped: a mirrored rig
     should be visible.
+
+    ``base_ratio`` is Stage 0A's per-camera readout
+    (``score_joint.py::relative_pose_readout`` in the hub repo), taken at every
+    query anchor: ``|predicted offset| * alignment.scale / |ground-truth
+    offset|``, over the same reference-relative offsets ``baseline_scale`` is
+    fitted on -- the camera baseline measured against the pointmap-fitted depth
+    scale, so below 1 the predicted camera sits short along its baseline.
+    Unlike the relative figures it composes through ``alignment.scale`` on
+    purpose: that disagreement is the quantity.  ``None`` at the reference
+    anchor, which has no offset of its own, and at a zero ground-truth baseline
+    -- the same test that keeps a slot out of the fit, so "zero" means what
+    ``static_camera`` means -- where there is no length to compare against.  A
+    predicted centre collapsed onto the reference reports ``0.0``, a
+    measurement rather than an absence.  Keyed by :func:`_anchor_key`, camera
+    id and original time from ``scene.query_anchors``; the ``depth`` keys are
+    view indices instead, and the two coincide whenever the view list is
+    ascending and complete, which the held-out loader's always is.
     """
 
     depth = raw_predictions.get("depth")
@@ -616,7 +647,7 @@ def reconstruction_drift_report(
             original_rows, original_columns = transform.output_to_original_indices()
             columns_grid, rows_grid = np.meshgrid(original_columns, original_rows)
             target = (
-                scene.depth0[observation.camera, 0]
+                scene.surface_depth_map(observation.camera, 0)
                 .detach()
                 .cpu()
                 .numpy()
@@ -669,6 +700,8 @@ def reconstruction_drift_report(
         relative_rotations: list[float] = []
         predicted_offsets: list[torch.Tensor] = []
         ground_truth_offsets: list[torch.Tensor] = []
+        # The slot each offset belongs to, so base_ratio can find an anchor's own.
+        offset_slots: list[int] = []
         for observation in scene.observations:
             rotation_c2w = camera_to_world[0, observation.slot, :3, :3]
             predicted_center = camera_to_world[0, observation.slot, :3, 3]
@@ -719,10 +752,16 @@ def reconstruction_drift_report(
             ground_truth_offsets.append(
                 reference_rotation_gt @ (center_gt - reference_center_gt)
             )
+            offset_slots.append(observation.slot)
 
         baseline_scale = None
         relative_rotation_report = _split_by_baseline([], [])
         relative_center_report = _split_by_baseline([], [])
+        # Every seated anchor, the reference included, so the keys say which
+        # anchors the window holds; a ratio is filled in below where one exists.
+        base_ratio: dict[str, float | None] = {
+            _anchor_key(camera, time): None for camera, time in scene.query_anchors
+        }
         if predicted_offsets:
             predicted_offset = torch.stack(predicted_offsets)
             ground_truth_offset = torch.stack(ground_truth_offsets)
@@ -754,6 +793,22 @@ def reconstruction_drift_report(
                     separated_flags,
                 )
 
+            offset_index = {slot: index for index, slot in enumerate(offset_slots)}
+            predicted_lengths = torch.linalg.vector_norm(predicted_offset, dim=-1)
+            for (camera, time), slot in zip(
+                scene.query_anchors, scene.anchor_observation_slots
+            ):
+                index = offset_index.get(slot)
+                # The reference anchor has no offset of its own, and a zero
+                # baseline leaves no length to measure the prediction against.
+                if index is None or not separated_flags[index]:
+                    continue
+                base_ratio[_anchor_key(camera, time)] = (
+                    float(predicted_lengths[index].item())
+                    * scale
+                    / float(baselines[index].item())
+                )
+
     return {
         "depth": depth_report,
         "pose": {
@@ -769,6 +824,7 @@ def reconstruction_drift_report(
             "relative_center_error_m": relative_center_report,
             "baseline_scale": baseline_scale,
         },
+        "base_ratio": base_ratio,
     }
 
 
@@ -937,6 +993,70 @@ def gather_query_anchor_points(
         correspondences.columns.to(pointmaps.device),
     ]
     return anchors.detach(), "model"
+
+
+def query_anchor_errors(
+    model_anchors: torch.Tensor,
+    scene: DumpedKubricScene,
+    correspondences: SparseCorrespondences,
+    alignment: DetachedSim3,
+) -> dict[str, np.ndarray]:
+    """Metric distance from the model's own query anchor to the tracked point.
+
+    ``model_anchors`` are what :func:`gather_query_anchor_points` returns with
+    both eval-only diagnostics off: one row per correspondence, in the
+    reconstruction's own gauge.  Each is carried into the stored frame by
+    ``alignment.apply_points`` and compared there with the tracked point's true
+    position at its query time,
+    ``scene.trajectories_world[query_times, trajectory_indices]`` -- exactly
+    the value ``oracle_query_anchor`` substitutes -- and the distance is lifted
+    to metres by the scene's track upscaling factor, outside the Sim(3), as
+    every other metric figure is.  A world-frame anchor (either diagnostic's)
+    must not come here: ``apply_points`` would carry it into the stored frame a
+    second time.
+
+    Rows are grouped by ``correspondences.query_slots``, which index the
+    adapter's anchor list, so each group is one anchor, keyed by
+    :func:`_anchor_key` of its ``scene.query_anchors`` entry.  Every seated
+    anchor is present, in spec order, with an empty array where it supervises
+    no row.  Pass the **scene-level** correspondences, for the reason
+    :func:`gather_query_anchor_points` gives: a set rebased by
+    :meth:`SparseCorrespondences.select_query_slot` has every slot at 0 and
+    would file every anchor's rows under the first.
+
+    Detached, on CPU and in float64: the anchors arrive on the model's device
+    and the fitted alignment on CPU, so no autocast context reaches the
+    arithmetic, and nothing here draws randomness.
+    """
+
+    if tuple(model_anchors.shape) != (correspondences.count, 3):
+        raise ValueError(
+            f"model_anchors must have shape ({correspondences.count}, 3), got "
+            f"{tuple(model_anchors.shape)}"
+        )
+    query_slots = correspondences.query_slots.cpu().numpy()
+    if query_slots.size and (
+        query_slots.min() < 0 or query_slots.max() >= len(scene.query_anchors)
+    ):
+        raise ValueError(
+            "Correspondence query slots must index the scene's "
+            f"{len(scene.query_anchors)} query anchors, got "
+            f"{sorted(set(query_slots.tolist()))}"
+        )
+    anchors = model_anchors.detach().to(device="cpu", dtype=torch.float64)
+    alignment = alignment.to(device=torch.device("cpu"), dtype=torch.float64)
+    truth = scene.trajectories_world.detach().to(device="cpu", dtype=torch.float64)[
+        correspondences.query_times.cpu(),
+        correspondences.trajectory_indices.cpu(),
+    ]
+    distances = (
+        torch.linalg.vector_norm(alignment.apply_points(anchors) - truth, dim=-1)
+        * float(scene.track_upscaling_factor)
+    ).numpy()
+    return {
+        _anchor_key(camera, time): distances[query_slots == index]
+        for index, (camera, time) in enumerate(scene.query_anchors)
+    }
 
 
 # The stages a query passes through at one anchor, in the order they are
