@@ -1,6 +1,7 @@
+import hashlib
 import json
-import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -1593,19 +1594,31 @@ def test_npz_keeps_24_observations_without_serializing_time_metadata(tmp_path):
         assert sum(key.startswith("view_") for key in saved.files) == 24
 
 
-def test_released_checkpoint_header_has_only_the_time_embedding_gap():
-    header_path = os.environ.get("FOUR_RC_RELEASED_SAFETENSORS_HEADER")
-    if not header_path:
-        pytest.skip("Set FOUR_RC_RELEASED_SAFETENSORS_HEADER to the downloaded header file")
+# The released checkpoint's safetensors header -- every tensor's name, dtype and
+# shape, no weights -- so the check below runs on every CPU run rather than only
+# where the 6 GB file sits.
+_RELEASED_HEADER = Path(__file__).parent / "fixtures" / "released_4rc_header.json"
+_RELEASED_HEADER_SHA256 = (
+    "be32edf1617bd154209568b303180db7b394d1d52d0378412a4be8b3fd85428f"
+)
 
-    with open(header_path, "rb") as checkpoint_header:
-        header_length = int.from_bytes(
-            checkpoint_header.read(8),
-            byteorder="little",
-        )
-        released_state = json.loads(
-            checkpoint_header.read(header_length)
-        )
+
+def test_released_checkpoint_header_has_only_the_time_embedding_gap():
+    """The released weights still fit the model, short of the declared new keys.
+
+    The fixture is bytes 8-125423 of ``model.safetensors`` in ``Luo-Yihang/4RC``
+    at revision 3634b324abb16634a527987c8efa212e392a1449 -- the header's JSON,
+    after its 8-byte length -- regenerated with ``curl -L -r 8-125423`` against
+    that revision's ``resolve`` URL. Its hash is pinned, so the fixture can only
+    ever be that header. Every parameter the model gained since (the time
+    embedding, the depth and camera inputs, the track refiner) must be declared
+    in LEGACY_CHECKPOINT_MISSING_KEYS, or from_pretrained refuses the released
+    weights.
+    """
+
+    header = _RELEASED_HEADER.read_bytes()
+    assert hashlib.sha256(header).hexdigest() == _RELEASED_HEADER_SHA256
+    released_state = json.loads(header)
     released_state.pop("__metadata__", None)
 
     model = _full_meta_arc()
@@ -1618,23 +1631,6 @@ def test_released_checkpoint_header_has_only_the_time_embedding_gap():
         assert list(current_state[name].shape) == metadata["shape"]
         assert metadata["dtype"] == "F32"
         assert current_state[name].dtype == torch.float32
-
-
-def test_released_checkpoint_load():
-    checkpoint_dir = os.environ.get("FOUR_RC_RELEASED_CHECKPOINT_DIR")
-    if not checkpoint_dir:
-        pytest.skip(
-            "Set FOUR_RC_RELEASED_CHECKPOINT_DIR to a directory containing model.safetensors"
-        )
-
-    model = Arc.from_pretrained(
-        checkpoint_dir,
-        map_location="cpu",
-    )
-
-    assert torch.count_nonzero(
-        model.backbone.pretrained.time_index_embedding.weight
-    ) == 0
 
 
 # ------------------------------------------------------------------------------

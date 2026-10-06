@@ -130,8 +130,13 @@ class MultiViewDUSt3RLitModule(LightningModule):
 
         preds = self.forward(views)
 
-        # Compute the loss in higher precision
-        with torch.autocast(device_type=self.device.type, dtype=torch.float32):
+        # Compute the loss in higher precision. CPU autocast rejects float32 (it
+        # warns and disables itself), so this is enabled on CUDA only.
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.float32,
+            enabled=self.device.type == "cuda",
+        ):
             loss, loss_details = criterion(views, preds) if criterion is not None else None
 
         return views, preds, loss, loss_details

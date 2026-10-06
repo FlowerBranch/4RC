@@ -936,8 +936,11 @@ class Arc(
         """Depth head and camera decoder, keyed off the shared backbone taps."""
 
         H, W = x.shape[-2], x.shape[-1]
-        # Process features through depth head
-        with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
+        # Process features through depth head. CPU autocast rejects float32 (it
+        # warns and disables itself), so the fp32 block is enabled on CUDA only:
+        # the same behaviour on both devices, without the warning.
+        device_type = next(self.parameters()).device.type
+        with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=device_type == "cuda"):
             # Under every temporal freeze mode the depth head and camera decoder
             # are frozen and their outputs are consumed only through detached
             # paths (arc.models.arc.utils.transform.predicted_pointmaps is
@@ -1026,7 +1029,10 @@ class Arc(
         # observation axis; x[:, :T] is the cheapest tensor with that shape --
         # WHICH frames it holds is irrelevant. At V=1 the slice is all of x.
         head_images = x if not merge else x[:, : x.shape[1] // views_per_time]
-        with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
+        # fp32 under an outer CUDA bf16 autocast; enabled on CUDA only, as in
+        # reconstruct, since CPU autocast rejects float32 with a warning.
+        device_type = next(self.parameters()).device.type
+        with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=device_type == "cuda"):
             track, track_conf = self.track_head(
                 aggregated_track_tokens_list, images=head_images, patch_start_idx=1, frames_chunk_size=frames_chunk_size
             )

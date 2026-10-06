@@ -397,8 +397,10 @@ class MVTrackerSceneProvider:
             # unrecordable: it is a value nobody chose, so it is simply set.
             #
             # KNOWN GAP: nothing verifies 24 is still what the paired run uses.
-            # There is a test pinning upstream's 1000 default, but that catches
-            # the loader changing, not the run's config moving. Do NOT close this
+            # Upstream's own 1000 default is pinned by no test either -- it was
+            # last read at kubric_multiview_dataset.py:212 on MVTracker 4002795 --
+            # and pinning it would catch the loader changing, not the run's
+            # config moving. Do NOT close this
             # by asserting `configs/train.yaml`'s value -- that reads as coverage
             # while checking one of two sources, and the other is live:
             # train_curve.sbatch already overrides `datasets.train.traj_per_sample`

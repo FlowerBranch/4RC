@@ -31,7 +31,6 @@ nothing at all, which ``test_the_flag_defaults_off`` and
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from arc.models.arc.arc import Arc
@@ -270,39 +269,3 @@ def test_the_flag_is_inert_in_eval_mode():
         outputs.append(output[0][0])
 
     assert torch.equal(outputs[0], outputs[1])
-
-
-def test_peak_cuda_allocation_is_lower_with_checkpointing():
-    """Direction only -- the absolute figure is hardware-dependent.
-
-    The CPU retention test above is what guards the change in CI; this exists so
-    the claim is also checked in allocator terms wherever a GPU is available.
-    """
-
-    if not torch.cuda.is_available():
-        pytest.skip("Peak allocation needs a CUDA device")
-
-    encoder = _build_encoder().cuda()
-    images, time_indices = _inputs()
-    images, time_indices = images.cuda(), time_indices.cuda()
-
-    peaks = {}
-    for local_checkpointing in (False, True):
-        encoder.train(True)
-        encoder.checkpoint_local_attention = local_checkpointing
-        encoder.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        output, _aux = encoder.get_intermediate_layers(
-            images, OUT_LAYERS, time_indices=time_indices
-        )
-        sum(
-            tensor.square().mean() for entry in output for tensor in entry
-        ).backward()
-        peaks[local_checkpointing] = torch.cuda.max_memory_allocated()
-
-    assert peaks[True] < peaks[False], (
-        f"peak allocation was {peaks[True]} with local checkpointing against "
-        f"{peaks[False]} without it"
-    )

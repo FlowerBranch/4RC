@@ -133,7 +133,6 @@ def as_homogeneous(ext):
         raise TypeError("Input must be a torch.Tensor or np.ndarray.")
 
 
-@torch.jit.script
 def affine_inverse(A: torch.Tensor):
     R = A[..., :3, :3]  # ..., 3, 3
     T = A[..., :3, 3:]  # ..., 3, 1

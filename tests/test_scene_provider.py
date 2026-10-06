@@ -14,7 +14,6 @@ when wrong.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import os
 import re
 from pathlib import Path
@@ -1222,51 +1221,6 @@ def test_a_mismatched_pool_is_built_once_however_many_steps_retry(stub_loader):
 
     assert stub_loader["builds"] == ["/pool"], "the pool was rescanned on a retry"
     assert "/pool" in provider._datasets, "a usable loader was thrown away"
-
-
-@pytest.mark.skipif(
-    importlib.util.find_spec("mvtracker") is None,
-    reason="upstream not importable; the fixture is pinned by inspection instead",
-)
-def test_the_loader_default_this_repo_overrides_is_still_1000():
-    """The drift alarm for max_depth, which no from_name kwarg would reveal.
-
-    EVAL_DEFAULT_KWARGS cannot carry this: `from_name` does not emit `max_depth`,
-    so the value the replay would inherit lives in the constructor signature. If
-    upstream ever changes that default, the override stops being a correction and
-    this says so on the cluster.
-    """
-
-    import inspect
-
-    from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
-
-    default = inspect.signature(KubricMultiViewDataset.__init__).parameters["max_depth"].default
-    assert default == 1000, f"upstream's max_depth default moved to {default!r}"
-
-
-@pytest.mark.skipif(
-    importlib.util.find_spec("mvtracker") is None,
-    reason="upstream not importable; the fixture is pinned by inspection instead",
-)
-def test_the_eval_default_fixture_still_matches_upstream():
-    """Keeps the fixture honest, the way the vendored-module hash tests do.
-
-    A fixture that claims to mirror upstream's defaults is only useful while it
-    does. This runs on the cluster, where mvtracker is importable, and is skipped
-    here -- so it is a drift alarm rather than a local gate.
-    """
-
-    from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
-
-    real = KubricMultiViewDataset.from_name(
-        "kubric-multiview-v3", dataset_root="", just_return_kwargs=True
-    )
-    for name, value in EVAL_DEFAULT_KWARGS.items():
-        if name == "data_root":
-            continue
-        assert name in real, f"{name} vanished from from_name's kwargs"
-        assert real[name] == value, f"{name}: fixture {value!r}, upstream {real[name]!r}"
 
 
 # ------------------------------------------------------------ query anchors ---

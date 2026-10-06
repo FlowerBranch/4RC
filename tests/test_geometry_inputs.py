@@ -275,7 +275,7 @@ def test_camera_vectors_ride_the_reference_reorder():
     # view's slot-0 token must carry its own vector's first entry. Without the
     # reorder line, view s receives another camera's vector and this fails.
     for view in range(4):
-        assert float(output[0, view, 0, 0]) == pytest.approx(view + 1)
+        assert float(output[0, view, 0, 0].detach()) == pytest.approx(view + 1)
 
 
 def test_all_four_arms_are_constructible_and_separate():
