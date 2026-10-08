@@ -544,11 +544,12 @@ def test_camera_vector_is_model_grid_c2w_with_principal_point():
 
 def test_model_grid_intrinsics_match_the_direct_affine_formula():
     """The settled K_model pin: production derives every model-grid intrinsic
-    entry through original_to_output, the repo's ONE spelling of the
-    scale/crop affine; the readable direct formula lives HERE, as the
-    expectation, on a transform with non-trivial scale and non-zero crop in
-    both axes. If ImageTransform ever stops being affine, this is the test
-    that fails."""
+    entry in ImageTransform.intrinsics_to_output, through original_to_output,
+    the repo's ONE spelling of the scale/crop affine; the camera vector and
+    the visual dump's ground-truth cameras both read it there. The readable
+    direct formula lives HERE, as the expectation, on a transform with
+    non-trivial scale and non-zero crop in both axes. If ImageTransform ever
+    stops being affine, this is the test that fails."""
 
     transform = dumped_kubric.ImageTransform(
         original_height=96,
@@ -562,17 +563,22 @@ def test_model_grid_intrinsics_match_the_direct_affine_formula():
     )
     fx, fy, cx, cy = 100.0, 90.0, 63.5, 47.5
 
-    principal = transform.original_to_output(np.array([[cx, cy]]))[0]
-    fx_out = transform.original_to_output(np.array([[cx + fx, cy]]))[0][0] - principal[0]
-    fy_out = transform.original_to_output(np.array([[cx, cy + fy]]))[0][1] - principal[1]
+    model_k = transform.intrinsics_to_output(
+        np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+    )
 
-    np.testing.assert_allclose(fx_out, fx * transform.scale_x, rtol=1e-12)
-    np.testing.assert_allclose(fy_out, fy * transform.scale_y, rtol=1e-12)
+    assert model_k.shape == (3, 3)
+    assert model_k.dtype == np.float64
+    np.testing.assert_allclose(model_k[0, 0], fx * transform.scale_x, rtol=1e-12)
+    np.testing.assert_allclose(model_k[1, 1], fy * transform.scale_y, rtol=1e-12)
     np.testing.assert_allclose(
-        principal[0], cx * transform.scale_x - transform.crop_left, rtol=1e-12
+        model_k[0, 2], cx * transform.scale_x - transform.crop_left, rtol=1e-12
     )
     np.testing.assert_allclose(
-        principal[1], cy * transform.scale_y - transform.crop_top, rtol=1e-12
+        model_k[1, 2], cy * transform.scale_y - transform.crop_top, rtol=1e-12
+    )
+    np.testing.assert_array_equal(
+        model_k[[0, 1, 2, 2, 2], [1, 0, 0, 1, 2]], [0.0, 0.0, 0.0, 0.0, 1.0]
     )
 
 

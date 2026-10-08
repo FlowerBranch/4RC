@@ -591,7 +591,7 @@ def predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
     caller is. Moved here verbatim from
     ``arc.training.sparse_tracking._predicted_pointmaps`` so the model can
     read its own cloud (TrackRefiner) without importing from arc.training;
-    sparse_tracking imports it back under the old name for its two callers
+    sparse_tracking imports it back under the old name for its three callers
     and for the tests that plant a known gauge through that name.
     """
 

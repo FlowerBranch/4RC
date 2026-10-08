@@ -18,6 +18,7 @@ from arc.training import (
     DetachedSim3,
     SparseCorrespondences,
     adjacent_pair_indices,
+    aligned_query_anchors,
     build_anchor_correspondences,
     build_scene,
     capture_rng_state,
@@ -3257,6 +3258,42 @@ def test_anchor_error_reads_a_planted_offset_in_metres(dumped_scene):
     np.testing.assert_allclose(
         errors, torch.linalg.vector_norm(offsets, dim=-1).numpy() * 2.5, rtol=1e-9
     )
+
+
+def test_anchor_errors_are_the_pre_move_formula_bit_for_bit(dumped_scene):
+    """The composition moved into aligned_query_anchors, and no figure moved.
+
+    The visual dump shares the readout's anchor composition through
+    aligned_query_anchors, so the readout's numbers must be exactly the inline
+    formula it used before the move -- written out here as the expectation,
+    through a gauge where every term is non-trivial, at a factor that is not 1,
+    from float32 anchors on the model's side of the fit.
+    """
+
+    scene = dataclasses.replace(dumped_scene, track_upscaling_factor=2.5)
+    correspondences, _ = build_anchor_correspondences(scene)
+    skewed = _skewed_alignment()
+    anchors = _preimage(skewed, _anchors_for(scene, correspondences).double() + 0.01).float()
+
+    stored = skewed.to(device=torch.device("cpu"), dtype=torch.float64)
+    truth = scene.trajectories_world.detach().to(device="cpu", dtype=torch.float64)[
+        correspondences.query_times.cpu(),
+        correspondences.trajectory_indices.cpu(),
+    ]
+    aligned = stored.apply_points(anchors.detach().to(device="cpu", dtype=torch.float64))
+    expected = (
+        torch.linalg.vector_norm(aligned - truth, dim=-1) * float(scene.track_upscaling_factor)
+    ).numpy()
+
+    np.testing.assert_array_equal(
+        query_anchor_errors(anchors, scene, correspondences, skewed)["0:0"], expected
+    )
+    shared, true_positions = aligned_query_anchors(anchors, scene, correspondences, skewed)
+    for tensor in (shared, true_positions):
+        assert tensor.dtype == torch.float64
+        assert tensor.device.type == "cpu"
+    assert torch.equal(shared, aligned)
+    assert torch.equal(true_positions, truth)
 
 
 @pytest.mark.parametrize(

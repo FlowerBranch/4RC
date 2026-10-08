@@ -72,6 +72,7 @@ from .sparse_tracking import (
     DetachedSim3,
     SparseCorrespondences,
     SparseTrackingLossResult,
+    aligned_query_anchors,
     build_anchor_correspondences,
     camera_major_layout,
     compose_predicted_metric,
@@ -83,6 +84,16 @@ from .sparse_tracking import (
     sparse_targets,
     sparse_targets_per_time,
     sparse_tracking_loss,
+    visual_geometry,
+)
+from .visual_dump import (
+    OPTIONAL_VISUAL_KEYS,
+    VISUAL_KEYS,
+    VISUAL_METADATA_KEYS,
+    VISUAL_TRACK_KEYS,
+    build_visual_arrays,
+    read_visual_dump,
+    write_visual_dump,
 )
 
 __all__ = [
@@ -108,8 +119,17 @@ __all__ = [
     "confidence_occlusion_diagnostics",
     "fit_scene_sim3",
     "gather_at_correspondences",
+    "aligned_query_anchors",
     "gather_query_anchor_points",
     "query_anchor_errors",
+    "visual_geometry",
+    "OPTIONAL_VISUAL_KEYS",
+    "VISUAL_KEYS",
+    "VISUAL_METADATA_KEYS",
+    "VISUAL_TRACK_KEYS",
+    "build_visual_arrays",
+    "read_visual_dump",
+    "write_visual_dump",
     "load_temporal_tracking_checkpoint",
     "ManifestPlanError",
     "LEGACY_PREDICTION_KEYS",

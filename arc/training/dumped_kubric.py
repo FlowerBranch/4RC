@@ -59,6 +59,41 @@ class ImageTransform:
         result[..., 1] = result[..., 1] * self.scale_y - self.crop_top
         return result
 
+    def intrinsics_to_output(self, intrinsics: np.ndarray) -> np.ndarray:
+        """Original-image intrinsics re-expressed on the track-head grid, (3,3) float64.
+
+        Every entry goes through :meth:`original_to_output`, the ONE spelling of
+        the scale/crop affine: the principal point is mapped as a point, and
+        each focal as the mapped offset of a point one focal length away from
+        it. The camera-vector input and the visual dump's ground-truth cameras
+        both read their model-grid intrinsics here.
+        """
+
+        intrinsics = np.asarray(intrinsics, dtype=np.float64)
+        principal = self.original_to_output(
+            np.array([[intrinsics[0, 2], intrinsics[1, 2]]])
+        )[0]
+        fx_out = (
+            self.original_to_output(
+                np.array([[intrinsics[0, 2] + intrinsics[0, 0], intrinsics[1, 2]]])
+            )[0][0]
+            - principal[0]
+        )
+        fy_out = (
+            self.original_to_output(
+                np.array([[intrinsics[0, 2], intrinsics[1, 2] + intrinsics[1, 1]]])
+            )[0][1]
+            - principal[1]
+        )
+        return np.array(
+            [
+                [fx_out, 0.0, principal[0]],
+                [0.0, fy_out, principal[1]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+
     def output_to_original_indices(self) -> tuple[np.ndarray, np.ndarray]:
         """Nearest original pixel represented by every output-grid pixel."""
 
@@ -439,10 +474,10 @@ def _attach_view_geometry(scene, *, input_depth_max, input_camera_vectors):
     inverts it) with model-grid intrinsics, plus the principal point the
     9-dim format discards -- it discards it only because ``cam_dec`` must
     predict INTO the format, and a projection has no such obligation. The
-    model-grid intrinsics are derived exclusively through
-    ``ImageTransform.original_to_output`` so no second spelling of the
-    scale/crop affine exists; a test pins the construction against the direct
-    fields formula.
+    model-grid intrinsics come from ``ImageTransform.intrinsics_to_output``,
+    which derives every entry through ``original_to_output`` so no second
+    spelling of the scale/crop affine exists; a test pins that method against
+    the direct fields formula.
     """
 
     if input_depth_max is not None:
@@ -486,50 +521,21 @@ def _attach_view_geometry(scene, *, input_depth_max, input_camera_vectors):
         world_to_camera_rows = []
         principal_points = []
         for observation in scene.observations:
-            transform = observation.image_transform
-            intrinsics = (
+            model_k = observation.image_transform.intrinsics_to_output(
                 scene.intrinsics[observation.camera, observation.original_time]
                 .detach()
                 .cpu()
                 .numpy()
                 .astype(np.float64)
             )
-            principal = transform.original_to_output(
-                np.array([[intrinsics[0, 2], intrinsics[1, 2]]])
-            )[0]
-            fx_out = (
-                transform.original_to_output(
-                    np.array(
-                        [[intrinsics[0, 2] + intrinsics[0, 0], intrinsics[1, 2]]]
-                    )
-                )[0][0]
-                - principal[0]
-            )
-            fy_out = (
-                transform.original_to_output(
-                    np.array(
-                        [[intrinsics[0, 2], intrinsics[1, 2] + intrinsics[1, 1]]]
-                    )
-                )[0][1]
-                - principal[1]
-            )
-            model_intrinsics.append(
-                np.array(
-                    [
-                        [fx_out, 0.0, principal[0]],
-                        [0.0, fy_out, principal[1]],
-                        [0.0, 0.0, 1.0],
-                    ],
-                    dtype=np.float64,
-                )
-            )
+            model_intrinsics.append(model_k)
             world_to_camera_rows.append(
                 scene.extrinsics_world_to_camera[
                     observation.camera, observation.original_time
                 ].double()
             )
             principal_points.append(
-                (principal[0] / output_width, principal[1] / output_height)
+                (model_k[0, 2] / output_width, model_k[1, 2] / output_height)
             )
         camera_to_world = affine_inverse(torch.stack(world_to_camera_rows)[None])
         pose9 = extri_intri_to_pose_encoding(

@@ -34,7 +34,10 @@ matplotlib
 tqdm
 jupyterlab
 opencv-python
-viser
+# Pinned to what $RC_ENV on the Triton login node runs, where the eval viewer
+# is used; 4I4's setup_env.sh installs this file on every run. 1.1.0 renamed
+# line_width to thickness, so a bump moves both requirement files and $RC_ENV.
+viser==1.0.30
 pillow_heif
 plotly
 scikit-image

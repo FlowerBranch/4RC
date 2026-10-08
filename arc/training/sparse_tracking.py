@@ -22,9 +22,9 @@ import torch
 from arc.models.arc.utils.transform import (
     pose_encoding_to_extri_intri,
     # The model reads its own cloud too (TrackRefiner), so the helper lives
-    # beside unproject_depth now; the private alias keeps this module's two
-    # callers, and the tests that plant a known gauge through this name,
-    # unchanged.
+    # beside unproject_depth now; the private alias keeps this module's three
+    # callers (the Sim(3) fit, the anchor gather and visual_geometry), and the
+    # tests that plant a known gauge through this name, unchanged.
     predicted_pointmaps as _predicted_pointmaps,
 )
 from arc.training.diagnostics import (
@@ -995,34 +995,30 @@ def gather_query_anchor_points(
     return anchors.detach(), "model"
 
 
-def query_anchor_errors(
+def aligned_query_anchors(
     model_anchors: torch.Tensor,
     scene: DumpedKubricScene,
     correspondences: SparseCorrespondences,
     alignment: DetachedSim3,
-) -> dict[str, np.ndarray]:
-    """Metric distance from the model's own query anchor to the tracked point.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The model's own query anchors in the stored frame, beside the tracked points.
 
     ``model_anchors`` are what :func:`gather_query_anchor_points` returns with
     both eval-only diagnostics off: one row per correspondence, in the
     reconstruction's own gauge.  Each is carried into the stored frame by
-    ``alignment.apply_points`` and compared there with the tracked point's true
+    ``alignment.apply_points``; the second tensor is the tracked point's true
     position at its query time,
     ``scene.trajectories_world[query_times, trajectory_indices]`` -- exactly
-    the value ``oracle_query_anchor`` substitutes -- and the distance is lifted
-    to metres by the scene's track upscaling factor, outside the Sim(3), as
-    every other metric figure is.  A world-frame anchor (either diagnostic's)
-    must not come here: ``apply_points`` would carry it into the stored frame a
-    second time.
+    the value ``oracle_query_anchor`` substitutes.  Both ``(count, 3)``, in
+    stored units.  A world-frame anchor (either diagnostic's) must not come
+    here: ``apply_points`` would carry it into the stored frame a second time.
 
-    Rows are grouped by ``correspondences.query_slots``, which index the
-    adapter's anchor list, so each group is one anchor, keyed by
-    :func:`_anchor_key` of its ``scene.query_anchors`` entry.  Every seated
-    anchor is present, in spec order, with an empty array where it supervises
-    no row.  Pass the **scene-level** correspondences, for the reason
-    :func:`gather_query_anchor_points` gives: a set rebased by
-    :meth:`SparseCorrespondences.select_query_slot` has every slot at 0 and
-    would file every anchor's rows under the first.
+    The one composition behind :func:`query_anchor_errors` and
+    :func:`visual_geometry`, so the anchors the visual dump draws are the ones
+    the readout measures by construction.  Pass the **scene-level**
+    correspondences, whose ``query_slots`` index ``scene.query_anchors``, for
+    the reason :func:`gather_query_anchor_points` gives: a set rebased by
+    :meth:`SparseCorrespondences.select_query_slot` has every slot at 0.
 
     Detached, on CPU and in float64: the anchors arrive on the model's device
     and the fitted alignment on CPU, so no autocast context reaches the
@@ -1049,14 +1045,225 @@ def query_anchor_errors(
         correspondences.query_times.cpu(),
         correspondences.trajectory_indices.cpu(),
     ]
+    return alignment.apply_points(anchors), truth
+
+
+def query_anchor_errors(
+    model_anchors: torch.Tensor,
+    scene: DumpedKubricScene,
+    correspondences: SparseCorrespondences,
+    alignment: DetachedSim3,
+) -> dict[str, np.ndarray]:
+    """Metric distance from the model's own query anchor to the tracked point.
+
+    The distance between the two rows :func:`aligned_query_anchors` returns --
+    the model's anchor carried into the stored frame, and the tracked point's
+    true position at its query time -- lifted to metres by the scene's track
+    upscaling factor, outside the Sim(3), as every other metric figure is.
+    ``model_anchors`` and the correspondences carry that function's contract.
+
+    Rows are grouped by ``correspondences.query_slots``, which index the
+    adapter's anchor list, so each group is one anchor, keyed by
+    :func:`_anchor_key` of its ``scene.query_anchors`` entry.  Every seated
+    anchor is present, in spec order, with an empty array where it supervises
+    no row.  A set rebased by :meth:`SparseCorrespondences.select_query_slot`
+    has every slot at 0 and would file every anchor's rows under the first.
+
+    Detached, on CPU and in float64, and nothing here draws randomness.
+    """
+
+    aligned, truth = aligned_query_anchors(
+        model_anchors, scene, correspondences, alignment
+    )
+    query_slots = correspondences.query_slots.cpu().numpy()
     distances = (
-        torch.linalg.vector_norm(alignment.apply_points(anchors) - truth, dim=-1)
+        torch.linalg.vector_norm(aligned - truth, dim=-1)
         * float(scene.track_upscaling_factor)
     ).numpy()
     return {
         _anchor_key(camera, time): distances[query_slots == index]
         for index, (camera, time) in enumerate(scene.query_anchors)
     }
+
+
+def visual_geometry(
+    raw_predictions: dict,
+    scene: DumpedKubricScene,
+    correspondences: SparseCorrespondences,
+    alignment: DetachedSim3,
+    model_anchors: torch.Tensor,
+    *,
+    stride: int,
+) -> dict[str, np.ndarray]:
+    """What the held-out eval saw of one scene, for the multi-view viewer.
+
+    Everything is in the stored world frame with distances lifted to metres by
+    the scene's track upscaling factor -- the frame and units the prediction
+    bundles' ``pred`` and ``gt`` already use, so the scored tracks overlay
+    these clouds as written.  Composed on CPU in float64 and returned in the
+    dtypes :mod:`arc.training.visual_dump` stores.  The pixel subsample is the
+    fixed grid ``[::stride, ::stride]`` of the model's ``H x W``, and nothing
+    here draws randomness.
+
+    Per observation slot, indexed by ``Observation.slot``:
+
+    * identity: ``Observation.camera_id`` (the id the anchor keys use), the
+      original time and the semantic time index;
+    * the predicted cloud: :func:`_predicted_pointmaps` carried through
+      ``alignment.apply_points``.  It is read through this module's name for
+      that function, so a planted gauge reaches this reader exactly as it
+      reaches the Sim(3) fit and the anchor gather.  Beside it, the input
+      image's RGB at the same pixels, and the depth confidence there under
+      ``depth_conf`` -- present only when the model emitted one, absent rather
+      than a sentinel, as ``fit_scene_sim3`` reads it;
+    * the ground-truth cloud: :func:`_metric_pointmap_at_anchor` at the same
+      pixels, with its validity;
+    * both cameras, as camera-to-world rotation, centre and model-grid
+      intrinsics.  The predicted camera is ``pose_enc``'s token camera
+      expressed in the stored world through the same alignment, composed as
+      :func:`reconstruction_drift_report` composes it: the centre through
+      ``apply_points``, the orientation rotated by the alignment rotation.
+      The ground-truth camera inverts ``extrinsics_world_to_camera``, and
+      :meth:`ImageTransform.intrinsics_to_output` maps its intrinsics onto
+      the model grid, so both frusta share one pixel grid.
+
+    Per correspondence row: the model's own anchor and the tracked point's
+    true position, as :func:`aligned_query_anchors` composes them -- exactly
+    what :func:`query_anchor_errors` measures -- and the anchor's
+    :func:`_anchor_key`.  ``model_anchors`` must be the MODEL's anchors (both
+    eval-only diagnostics off), whatever anchored the scored tracks.
+    """
+
+    if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:
+        raise ValueError(f"stride must be a positive integer, got {stride!r}")
+    pointmaps = _predicted_pointmaps(raw_predictions)
+    slot_count = scene.num_observations
+    if pointmaps.shape[1] != slot_count:
+        raise ValueError(
+            f"Model returned {pointmaps.shape[1]} pointmaps for {slot_count} inputs"
+        )
+    height, width = pointmaps.shape[2:4]
+    rows = np.arange(0, height, stride, dtype=np.int64)
+    columns = np.arange(0, width, stride, dtype=np.int64)
+    upscaling = float(scene.track_upscaling_factor)
+
+    aligned_anchors, true_anchors = aligned_query_anchors(
+        model_anchors, scene, correspondences, alignment
+    )
+    with torch.no_grad(), torch.autocast(device_type="cpu", enabled=False):
+        alignment64 = alignment.to(device=torch.device("cpu"), dtype=torch.float64)
+        predicted_points = (
+            alignment64.apply_points(
+                pointmaps[0, :, ::stride, ::stride].detach().cpu().double()
+            )
+            * upscaling
+        )
+        camera_to_world, predicted_intrinsics = pose_encoding_to_extri_intri(
+            raw_predictions["pose_enc"].detach().float().cpu(),
+            (height, width),
+        )
+        camera_to_world = camera_to_world[0].double()
+        predicted_rotation = alignment64.rotation @ camera_to_world[:, :3, :3]
+        predicted_center = (
+            alignment64.apply_points(camera_to_world[:, :3, 3]) * upscaling
+        )
+
+    grid = (slot_count, rows.size, columns.size)
+    camera_ids = np.empty(slot_count, dtype=np.int64)
+    original_times = np.empty(slot_count, dtype=np.int64)
+    time_indices = np.empty(slot_count, dtype=np.int64)
+    rgb = np.empty((*grid, 3), dtype=np.uint8)
+    ground_truth_points = np.empty((*grid, 3), dtype=np.float32)
+    ground_truth_valid = np.empty(grid, dtype=bool)
+    ground_truth_rotation = np.empty((slot_count, 3, 3), dtype=np.float32)
+    ground_truth_center = np.empty((slot_count, 3), dtype=np.float32)
+    ground_truth_intrinsics = np.empty((slot_count, 3, 3), dtype=np.float32)
+    for observation in scene.observations:
+        slot = observation.slot
+        camera_ids[slot] = observation.camera_id
+        original_times[slot] = observation.original_time
+        time_indices[slot] = observation.semantic_time_index
+
+        image = scene.views[slot]["img"].detach().float().cpu()[0]
+        if tuple(image.shape[-2:]) != (height, width):
+            raise ValueError(
+                f"Input image grid {tuple(image.shape[-2:])} of slot {slot} does "
+                f"not match the pointmap grid {(height, width)}"
+            )
+        # The loader's ImgNorm maps each uint8 value v to 2v/255 - 1, so this
+        # inverts it exactly up to float rounding; rint rather than truncation.
+        rgb[slot] = np.clip(
+            np.rint((image.permute(1, 2, 0).numpy()[::stride, ::stride] + 1.0) * 127.5),
+            0,
+            255,
+        ).astype(np.uint8)
+
+        world_points, valid = _metric_pointmap_at_anchor(scene, slot)
+        if valid.shape != (height, width):
+            raise ValueError(
+                f"Ground-truth pointmap grid {valid.shape} of slot {slot} does "
+                f"not match the pointmap grid {(height, width)}"
+            )
+        ground_truth_points[slot] = world_points[::stride, ::stride] * upscaling
+        ground_truth_valid[slot] = valid[::stride, ::stride]
+
+        world_to_camera = (
+            scene.extrinsics_world_to_camera[
+                observation.camera, observation.original_time
+            ]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64)
+        )
+        rotation = world_to_camera[:3, :3]
+        ground_truth_rotation[slot] = rotation.T
+        ground_truth_center[slot] = -(rotation.T @ world_to_camera[:3, 3]) * upscaling
+        ground_truth_intrinsics[slot] = observation.image_transform.intrinsics_to_output(
+            scene.intrinsics[observation.camera, observation.original_time]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    geometry = {
+        "slot_camera_id": camera_ids,
+        "slot_original_time": original_times,
+        "slot_time_index": time_indices,
+        "image_size": np.array([height, width], dtype=np.int64),
+        "pixel_rows": rows,
+        "pixel_columns": columns,
+        "pred_points_m": predicted_points.numpy().astype(np.float32),
+        "rgb": rgb,
+        "gt_points_m": ground_truth_points,
+        "gt_points_valid": ground_truth_valid,
+        "pred_camera_rotation": predicted_rotation.numpy().astype(np.float32),
+        "pred_camera_center_m": predicted_center.numpy().astype(np.float32),
+        "pred_intrinsics": predicted_intrinsics[0].numpy().astype(np.float32),
+        "gt_camera_rotation": ground_truth_rotation,
+        "gt_camera_center_m": ground_truth_center,
+        "gt_intrinsics": ground_truth_intrinsics,
+        "anchor_pred_m": (aligned_anchors * upscaling).numpy().astype(np.float32),
+        "anchor_true_m": (true_anchors * upscaling).numpy().astype(np.float32),
+        "anchor_key": np.array(
+            [
+                _anchor_key(*scene.query_anchors[slot])
+                for slot in correspondences.query_slots.cpu().tolist()
+            ],
+            dtype=np.str_,
+        ),
+    }
+    confidence = raw_predictions.get("depth_conf")
+    if confidence is not None:
+        if tuple(confidence.shape) != (1, slot_count, height, width):
+            raise ValueError(
+                f"depth_conf must have shape {(1, slot_count, height, width)}, "
+                f"got {tuple(confidence.shape)}"
+            )
+        geometry["depth_conf"] = (
+            confidence[0, :, ::stride, ::stride].detach().float().cpu().numpy()
+        )
+    return geometry
 
 
 # The stages a query passes through at one anchor, in the order they are

@@ -36,6 +36,7 @@ import argparse
 import json
 import math
 import signal
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -1066,6 +1067,9 @@ def evaluate_held_out(
     oracle_query_anchor: bool = False,
     ground_truth_query_anchor: bool = False,
     refine_iters: int = 1,
+    visual_scenes: frozenset[str] = frozenset(),
+    visual_stride: int = 4,
+    run_identity: dict | None = None,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
@@ -1157,19 +1161,48 @@ def evaluate_held_out(
     keys of :func:`_readout_aggregates`. Neither draws randomness, and every
     other figure, ``history.jsonl`` and the written bundles are untouched by
     them.
+
+    ``visual_scenes`` names the scored scenes whose plain arm is also written
+    for the multi-view viewer, to ``visual/<scene>.npz`` beside
+    ``metrics.json`` (see :mod:`arc.training.visual_dump`):
+
+    * the reconstruction, both camera sets and the model's own anchors, from
+      :func:`arc.training.visual_geometry` -- the same ``raw``, Sim(3) and
+      scene-level correspondences the readouts read, every cloud at
+      ``visual_stride``;
+    * the scored tracks, the bundle's own arrays whether or not
+      ``emit_predictions`` writes the bundle;
+    * metadata: ``run_identity`` (checkpoint dir and commit, read once per
+      run, so required whenever a scene is named), the head settings this
+      eval ran, and the scene's two readouts.
+
+    The anchors are the model's own under either eval-only diagnostic, as the
+    anchor readout's are; the tracks are what was scored. The dump draws no
+    randomness and feeds nothing back, so every other output is
+    byte-identical with it on; empty, the default, it writes nothing. A
+    skipped scene has nothing to dump.
     """
 
     from arc.training import (
         build_anchor_correspondences,
+        build_visual_arrays,
         fit_scene_sim3,
         gather_query_anchor_points,
         query_anchor_errors,
         reconstruction_drift_report,
         sparse_tracking_loss,
+        visual_geometry,
+        write_visual_dump,
     )
+    from arc.training.dumped_kubric import CAMERA_VECTOR_KEY, DEPTH_INPUT_KEY
     from arc.training.predictions import reference_tau, write_scene_predictions
     from arc.training.runtime import shuffled_index_views
 
+    if visual_scenes and run_identity is None:
+        raise ValueError(
+            "visual_scenes needs run_identity: a dump that cannot name the "
+            "checkpoint and commit behind it cannot say which model is on screen"
+        )
     rng = capture_rng_state()
     modes = {name: module.training for name, module in model.named_modules()}
     directory = Path(output_dir) / "eval" / f"step-{step}"
@@ -1390,8 +1423,12 @@ def evaluate_held_out(
                     entry["position_loss_shuffled"] = None
                     entry["velocity_consistency_shuffled"] = None
 
-                if emit_predictions:
-                    arrays = _prediction_arrays(
+                # One assembly serves both writers, so the visual dump carries
+                # exactly the arrays the bundle holds -- what was scored --
+                # built the same way whether or not the bundle is written.
+                dumped = plan.seq_name in visual_scenes
+                arrays = (
+                    _prediction_arrays(
                         raw,
                         scene,
                         correspondences,
@@ -1401,6 +1438,10 @@ def evaluate_held_out(
                         anchor_frame=anchor_frame,
                         merge_synchronized_slots=merge_synchronized_slots,
                     )
+                    if emit_predictions or dumped
+                    else None
+                )
+                if emit_predictions:
                     # None, not 0.0, on a run with no operating point: the bundle
                     # carries no `occ` to take a fraction of, and a zero here would
                     # read as "the model called nothing occluded", which is a
@@ -1418,6 +1459,46 @@ def evaluate_held_out(
                     key: _distance_summary(errors)
                     for key, errors in anchor_errors.items()
                 }
+                if dumped:
+                    # The plain arm's raw, Sim(3) and scene-level
+                    # correspondences, the ones the readouts above read; the
+                    # model's own anchors whatever anchored the scored tracks.
+                    write_visual_dump(
+                        directory / "visual" / f"{plan.seq_name}.npz",
+                        build_visual_arrays(
+                            geometry=visual_geometry(
+                                raw,
+                                scene,
+                                correspondences,
+                                alignment,
+                                model_anchors,
+                                stride=visual_stride,
+                            ),
+                            tracks=arrays,
+                            metadata={
+                                "scene": plan.seq_name,
+                                "step": step,
+                                "output_dir": str(output_dir),
+                                "checkpoint_dir": run_identity["checkpoint_dir"],
+                                "commit": run_identity["commit"],
+                                "merge_synchronized_slots": bool(
+                                    merge_synchronized_slots
+                                ),
+                                "refine_iters": int(refine_iters),
+                                # What this forward actually received, read off
+                                # the views it was handed.
+                                "depth_input": DEPTH_INPUT_KEY in scene.views[0],
+                                "camera_input": CAMERA_VECTOR_KEY in scene.views[0],
+                                "oracle_query_anchor": bool(oracle_query_anchor),
+                                "ground_truth_query_anchor": bool(
+                                    ground_truth_query_anchor
+                                ),
+                                "query_anchors": list(query_anchors),
+                                "base_ratio": drift["base_ratio"],
+                                "anchor_error_m": entry["anchor_error_m"],
+                            },
+                        ),
+                    )
             per_scene.append(entry)
             scene_anchor_errors.append(anchor_errors)
             del raw, scene
@@ -2485,6 +2566,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "be combined with --oracle_query_anchor"
         ),
     )
+    evaluation.add_argument(
+        "--eval_visual_scenes",
+        nargs="*",
+        default=[],
+        metavar="SCENE",
+        help=(
+            "Eval-only: at every held-out eval, also write what the plain arm "
+            "saw of these held-out scenes -- the aligned reconstruction, the "
+            "predicted and ground-truth cameras, the model's own query anchors "
+            "and the scored tracks, in metres in the stored world -- to "
+            "eval/step-<N>/visual/<scene>.npz, for python -m "
+            "arc.viz.viser_multiview_eval. Takes held-out scene names, or "
+            "'all'; empty, the default, writes nothing. Written at EVERY eval, "
+            "so the disk cost multiplies: a 20000-step run at --eval_every 500 "
+            "writes each scene 40 times. Changes no gradient, figure or other "
+            "output and is not stored in the checkpoint, so a resume may switch "
+            "it freely. Needs --val_scenes_file and a nonzero --eval_every"
+        ),
+    )
+    evaluation.add_argument(
+        "--eval_visual_stride",
+        type=int,
+        default=4,
+        help=(
+            "Pixel stride of the clouds --eval_visual_scenes writes: every "
+            "stride-th row and column of the model grid, a fixed subsample with "
+            "no randomness. Tracks and anchors are written in full. Eval-only "
+            "and not stored in the checkpoint, like --eval_visual_scenes "
+            "(default: %(default)s)"
+        ),
+    )
     return parser
 
 
@@ -2656,6 +2768,37 @@ def _validate_args(args: argparse.Namespace) -> None:
             "--ground_truth_query_anchor: each replaces the query anchor with "
             "a different ground-truth reading and the eval writes one curve; "
             "drop one of the two flags"
+        )
+    # The visual dump rides the held-out eval, so a flag that can never reach
+    # one is refused here rather than silently writing nothing. Scene names
+    # are checked against the held-out set itself in run_training's preflight,
+    # the first point that set is known.
+    if args.eval_visual_scenes:
+        if not args.val_scenes_file:
+            raise ValueError(
+                "--eval_visual_scenes needs --val_scenes_file: the dump is written "
+                "by the held-out eval, so without a held-out set nothing would "
+                "ever be written"
+            )
+        if not args.eval_every:
+            raise ValueError(
+                "--eval_visual_scenes needs a nonzero --eval_every: --eval_every 0 "
+                "switches the held-out eval off, so the dump would silently never "
+                "be written"
+            )
+        if "all" in args.eval_visual_scenes and len(args.eval_visual_scenes) > 1:
+            raise ValueError(
+                "--eval_visual_scenes takes held-out scene names or 'all' alone, "
+                f"got {args.eval_visual_scenes}"
+            )
+        duplicates = sorted(
+            name for name, count in Counter(args.eval_visual_scenes).items() if count > 1
+        )
+        if duplicates:
+            raise ValueError(f"--eval_visual_scenes names {duplicates} more than once")
+    if args.eval_visual_stride < 1:
+        raise ValueError(
+            f"--eval_visual_stride must be at least 1, got {args.eval_visual_stride}"
         )
 
     anchor_slots = parse_query_anchor_slots(args.query_anchors)
@@ -2973,6 +3116,64 @@ def append_step_history(path: Path, outcome: StepOutcome) -> None:
         handle.write(json.dumps(record) + "\n")
 
 
+def _resolve_visual_scenes(
+    requested, held_out, *, unsupervisable
+) -> frozenset[str]:
+    """The held-out scenes ``--eval_visual_scenes`` dumps, refused where it cannot.
+
+    ``all`` is every held-out scene the preflight found supervisable: the eval
+    skips the others at every boundary, so there is nothing to dump for them.
+    An explicitly named scene is refused instead when it is not in the
+    held-out set, or when it is unsupervisable -- the dump asked for would
+    never be written, while the run would read as having produced it. The
+    parse-time half (``all`` alone, no duplicates) is ``_validate_args``'s.
+    """
+
+    if not requested:
+        return frozenset()
+    if list(requested) == ["all"]:
+        return frozenset(held_out) - frozenset(unsupervisable)
+    unknown = sorted(set(requested) - set(held_out))
+    if unknown:
+        raise ValueError(
+            f"--eval_visual_scenes names {unknown}, which are not held-out scenes; "
+            f"the held-out set is {sorted(held_out)}"
+        )
+    unscorable = sorted(set(requested) & set(unsupervisable))
+    if unscorable:
+        raise ValueError(
+            f"--eval_visual_scenes names {unscorable}, which no anchor can "
+            "supervise: the eval skips them at every boundary, so their dump "
+            "would never be written"
+        )
+    return frozenset(requested)
+
+
+def _fork_commit(repo: Path) -> str | None:
+    """HEAD of the git checkout at ``repo``, or None outside one.
+
+    The commit the visual dump records, so the model on screen names the code
+    that produced it. On the cluster HEAD is the pinned commit: 4I4's
+    ``require_pin`` refuses a checkout at any other HEAD. It only warns on
+    uncommitted changes, though, so those -- on the cluster or locally -- are
+    not reflected here. None rather than an error without git or a checkout:
+    the dump is a viewer aid and must not end a run.
+    """
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    commit = completed.stdout.strip()
+    return commit if completed.returncode == 0 and commit else None
+
+
 def run_training(
     *,
     model,
@@ -3128,6 +3329,22 @@ def run_training(
         print(
             f"held_out_preflight_ok={len(val_plans) - len(unsupervisable)}/{len(val_plans)}"
         )
+    # The visual dump's scenes, resolved and checked here, before any step:
+    # this is the first point the held-out set is known. The run identity the
+    # dump records is read once, and only when something will be dumped.
+    visual_scenes = _resolve_visual_scenes(
+        args.eval_visual_scenes,
+        [plan.seq_name for plan in val_plans or []],
+        unsupervisable=[entry["scene"] for entry in unsupervisable],
+    )
+    run_identity = (
+        {
+            "checkpoint_dir": args.checkpoint_dir,
+            "commit": _fork_commit(Path(__file__).resolve().parent),
+        }
+        if visual_scenes
+        else None
+    )
     history: list[StepOutcome] = []
     history_path = open_step_history(output_dir, start_step=start_step)
     evaluations: list[dict] = []
@@ -3434,6 +3651,11 @@ def run_training(
                 # The run's own count, so the held-out curve measures the
                 # model as trained and every pass is scored.
                 refine_iters=args.refine_iters,
+                # Eval-only, like the anchor diagnostics: resolved at the
+                # preflight above and never stored in the checkpoint.
+                visual_scenes=visual_scenes,
+                visual_stride=args.eval_visual_stride,
+                run_identity=run_identity,
             )
             evaluations.append(metrics)
             print(

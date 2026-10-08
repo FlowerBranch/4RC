@@ -24,6 +24,9 @@ Pillow
 opencv-python
 matplotlib
 tqdm
+# The headless viewer test (tests/test_viser_multiview_eval.py). Pinned to the
+# version requirements.txt pins, which is what $RC_ENV runs.
+viser==1.0.30
 pytest
 # Not a linter for style: tests/test_static_analysis.py asserts on exactly two
 # pyflakes message classes, the "name is read but not bound" pair that

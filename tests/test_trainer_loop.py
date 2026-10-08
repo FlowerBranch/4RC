@@ -313,6 +313,14 @@ def _loop_args(tmp_path, **overrides):
         # assumes; at one pass gamma is inert.
         refine_iters=1,
         refine_gamma=0.8,
+        # The eval-only visual dump: NOT stored by _checkpoint_settings and in
+        # no resume tier, like the anchor diagnostics. run_training resolves the
+        # scenes at its preflight and threads both into evaluate_held_out, and
+        # _validate_args reads both, so every loop test needs them present.
+        # Empty is the parser's default and writes nothing, the behaviour every
+        # existing test assumes.
+        eval_visual_scenes=[],
+        eval_visual_stride=4,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -917,6 +925,52 @@ def test_the_trainer_wires_the_refinement_flags_to_freeze_assert_step_and_eval()
     assert calls.get("evaluate_held_out"), "run_training has no evaluate_held_out call"
     for call in calls["evaluate_held_out"]:
         assert reads_args(keyword(call, "refine_iters"), "refine_iters")
+
+
+def test_the_trainer_wires_the_visual_dump_flags_into_the_eval():
+    """Inspected rather than executed, as the refinement pin above is. A loop
+    that resolved --eval_visual_scenes but handed the eval a constant, or read
+    the stride off anything but its own flag, would dump the wrong scenes or
+    at the wrong density while every flag-off test passed. The eval call must
+    pass the stride flag itself and the scene set and run identity the
+    preflight resolved, and the resolution must read the scene flag."""
+
+    tree = ast.parse(Path(train_cli.__file__).read_text())
+    calls = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            calls.setdefault(name, []).append(node)
+
+    def keyword(call, name):
+        return next((item.value for item in call.keywords if item.arg == name), None)
+
+    def reads_args(node, attribute):
+        return (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+            and node.attr == attribute
+        )
+
+    assert calls.get("evaluate_held_out"), "run_training has no evaluate_held_out call"
+    for call in calls["evaluate_held_out"]:
+        assert reads_args(keyword(call, "visual_stride"), "eval_visual_stride")
+        for name in ("visual_scenes", "run_identity"):
+            value = keyword(call, name)
+            assert isinstance(value, ast.Name) and value.id == name, name
+    assert len(calls.get("_resolve_visual_scenes", [])) == 1
+    assert reads_args(calls["_resolve_visual_scenes"][0].args[0], "eval_visual_scenes")
+    bound = {
+        target.id: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+        and target.id in ("visual_scenes", "run_identity")
+    }
+    assert getattr(bound["visual_scenes"].func, "id", None) == "_resolve_visual_scenes"
+    assert isinstance(bound["run_identity"], ast.IfExp)
 
 
 def test_the_refinement_flags_default_to_one_iteration_at_mvtrackers_gamma():
