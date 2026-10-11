@@ -158,16 +158,11 @@ def _head_summary(metadata: dict) -> str:
         for name, on in (("depth", metadata["depth_input"]), ("camera", metadata["camera_input"]))
         if on
     ]
-    if metadata["oracle_query_anchor"]:
-        scored = "oracle anchors"
-    elif metadata["ground_truth_query_anchor"]:
-        scored = "ground-truth-depth anchors"
-    else:
-        scored = "model anchors"
     return (
         f"{'merged' if metadata['merge_synchronized_slots'] else 'per-slot'} head, "
         f"K={metadata['refine_iters']}, inputs: {'+'.join(inputs) or 'none'}, "
-        f"tracks scored on {scored}"
+        f"trained on {metadata['query_anchor_source']} anchors, "
+        f"tracks scored on {metadata['eval_query_anchor_source']} anchors"
     )
 
 

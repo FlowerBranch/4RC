@@ -290,14 +290,19 @@ def _loop_args(tmp_path, **overrides):
         # it; 1 is the parser's default and the every-step-is-a-window contract
         # every existing test assumes.
         grad_accum=1,
-        # Eval-only diagnostic: the held-out tracks anchored at ground truth.
-        # Changes no gradient, so NOT stored by _checkpoint_settings and in
-        # neither resume tier, like the guard thresholds; run_training threads
-        # it into evaluate_held_out, so every loop test needs it present. Off is
-        # the parser's default and the behaviour every existing test assumes.
+        # The query anchor every step's loss composes on: stream-defining
+        # (REFUSED tier, absent default "predicted"), read by
+        # _checkpoint_settings, _plan_summary and run_training's step and eval
+        # calls, so every loop test needs it present. The model's own anchor
+        # is the parser's default and today's step.
+        query_anchor_source="predicted",
+        # The eval's own anchor flags. Change no gradient, so NOT stored by
+        # _checkpoint_settings and in neither resume tier, like the guard
+        # thresholds; _eval_query_anchor_source resolves them for run_training
+        # and _plan_summary, so every loop test needs them present. None and
+        # off are the parser's defaults: the eval follows the training source.
+        eval_query_anchor_source=None,
         oracle_query_anchor=False,
-        # Its realisable sibling, same eval-only / non-resume shape; off is
-        # the parser's default and the behaviour every existing test assumes.
         ground_truth_query_anchor=False,
         # The geometry-input training flags: stream-defining (REFUSED tier,
         # absent-default False), read by _checkpoint_settings and
@@ -1653,6 +1658,7 @@ def test_the_real_held_out_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     assert metrics["step"] == 7 and metrics["scenes"] == 1
@@ -1702,6 +1708,7 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
         merge_synchronized_slots=True,
     )
 
@@ -1721,23 +1728,22 @@ def test_the_merged_eval_runs_end_to_end_on_cpu(tmp_path, monkeypatch):
     assert loaded["gt_vis_any"].shape[0] == 4
 
 
-@pytest.mark.parametrize(
-    "flag", ("oracle_query_anchor", "ground_truth_query_anchor")
-)
-def test_evaluate_held_out_threads_the_anchor_diagnostics(
-    tmp_path, monkeypatch, flag
+@pytest.mark.parametrize("source", ("predicted", "query_position", "gt_depth"))
+def test_each_anchor_source_reaches_the_eval_gather_and_the_step_gather(
+    tmp_path, monkeypatch, source
 ):
-    """Each flag reaches the eval's scoring gather and never train_step's.
+    """Each source reaches the gather it names, in the eval and in the step.
 
     Both functions import ``gather_query_anchor_points`` from the package at
     call time, so the package namespace is the one interception point -- the
     same seam the sync-weight recorder uses. The eval is asserted on its
-    recorded kwargs AND on the marker it writes, because the marker is what a
-    later reader has; train_step is asserted on both kwargs' absence, since a
-    step that so much as spelled one would be one keystroke from supervising
-    against ground truth. With a flag on, the eval gathers a second time, bare:
-    the anchor-error readout describes the model's own anchor, which the flag
-    replaced for scoring.
+    recorded kwargs AND on the markers it writes, because the markers are what
+    a later reader has. It scores on ``source`` for a run trained against
+    ``gt_depth``, so the written training source and the two booleans derived
+    from the eval's reading cannot both come from one value. With a
+    ground-truth source the eval gathers a second time, bare: the anchor-error
+    readout describes the model's own anchor, which the source replaced for
+    scoring. train_step, at the same source, spells it on its one gather.
     """
 
     import arc.training as training_package
@@ -1758,52 +1764,37 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
     model = _FakeArc(scene.num_observations, height, width)
     plan = plan_record(_record(seq_name="0000"), budget=48, stride=2)
 
-    other = (
-        "ground_truth_query_anchor"
-        if flag == "oracle_query_anchor"
-        else "oracle_query_anchor"
+    metrics = train_cli.evaluate_held_out(
+        model=model,
+        plans=[plan],
+        scene_provider=lambda _plan: scene,
+        precision="32",
+        huber_delta_m=0.05,
+        step=1,
+        output_dir=tmp_path / "out",
+        query_anchors=["0:0"],
+        confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="gt_depth",
+        eval_query_anchor_source=source,
     )
-    expected: list[dict] = []
-    for step, enabled in ((1, True), (2, False)):
-        metrics = train_cli.evaluate_held_out(
-            model=model,
-            plans=[plan],
-            scene_provider=lambda _plan: scene,
-            precision="32",
-            huber_delta_m=0.05,
-            step=step,
-            output_dir=tmp_path / "out",
-            query_anchors=["0:0"],
-            confidence_alpha=_EVAL_ALPHA,
-            **{flag: enabled},
-        )
-        # One scoring gather per scene: both arms and the writer reuse its
-        # result, and its call site always spells both kwargs; the flag picks
-        # values. A flag that replaced the anchor adds the readout's gather of
-        # the model's own, spelling neither.
-        expected.append(
-            {
-                "oracle_query_anchor": flag == "oracle_query_anchor" and enabled,
-                "ground_truth_query_anchor": (
-                    flag == "ground_truth_query_anchor" and enabled
-                ),
-            }
-        )
-        if enabled:
-            expected.append({})
-        assert seen == expected
-        if enabled:
-            # The forward's own output, depth and pose_enc included: the fixture
-            # plants the pointmaps, so only identity tells a stripped dict apart.
-            assert raws[-1] is raws[-2]
-        assert metrics[flag] is enabled
-        assert metrics[other] is False
-        written = json.loads(
-            (tmp_path / "out" / "eval" / f"step-{step}" / "metrics.json").read_text()
-        )
-        assert written[flag] is enabled
-        assert written[other] is False
+    # One scoring gather per scene: both arms and the writer reuse its result.
+    # A ground-truth source adds the readout's gather of the model's own,
+    # spelling nothing.
+    assert seen == [{"source": source}] + ([] if source == "predicted" else [{}])
+    if source != "predicted":
+        # The forward's own output, depth and pose_enc included: the fixture
+        # plants the pointmaps, so only identity tells a stripped dict apart.
+        assert raws[-1] is raws[-2]
+    written = json.loads(
+        (tmp_path / "out" / "eval" / "step-1" / "metrics.json").read_text()
+    )
+    for record in (metrics, written):
+        assert record["oracle_query_anchor"] is (source == "query_position")
+        assert record["ground_truth_query_anchor"] is (source == "gt_depth")
+        assert record["query_anchor_source"] == "gt_depth"
+        assert record["eval_query_anchor_source"] == source
 
+    seen.clear()
     step_scene = _step_scene(monkeypatch)
     height, width = step_scene.views[0]["img"].shape[-2:]
     step_model = _FakeArc(step_scene.num_observations, height, width)
@@ -1827,11 +1818,9 @@ def test_evaluate_held_out_threads_the_anchor_diagnostics(
         accum_steps=1,
         window_start=True,
         window_end=True,
+        query_anchor_source=source,
     )
-    assert len(seen) == len(expected) + 1 == 4
-    # No such keyword at all: the step's call site is verbatim.
-    assert "oracle_query_anchor" not in seen[-1]
-    assert "ground_truth_query_anchor" not in seen[-1]
+    assert seen == [{"source": source}]
 
 
 @pytest.mark.parametrize("gauge", ("identity", "scaled"))
@@ -1884,8 +1873,9 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(
             output_dir=tmp_path / "out",
             query_anchors=["0:0"],
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             merge_synchronized_slots=merge,
-            oracle_query_anchor=enabled,
+            eval_query_anchor_source="query_position" if enabled else "predicted",
         )
         bundles[enabled] = dict(
             np.load(tmp_path / "out" / "eval" / f"step-{step}" / "pred" / "0000.npz")
@@ -1951,8 +1941,8 @@ def test_the_ground_truth_anchor_matches_an_exact_reconstruction(
     metrics = {}
     for step, kwargs in (
         (1, {}),
-        (2, {"ground_truth_query_anchor": True}),
-        (3, {"oracle_query_anchor": True}),
+        (2, {"eval_query_anchor_source": "gt_depth"}),
+        (3, {"eval_query_anchor_source": "query_position"}),
     ):
         metrics[step] = train_cli.evaluate_held_out(
             model=model,
@@ -1964,6 +1954,7 @@ def test_the_ground_truth_anchor_matches_an_exact_reconstruction(
             output_dir=tmp_path / "out",
             query_anchors=["0:0"],
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             **kwargs,
         )
         bundles[step] = dict(
@@ -2023,6 +2014,7 @@ def test_the_written_occlusion_is_not_the_inverted_ground_truth(tmp_path, monkey
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     loaded = np.load(tmp_path / "out" / "eval" / "step-2" / "pred" / "0000.npz")
@@ -2062,6 +2054,7 @@ def test_a_position_only_run_writes_a_sweepable_bundle_with_no_operating_point(
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=None,
+        query_anchor_source="predicted",
     )
 
     assert metrics["confidence_alpha"] is None
@@ -2101,6 +2094,7 @@ def test_the_eval_writes_one_threshold_from_the_runs_own_alpha(tmp_path, monkeyp
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     directory = tmp_path / "out" / "eval" / "step-6" / "pred"
@@ -2173,6 +2167,7 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
         emit_predictions=False,
     )
 
@@ -2183,7 +2178,8 @@ def test_the_eval_restores_rng_and_module_modes(tmp_path, monkeypatch):
 # ----------------------------------------------------- the held-out readouts ---
 
 
-# The run-level readout keys, in the order the eval appends them after per_scene.
+# The run-level readout keys, in the order the eval appends them after
+# per_scene; only the two anchor-source keys follow them.
 _READOUT_KEYS = (
     "anchor_error_m",
     "anchor_error_m_by_camera",
@@ -2346,6 +2342,7 @@ def test_the_eval_reports_the_camera_baseline_and_the_anchor_error(
         output_dir=tmp_path / "out",
         query_anchors=_FOUR_ANCHOR_SPEC,
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
         emit_predictions=emit_predictions,
     )
 
@@ -2384,7 +2381,10 @@ def test_the_eval_reports_the_camera_baseline_and_the_anchor_error(
     ]
     assert abs(np.median(pooled) - np.median(per_scene_medians)) > 0.5
 
-    assert list(metrics)[-len(_READOUT_KEYS):] == list(_READOUT_KEYS)
+    # Appended after per_scene, and followed only by the two anchor-source
+    # keys appended after them, so every earlier key kept its position.
+    assert list(metrics)[-len(_READOUT_KEYS) - 2 : -2] == list(_READOUT_KEYS)
+    assert list(metrics)[-2:] == ["query_anchor_source", "eval_query_anchor_source"]
     # Cameras in first-seen order, which is spec order.
     assert list(metrics["anchor_error_m_by_camera"]) == ["0", "3", "1", "2"]
     assert list(metrics["base_ratio_by_camera"]) == ["0", "3", "1", "2"]
@@ -2447,9 +2447,9 @@ def test_the_anchor_readout_reads_the_models_own_anchor_under_either_diagnostic(
 
     On the steered window the model's own anchor at a camera-k pixel is the
     reference camera's planted pointmap, about k metres from the truth, while
-    either diagnostic's anchor is the truth to within a pixel, so a readout of
-    the scored anchor would collapse toward zero. The scored loss must move,
-    or the flags never reached the scoring at all.
+    either ground-truth source's anchor is the truth to within a pixel, so a
+    readout of the scored anchor would collapse toward zero. The scored loss
+    must move, or the source never reached the scoring at all.
     """
 
     scene = _cpu_eval_scene(
@@ -2463,7 +2463,11 @@ def test_the_anchor_readout_reads_the_models_own_anchor_under_either_diagnostic(
 
     entries = []
     for step, flags in enumerate(
-        ({}, {"oracle_query_anchor": True}, {"ground_truth_query_anchor": True})
+        (
+            {},
+            {"eval_query_anchor_source": "query_position"},
+            {"eval_query_anchor_source": "gt_depth"},
+        )
     ):
         metrics = train_cli.evaluate_held_out(
             model=model,
@@ -2475,6 +2479,7 @@ def test_the_anchor_readout_reads_the_models_own_anchor_under_either_diagnostic(
             output_dir=tmp_path / "out",
             query_anchors=_FOUR_ANCHOR_SPEC,
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             emit_predictions=False,
             **flags,
         )
@@ -2533,11 +2538,12 @@ def test_the_readouts_leave_every_existing_eval_figure_unchanged(
         scene = _step_scene(
             monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)
         )
-        spec, flags, views_per_time = ["0:0", "1:0"], {"oracle_query_anchor": True}, 1
+        spec, views_per_time = ["0:0", "1:0"], 1
+        flags = {"eval_query_anchor_source": "query_position"}
     elif arm == "merged_ground_truth":
         scene = _cpu_eval_scene(monkeypatch)
         spec, views_per_time = ["0:0"], 2
-        flags = {"merge_synchronized_slots": True, "ground_truth_query_anchor": True}
+        flags = {"merge_synchronized_slots": True, "eval_query_anchor_source": "gt_depth"}
     else:
         scene = _cpu_eval_scene(monkeypatch)
         spec, flags, views_per_time = ["0:0"], {}, 1
@@ -2559,6 +2565,7 @@ def test_the_readouts_leave_every_existing_eval_figure_unchanged(
             output_dir=tmp_path / directory,
             query_anchors=spec,
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             **flags,
         )
         _assert_same_rng_state(capture_rng_state(), before)
@@ -3853,6 +3860,7 @@ def test_the_eval_runs_at_two_anchors_end_to_end(tmp_path, monkeypatch):
         output_dir=tmp_path / "out",
         query_anchors=["0:0", "1:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     assert metrics["scenes"] == 1
@@ -4522,41 +4530,26 @@ def test_a_resume_restores_the_pinned_alpha_rather_than_re_resolving_it(tmp_path
     )
 
 
-def test_the_oracle_anchor_is_not_a_resume_setting(tmp_path):
-    """Eval-only and gradient-free, so it defines no stream: stored nowhere in
-    the checkpoint and compared by neither tier, like the guard thresholds. A
-    segment may switch it on to price a checkpoint and off again to train."""
+@pytest.mark.parametrize(
+    "flag, value",
+    (
+        ("eval_query_anchor_source", "gt_depth"),
+        ("oracle_query_anchor", True),
+        ("ground_truth_query_anchor", True),
+    ),
+)
+def test_the_eval_anchor_flags_are_not_resume_settings(tmp_path, flag, value):
+    """Eval-only and gradient-free, so none defines a stream: stored nowhere in
+    the checkpoint, compared by neither tier, absent from the absent-defaults
+    map, like the guard thresholds. A segment may switch any of them on to
+    score a checkpoint on a different anchor and off again."""
 
-    stored = train_cli._checkpoint_settings(
-        _loop_args(tmp_path, oracle_query_anchor=True)
-    )
-    assert "oracle_query_anchor" not in stored
-    assert "oracle_query_anchor" not in train_cli._RESUME_SETTINGS_REFUSED
-    assert "oracle_query_anchor" not in train_cli._RESUME_SETTINGS_WARNED
-    train_cli.check_resume_settings(
-        stored, _loop_args(tmp_path, oracle_query_anchor=False)
-    )
-
-
-def test_the_ground_truth_anchor_is_not_a_resume_setting(tmp_path):
-    """Same shape as its sibling: eval-only and gradient-free, so it defines
-    no stream -- stored nowhere in the checkpoint, compared by neither tier,
-    absent from the absent-defaults map.  A segment may switch it on to price
-    a checkpoint and off again to train."""
-
-    stored = train_cli._checkpoint_settings(
-        _loop_args(tmp_path, ground_truth_query_anchor=True)
-    )
-    assert "ground_truth_query_anchor" not in stored
-    assert "ground_truth_query_anchor" not in train_cli._RESUME_SETTINGS_REFUSED
-    assert "ground_truth_query_anchor" not in train_cli._RESUME_SETTINGS_WARNED
-    assert (
-        "ground_truth_query_anchor"
-        not in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS
-    )
-    train_cli.check_resume_settings(
-        stored, _loop_args(tmp_path, ground_truth_query_anchor=False)
-    )
+    stored = train_cli._checkpoint_settings(_loop_args(tmp_path, **{flag: value}))
+    assert flag not in stored
+    assert flag not in train_cli._RESUME_SETTINGS_REFUSED
+    assert flag not in train_cli._RESUME_SETTINGS_WARNED
+    assert flag not in train_cli._RESUME_SETTINGS_ABSENT_DEFAULTS
+    train_cli.check_resume_settings(stored, _loop_args(tmp_path))
 
 
 def test_a_resume_that_changes_a_loss_weight_is_refused(tmp_path):
@@ -4702,46 +4695,6 @@ def test_merged_slots_are_recorded_in_the_plan_summary_settings(tmp_path):
         )
         settings = train_cli._plan_summary(tally, args)["settings"]
         assert settings["merge_synchronized_slots"] is enabled
-
-
-def test_the_oracle_anchor_is_recorded_in_the_plan_summary_settings(tmp_path):
-    """An oracle-anchored curve is an upper bound on the geometry, not a
-    measurement of the model, so an archived summary must say which one it is."""
-
-    tally = SimpleNamespace(
-        planned=[],
-        skipped=[],
-        skip_counts={},
-        considered=0,
-        threshold_skip_fraction=0.0,
-    )
-
-    for enabled in (False, True):
-        args = _validator_args(
-            tmp_path, manifest="m.jsonl", oracle_query_anchor=enabled
-        )
-        settings = train_cli._plan_summary(tally, args)["settings"]
-        assert settings["oracle_query_anchor"] is enabled
-
-
-def test_the_ground_truth_anchor_is_recorded_in_the_plan_summary_settings(tmp_path):
-    """A ground-truth-anchored curve is one side of the geometry bracket, not
-    a measurement of the model, so an archived summary must say which it is."""
-
-    tally = SimpleNamespace(
-        planned=[],
-        skipped=[],
-        skip_counts={},
-        considered=0,
-        threshold_skip_fraction=0.0,
-    )
-
-    for enabled in (False, True):
-        args = _validator_args(
-            tmp_path, manifest="m.jsonl", ground_truth_query_anchor=enabled
-        )
-        settings = train_cli._plan_summary(tally, args)["settings"]
-        assert settings["ground_truth_query_anchor"] is enabled
 
 
 def test_local_checkpointing_is_recorded_in_the_plan_summary_settings(tmp_path):
@@ -5029,6 +4982,7 @@ def test_the_eval_is_position_only_whatever_the_training_flags_say(
         output_dir=tmp_path,
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     assert seen, "the eval must have scored something"
@@ -5923,6 +5877,7 @@ def test_an_unsupervisable_held_out_scene_is_skipped_and_recorded(
         output_dir=tmp_path / "out",
         query_anchors=["0:2"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     # Scored zero scenes, and said so rather than raising.
@@ -5974,6 +5929,7 @@ def test_one_unsupervisable_held_out_scene_leaves_the_others_scored(
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
         emit_predictions=False,
     )
 
@@ -6358,6 +6314,7 @@ def test_the_eval_reports_the_velocity_residual_at_weight_zero(
         output_dir=tmp_path / "out",
         query_anchors=["0:0", "1:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     entry = metrics["per_scene"][0]
@@ -6409,6 +6366,7 @@ def test_a_window_with_nothing_to_shuffle_reports_none_not_zero(
         output_dir=tmp_path / "out",
         query_anchors=["0:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
     )
 
     entry = metrics["per_scene"][0]

@@ -33,8 +33,9 @@ are the bundle's own, so ``track_query_points[:, 0]`` and ``slot_time_index``
 index the same covered-timestep axis.
 
 ``depth_conf`` is present exactly when the model emitted one.  ``metadata`` is
-JSON text: the run's provenance, the head settings the eval ran, and the
-scene's ``base_ratio`` and ``anchor_error_m`` readouts verbatim.
+JSON text: the run's provenance and the query anchor it trained against, the
+head settings the eval ran and the anchor it scored on, and the scene's
+``base_ratio`` and ``anchor_error_m`` readouts verbatim.
 """
 
 from __future__ import annotations
@@ -85,8 +86,10 @@ OPTIONAL_VISUAL_KEYS = ("depth_conf",)
 # The bundle keys a dump carries, each under ``track_<key>``: what was scored.
 VISUAL_TRACK_KEYS = ("pred", "gt", "gt_vis_any", "query_points", "conf")
 
-# The metadata object's keys, exactly: the run's provenance, the head settings
-# the eval ran, and the scene's two readouts. The viewer reads every one.
+# The metadata object's keys, exactly: the run's provenance and the query anchor
+# it trained against, the head settings the eval ran and the anchor it scored on
+# (both anchors named in sparse_tracking.QUERY_ANCHOR_SOURCES' vocabulary), and
+# the scene's two readouts. The viewer reads every one.
 VISUAL_METADATA_KEYS = (
     "scene",
     "step",
@@ -97,8 +100,8 @@ VISUAL_METADATA_KEYS = (
     "refine_iters",
     "depth_input",
     "camera_input",
-    "oracle_query_anchor",
-    "ground_truth_query_anchor",
+    "query_anchor_source",
+    "eval_query_anchor_source",
     "query_anchors",
     "base_ratio",
     "anchor_error_m",

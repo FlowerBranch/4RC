@@ -46,8 +46,10 @@ _METADATA = {
     "refine_iters": 4,
     "depth_input": True,
     "camera_input": False,
-    "oracle_query_anchor": False,
-    "ground_truth_query_anchor": False,
+    # Distinct on purpose, so a summary that swaps the trained and scored
+    # anchors fails the head pin below.
+    "query_anchor_source": "gt_depth",
+    "eval_query_anchor_source": "predicted",
     "query_anchors": ["0:0", "1:0"],
     "base_ratio": {"0:0": None, "1:0": 0.98134},
     "anchor_error_m": {
@@ -220,7 +222,8 @@ def test_the_gui_names_the_model_on_screen(tmp_path, server):
     assert gui["checkpoint"].value == "/weights/released"
     assert gui["commit"].value == "0123abcd"
     assert gui["head"].value == (
-        "merged head, K=4, inputs: depth, tracks scored on model anchors"
+        "merged head, K=4, inputs: depth, trained on gt_depth anchors, "
+        "tracks scored on predicted anchors"
     )
     assert gui["base_ratio 0:0"].value == "-"
     assert gui["base_ratio 1:0"].value == "0.9813"

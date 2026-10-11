@@ -37,6 +37,7 @@ from arc.training import (
     compose_tracking_loss,
     ELIGIBILITY_REJECTION_STAGES,
     ELIGIBILITY_ROLLUP_RULE,
+    QUERY_ANCHOR_SOURCES,
     camera_major_layout,
     sparse_targets,
     sparse_targets_per_time,
@@ -1434,7 +1435,7 @@ def test_the_oracle_anchor_returns_the_ground_truth_query_positions():
     assert correspondences.count == 3
 
     anchors, frame = gather_query_anchor_points(
-        {}, scene, correspondences, oracle_query_anchor=True
+        {}, scene, correspondences, source="query_position"
     )
 
     expected = scene.trajectories_world[
@@ -1467,7 +1468,7 @@ def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
         gather_query_anchor_points({}, dumped_scene, correspondences)
 
     anchors, frame = gather_query_anchor_points(
-        {}, dumped_scene, correspondences, oracle_query_anchor=True
+        {}, dumped_scene, correspondences, source="query_position"
     )
     assert torch.equal(
         anchors,
@@ -1485,19 +1486,18 @@ def test_the_oracle_anchor_reads_no_prediction(dumped_scene):
         columns=correspondences.columns,
     )
     with pytest.raises(ValueError, match="exceeds the adapter's query observations"):
-        gather_query_anchor_points({}, dumped_scene, stray, oracle_query_anchor=True)
+        gather_query_anchor_points({}, dumped_scene, stray, source="query_position")
 
 
-def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
-    """Off, and off by default, is the predicted path unchanged.
-
-    The bare call, an explicit ``oracle_query_anchor=False`` and an explicit
-    ``ground_truth_query_anchor=False`` all return ``(points, frame)`` with
-    the pointmap gather at the query pixels and frame ``"model"`` -- the
-    snapshot the test above pins.  Both parameters are keyword-only with a
-    False default, which is what keeps ``train_step``'s numerics
-    byte-identical: its calls stay bare, and only the mechanical tuple unpack
-    changed.
+def test_the_predicted_source_is_the_default_and_reads_the_pointmaps(
+    dumped_scene, monkeypatch
+):
+    """The default, and ``source="predicted"`` spelled out, are the predicted
+    path unchanged: ``(points, frame)`` with the pointmap gather at the query
+    pixels and frame ``"model"`` -- the snapshot the test above pins.  The one
+    keyword is keyword-only with that default, which is what keeps every bare
+    call -- the readouts' re-gather of the model's own anchor among them --
+    byte-identical; the two booleans it replaced are gone.
     """
 
     import inspect
@@ -1512,21 +1512,17 @@ def test_the_oracle_anchor_is_off_by_default(dumped_scene, monkeypatch):
     raw = {"track_query_idx": dumped_scene.track_query_observation_slots}
     snapshot = pointmaps[0, 0, correspondences.rows, correspondences.columns]
 
-    bare = gather_query_anchor_points(raw, dumped_scene, correspondences)
-    assert torch.equal(bare[0], snapshot) and bare[1] == "model"
-    for kwargs in (
-        {"oracle_query_anchor": False},
-        {"ground_truth_query_anchor": False},
-    ):
+    for kwargs in ({}, {"source": "predicted"}):
         points, frame = gather_query_anchor_points(
             raw, dumped_scene, correspondences, **kwargs
         )
         assert torch.equal(points, snapshot) and frame == "model"
 
+    parameters = inspect.signature(gather_query_anchor_points).parameters
+    assert parameters["source"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["source"].default == "predicted"
     for name in ("oracle_query_anchor", "ground_truth_query_anchor"):
-        parameter = inspect.signature(gather_query_anchor_points).parameters[name]
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        assert parameter.default is False
+        assert name not in parameters
 
 
 def test_a_world_frame_anchor_is_composed_in_world_not_double_transformed(
@@ -1575,7 +1571,7 @@ def test_a_world_frame_anchor_is_composed_in_world_not_double_transformed(
     assert alignment.scale.item() == pytest.approx(2.25, rel=1e-4)
 
     oracle_anchors, oracle_frame = gather_query_anchor_points(
-        {}, dumped_scene, correspondences, oracle_query_anchor=True
+        {}, dumped_scene, correspondences, source="query_position"
     )
     assert oracle_frame == "world"
     # The same physical points in the model gauge, plus a deliberate error so
@@ -1647,7 +1643,7 @@ def test_a_world_frame_anchor_is_composed_in_world_not_double_transformed(
 
 
 def test_the_ground_truth_anchor_unprojects_the_anchor_depth():
-    """--ground_truth_query_anchor is the pixel's GT-depth unprojection.
+    """Source ``"gt_depth"`` is the pixel's GT-depth unprojection.
 
     Two anchors on purpose -- track 1 is invisible to camera 0 at t=0, so
     the correspondences span two distinct anchor slots and the per-slot loop
@@ -1674,10 +1670,10 @@ def test_the_ground_truth_anchor_unprojects_the_anchor_depth():
     assert len(set(anchor_slots.tolist())) == 2
 
     anchors, frame = gather_query_anchor_points(
-        {}, scene, correspondences, ground_truth_query_anchor=True
+        {}, scene, correspondences, source="gt_depth"
     )
     oracle, oracle_frame = gather_query_anchor_points(
-        {}, scene, correspondences, oracle_query_anchor=True
+        {}, scene, correspondences, source="query_position"
     )
 
     assert frame == "world" and oracle_frame == "world"
@@ -1738,25 +1734,29 @@ def test_the_ground_truth_anchor_refuses_an_invalid_depth_pixel(
 
     with pytest.raises(ValueError, match="anchor_depth_gate"):
         gather_query_anchor_points(
-            {}, dumped_scene, correspondences, ground_truth_query_anchor=True
+            {}, dumped_scene, correspondences, source="gt_depth"
         )
 
 
-def test_the_anchor_diagnostics_are_refused_together(dumped_scene):
-    """Each flag replaces the same anchor with a different ground-truth
-    reading; the raise inside the gather covers callers that bypass the
-    trainer's parse-time refusal."""
+def test_an_unknown_anchor_source_is_refused_before_anything_is_read(dumped_scene):
+    """The vocabulary check comes first: on a stray-slot set with an empty
+    prediction dict, a source that slipped past it would die on the slot check
+    or on the missing alignment fields instead, naming neither the source nor
+    the readings there are."""
 
     correspondences, _ = build_anchor_correspondences(dumped_scene)
+    stray = SparseCorrespondences(
+        trajectory_indices=correspondences.trajectory_indices,
+        query_slots=torch.ones_like(correspondences.query_slots),
+        query_times=correspondences.query_times,
+        rows=correspondences.rows,
+        columns=correspondences.columns,
+    )
 
-    with pytest.raises(ValueError, match="cannot be combined"):
-        gather_query_anchor_points(
-            {},
-            dumped_scene,
-            correspondences,
-            oracle_query_anchor=True,
-            ground_truth_query_anchor=True,
-        )
+    for source in ("oracle", "ground_truth", "world", ""):
+        with pytest.raises(ValueError, match="source must be one of"):
+            gather_query_anchor_points({}, dumped_scene, stray, source=source)
+    assert QUERY_ANCHOR_SOURCES == ("predicted", "query_position", "gt_depth")
 
 
 def test_sparse_loss_rejects_queries_that_are_not_declared_anchors(dumped_scene):

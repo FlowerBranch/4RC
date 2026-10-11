@@ -828,13 +828,22 @@ def reconstruction_drift_report(
     }
 
 
+# The query anchor a track's displacement field is composed on, by name: the
+# one vocabulary --query_anchor_source and --eval_query_anchor_source choose
+# from. "predicted" is the model's own reconstruction, in its own gauge (frame
+# "model"). The other two are ground truth in the stored frame ("world"):
+# "query_position" is the tracked point's true position at its query time, and
+# "gt_depth" is ground-truth depth unprojected through the ground-truth camera
+# at the anchor pixel -- what MVTracker receives.
+QUERY_ANCHOR_SOURCES = ("predicted", "query_position", "gt_depth")
+
+
 def gather_query_anchor_points(
     raw_predictions: dict,
     scene: DumpedKubricScene,
     correspondences: SparseCorrespondences,
     *,
-    oracle_query_anchor: bool = False,
-    ground_truth_query_anchor: bool = False,
+    source: str = "predicted",
 ) -> tuple[torch.Tensor, str]:
     """Gather the detached query anchor used by ``_postprocess_output``.
 
@@ -859,47 +868,52 @@ def gather_query_anchor_points(
     0 and would silently gather anchor 0's pointmaps; slice this function's
     result with :meth:`SparseCorrespondences.anchor_rows` instead.
 
-    ``oracle_query_anchor=True`` is an **eval-only diagnostic**.  It returns each
-    query's ground-truth world position,
-    ``scene.trajectories_world[query_times, trajectory_indices]``, and reads
-    nothing from ``raw_predictions`` at all: the trained model and its
-    displacement field are untouched, only the point that field is anchored at
-    moves.  Read the result as an **upper bound** on what ground-truth depth
-    would buy, not an estimate of it -- the tracked point's true position is at
-    least as good as unprojecting ground-truth depth through ground-truth
-    cameras at that pixel.  It must never reach ``train_step``: supervising
-    against an oracle anchor trains a different model, and this exists to price
-    the anchor's geometry error on models that already exist.  Same ``(count,
-    3)`` float32 contract as the predicted path, but returned on
-    ``trajectories_world``'s device rather than the model's; every consumer
-    re-homes it with ``torch.as_tensor(..., device=tracks.device)``, so the
-    difference is inert.  Frame ``"world"``.
+    ``source`` names the reading, one of :data:`QUERY_ANCHOR_SOURCES`; an
+    unknown one raises before anything is read.  ``train_step`` composes its
+    loss on ``--query_anchor_source`` and the held-out eval on
+    ``--eval_query_anchor_source``, which defaults to the training source.
+    Every reading is detached, so whichever one a step trains against, no
+    gradient reaches the reconstruction.
 
-    ``ground_truth_query_anchor=True`` is the second **eval-only diagnostic**:
-    ground-truth depth unprojected through the ground-truth camera at the
-    anchor pixel -- what MVTracker actually receives -- via
-    :func:`_metric_pointmap_at_anchor`, one call per distinct anchor slot.
-    Unlike the oracle it keeps the pixel quantisation and the depth-map
-    sampling, so the pair brackets what ground-truth depth would buy.  Every
-    gathered pixel is valid by construction --
-    :func:`build_anchor_correspondences` gates on the same depth map
-    (``anchor_depth_gate``) -- and an invalid one raises rather than dropping
-    the row, because a dropped row would silently unmatch this curve from the
-    predicted-anchor one.  An empty correspondence set returns an empty
-    ``(0, 3)`` tensor here where the other two paths die inside a torch
-    reduction; unreachable from ``evaluate_held_out``, which skips a
-    zero-count scene before any gather.  Frame ``"world"``, on CPU, under the
-    same never-in-``train_step`` rule as the oracle.  The two diagnostics are
-    mutually exclusive: the trainer refuses them together at parse time, and
-    the raise below covers callers that bypass it.
+    * ``"predicted"``, the default: the model's own pointmap at the anchor
+      pixel, in the reconstruction's gauge.  Frame ``"model"``.
+    * ``"query_position"``: each query's true position at its query time,
+      ``scene.trajectories_world[query_times, trajectory_indices]``.  It reads
+      nothing from ``raw_predictions`` at all: the model and its displacement
+      field are untouched, only the point that field is anchored at moves.
+      The more accurate of the two ground-truth readings -- no pixel
+      quantisation, no depth-map sampling.  Same ``(count, 3)`` float32
+      contract as the predicted path, but returned on ``trajectories_world``'s
+      device (the CPU: only the views move to CUDA) rather than the model's;
+      every consumer re-homes it with ``torch.as_tensor(...,
+      device=tracks.device)``, so the difference is inert.  Frame ``"world"``.
+    * ``"gt_depth"``: ground-truth depth unprojected through the ground-truth
+      camera at the anchor pixel -- what MVTracker actually receives -- via
+      :func:`_metric_pointmap_at_anchor`, one call per distinct anchor slot.
+      It keeps the pixel quantisation and the depth-map sampling, and reads
+      the scene's loaded depth, the map the Sim(3) fit and the eligibility gate
+      read too.  Every gathered pixel is valid by construction --
+      :func:`build_anchor_correspondences` gates on the same depth map
+      (``anchor_depth_gate``) -- and an invalid one raises rather than dropping
+      the row, because a dropped row would silently unmatch this reading from
+      the other two.  Frame ``"world"``, on CPU.
+
+    On a head trained against its own anchor, substituting either ground-truth
+    reading at eval time measures how much the head depends on that anchor,
+    not what correct geometry buys: re-anchoring the merged control at step
+    20000 dropped AJ from 45.89 to 22.97 (``"query_position"``) and 22.37
+    (``"gt_depth"``).  Training against the reading is what measures that.
+
+    An empty correspondence set returns an empty ``(0, 3)`` tensor under
+    ``"gt_depth"`` where the other two readings die inside a torch reduction.
+    Unreachable from both callers: ``train_step`` raises
+    ``UnsupervisableSceneError`` on a step with no supervised sample before
+    any gather, and ``evaluate_held_out`` skips a zero-count scene first.
     """
 
-    if oracle_query_anchor and ground_truth_query_anchor:
+    if source not in QUERY_ANCHOR_SOURCES:
         raise ValueError(
-            "oracle_query_anchor and ground_truth_query_anchor cannot be "
-            "combined: each replaces the query anchor with a different "
-            "ground-truth reading (the trainer refuses this at parse time; "
-            "this raise covers callers that bypass it)"
+            f"source must be one of {QUERY_ANCHOR_SOURCES}, got {source!r}"
         )
     anchor_slots = scene.track_query_observation_slots.cpu()
     if correspondences.query_slots.numel():
@@ -909,7 +923,7 @@ def gather_query_anchor_points(
             raise ValueError(
                 "Correspondence query slot exceeds the adapter's query observations"
             )
-    if oracle_query_anchor:
+    if source == "query_position":
         trajectories = scene.trajectories_world
         time_count, trajectory_count = trajectories.shape[:2]
         # sparse_tracking_loss runs the same two checks; repeated here because
@@ -931,7 +945,7 @@ def gather_query_anchor_points(
             correspondences.trajectory_indices.to(trajectories.device),
         ]
         return anchors.detach().to(torch.float32), "world"
-    if ground_truth_query_anchor:
+    if source == "gt_depth":
         query_slots = correspondences.query_slots.cpu()
         observation_slots = anchor_slots[query_slots]
         rows = correspondences.rows.cpu().numpy()
@@ -1003,15 +1017,16 @@ def aligned_query_anchors(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The model's own query anchors in the stored frame, beside the tracked points.
 
-    ``model_anchors`` are what :func:`gather_query_anchor_points` returns with
-    both eval-only diagnostics off: one row per correspondence, in the
+    ``model_anchors`` are what :func:`gather_query_anchor_points` returns at
+    source ``"predicted"``: one row per correspondence, in the
     reconstruction's own gauge.  Each is carried into the stored frame by
     ``alignment.apply_points``; the second tensor is the tracked point's true
     position at its query time,
     ``scene.trajectories_world[query_times, trajectory_indices]`` -- exactly
-    the value ``oracle_query_anchor`` substitutes.  Both ``(count, 3)``, in
-    stored units.  A world-frame anchor (either diagnostic's) must not come
-    here: ``apply_points`` would carry it into the stored frame a second time.
+    the value source ``"query_position"`` substitutes.  Both ``(count, 3)``,
+    in stored units.  A world-frame anchor (either ground-truth source's) must
+    not come here: ``apply_points`` would carry it into the stored frame a
+    second time.
 
     The one composition behind :func:`query_anchor_errors` and
     :func:`visual_geometry`, so the anchors the visual dump draws are the ones
@@ -1130,8 +1145,8 @@ def visual_geometry(
     Per correspondence row: the model's own anchor and the tracked point's
     true position, as :func:`aligned_query_anchors` composes them -- exactly
     what :func:`query_anchor_errors` measures -- and the anchor's
-    :func:`_anchor_key`.  ``model_anchors`` must be the MODEL's anchors (both
-    eval-only diagnostics off), whatever anchored the scored tracks.
+    :func:`_anchor_key`.  ``model_anchors`` must be the MODEL's anchors
+    (source ``"predicted"``), whatever anchored the scored tracks.
     """
 
     if isinstance(stride, bool) or not isinstance(stride, int) or stride < 1:

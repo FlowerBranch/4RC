@@ -80,7 +80,10 @@ from arc.training.schedule import (
     capture_base_learning_rates,
     warmup_cosine_scale,
 )
-from arc.training.sparse_tracking import ELIGIBILITY_REJECTION_STAGES
+from arc.training.sparse_tracking import (
+    ELIGIBILITY_REJECTION_STAGES,
+    QUERY_ANCHOR_SOURCES,
+)
 from arc.training.trainer_state import (
     build_trainer_state,
     capture_rng_state,
@@ -545,6 +548,7 @@ def train_step(
     merge_synchronized_slots: bool = False,
     refine_iters: int = 1,
     refine_gamma: float = DEFAULT_REFINE_GAMMA,
+    query_anchor_source: str = "predicted",
 ) -> StepOutcome:
     """One micro-step over one scene, with every guard in ``arc.training.runtime``.
 
@@ -600,6 +604,17 @@ def train_step(
     is unchanged at any K; ``iteration_losses`` carries all K. At K=1 the
     single weight is exactly 1.0 and the loop body is today's, statement for
     statement.
+
+    ``query_anchor_source`` picks the query anchor every pass's loss composes
+    the displacement field on (:func:`gather_query_anchor_points`):
+    ``"predicted"``, the model's own reconstruction -- today's step exactly --
+    or one of the two ground-truth readings, in the stored frame, which
+    :func:`compose_predicted_metric` composes without a second model-to-world
+    transform. It is gathered once, detached, from the scene-level
+    correspondences before any head pass, like the Sim(3), so every anchor and
+    every pass is scored against the same points and no gradient reaches the
+    reconstruction. Only the loss's composition moves: the refiner at K > 1
+    still reads the model's own cloud and carried field.
     """
 
     from arc.models.arc.heads.motiondecoder import RefinementInput, patch_centre_points
@@ -739,18 +754,21 @@ def train_step(
         # query_slots are renumbered to 0 and would silently gather anchor 0's
         # pointmaps for every anchor.
         anchors, anchor_frame = gather_query_anchor_points(
-            recon, scene, correspondences
+            recon, scene, correspondences, source=query_anchor_source
         )
         # The refiner's cloud: one patch-centre point per slot and patch of the
         # model's OWN reconstruction, read once per step because every anchor
         # and every pass reads the same cloud (reconstruct ran once, above).
-        # predicted_pointmaps is the unprojection the Sim(3) fit and the anchor
-        # gather above already consume -- it runs under no_grad in fp32 itself,
-        # so this line is safe inside the autocast block -- and so the cloud
-        # the refiner reads into is the gauge the loss composes in; no second
-        # unprojection anywhere. None at --refine_iters 1: nothing reads it,
-        # and building it would move peak_bytes on the flag-off step, the same
-        # reason the velocity counts are gated on their weight.
+        # predicted_pointmaps is the unprojection the Sim(3) fit above already
+        # consumes, as does the anchor gather at the predicted source -- it
+        # runs under no_grad in fp32 itself, so this line is safe inside the
+        # autocast block -- and so the cloud the refiner reads into is the
+        # gauge the displacement field lives in; no second unprojection
+        # anywhere. That holds under every --query_anchor_source: a
+        # ground-truth source moves only the point the loss composes the field
+        # on, never what the refiner reads. None at --refine_iters 1: nothing
+        # reads it, and building it would move peak_bytes on the flag-off step,
+        # the same reason the velocity counts are gated on their weight.
         key_xyz = (
             None
             if refine_iters == 1
@@ -1062,10 +1080,10 @@ def evaluate_held_out(
     output_dir: Path,
     query_anchors,
     confidence_alpha: float | None,
+    query_anchor_source: str,
     emit_predictions: bool = True,
     merge_synchronized_slots: bool = False,
-    oracle_query_anchor: bool = False,
-    ground_truth_query_anchor: bool = False,
+    eval_query_anchor_source: str = "predicted",
     refine_iters: int = 1,
     visual_scenes: frozenset[str] = frozenset(),
     visual_stride: int = 4,
@@ -1113,21 +1131,28 @@ def evaluate_held_out(
     that says why, so a later reader can tell a scene that was skipped from one
     that scored zero.
 
-    ``oracle_query_anchor`` re-anchors every track at the query point's
-    ground-truth world position (see :func:`gather_query_anchor_points`) and is
-    recorded in the metrics next to ``query_anchors`` for the reason that spec
-    is: an oracle-anchored curve is an upper bound on the geometry, not a
-    measurement of the model, and must never be read as one.  The same anchors
-    feed both arms and the written bundle, so ``pred`` moves and nothing else
-    does -- ``query_points`` was ground truth already.  Eval-only by
-    construction: ``train_step`` has no such parameter.
+    ``query_anchor_source`` is the query anchor the RUN trained against (see
+    :func:`gather_query_anchor_points`), recorded in the metrics and the visual
+    dump and read by nothing else: a curve trained against a ground-truth
+    anchor measures a different model from one trained against its own, and
+    must never be read against it.  Required rather than defaulted, like
+    ``query_anchors`` and ``confidence_alpha``: a caller that forgot it would
+    label a ground-truth-trained curve ``"predicted"``.
 
-    ``ground_truth_query_anchor`` re-anchors at ground-truth depth unprojected
-    through the ground-truth camera at the anchor pixel -- what MVTracker
-    actually receives -- so the oracle/ground-truth pair brackets what
-    ground-truth depth would buy.  Recorded in the metrics beside the oracle
-    marker; mutually exclusive with it (refused at parse time and inside the
-    gather); eval-only by the same construction.
+    ``eval_query_anchor_source`` is the anchor THIS eval composes the tracks
+    on.  The run hands it ``--eval_query_anchor_source``, one of that flag's
+    aliases, or by default its own training source (see
+    ``_eval_query_anchor_source``), so a model is scored on the anchor it
+    trained against unless the flags say otherwise; this function anchors at
+    exactly what it is handed.  The same anchors feed both arms and the
+    written bundle, so under a ground-truth reading ``pred`` moves and nothing
+    else does -- ``query_points`` was ground truth already.  On a head trained
+    against its own anchor, either ground-truth reading measures how much the
+    head depends on that anchor, not what correct geometry buys; training
+    against the reading is what measures that.  Recorded in the metrics by
+    name, and for the readers that predate the name as
+    ``oracle_query_anchor`` / ``ground_truth_query_anchor``: true when the eval
+    scored on ``"query_position"`` / ``"gt_depth"``.
 
     ``refine_iters`` is the run's own count, threaded so the held-out forward
     runs the SAME unrolled refinement the step trains -- MVTracker scores at
@@ -1153,10 +1178,10 @@ def evaluate_held_out(
     the scene's own fitted Sim(3): the camera baseline, ``base_ratio`` per
     anchor, and depth at time 0. ``anchor_error_m`` is the metric distance from
     the MODEL's own query anchor to the tracked point's true position, per
-    anchor -- under either eval-only diagnostic the scored anchor is ground
-    truth, so the model's is gathered again with both flags off, and the
-    readout reads the same whatever flag is set. Both are keyed by absolute
-    ``camera:time``, not by the ``VIEWSLOT:TIMESLOT`` strings in
+    anchor -- under either ground-truth eval source the scored anchor is
+    ground truth, so the model's is gathered again at source ``"predicted"``,
+    and the readout reads the same whatever the eval scores on. Both are keyed
+    by absolute ``camera:time``, not by the ``VIEWSLOT:TIMESLOT`` strings in
     ``query_anchors``, and pooled over the scored scenes into the run-level
     keys of :func:`_readout_aggregates`. Neither draws randomness, and every
     other figure, ``history.jsonl`` and the written bundles are untouched by
@@ -1173,11 +1198,12 @@ def evaluate_held_out(
     * the scored tracks, the bundle's own arrays whether or not
       ``emit_predictions`` writes the bundle;
     * metadata: ``run_identity`` (checkpoint dir and commit, read once per
-      run, so required whenever a scene is named), the head settings this
-      eval ran, and the scene's two readouts.
+      run, so required whenever a scene is named), the anchor the run trained
+      against, the head settings and the anchor this eval ran, and the
+      scene's two readouts.
 
-    The anchors are the model's own under either eval-only diagnostic, as the
-    anchor readout's are; the tracks are what was scored. The dump draws no
+    The anchors are the model's own under either ground-truth eval source, as
+    the anchor readout's are; the tracks are what was scored. The dump draws no
     randomness and feeds nothing back, so every other output is
     byte-identical with it on; empty, the default, it writes nothing. A
     skipped scene has nothing to dump.
@@ -1263,17 +1289,13 @@ def evaluate_held_out(
                 # and pose_enc, against the alignment fitted just above.
                 drift = reconstruction_drift_report(raw, scene, alignment)
                 anchors, anchor_frame = gather_query_anchor_points(
-                    raw,
-                    scene,
-                    correspondences,
-                    oracle_query_anchor=oracle_query_anchor,
-                    ground_truth_query_anchor=ground_truth_query_anchor,
+                    raw, scene, correspondences, source=eval_query_anchor_source
                 )
                 # The anchor error describes the model's OWN anchor whatever
-                # anchored the scored tracks. A "world" frame means an
-                # eval-only diagnostic replaced it with ground truth, so the
-                # model's is gathered again with both flags off; otherwise the
-                # scored anchor is the model's and is reused.
+                # anchored the scored tracks. A "world" frame means the eval
+                # scores on a ground-truth source, so the model's is gathered
+                # again at the predicted source; otherwise the scored anchor is
+                # the model's and is reused.
                 model_anchors = (
                     anchors
                     if anchor_frame == "model"
@@ -1489,10 +1511,8 @@ def evaluate_held_out(
                                 # the views it was handed.
                                 "depth_input": DEPTH_INPUT_KEY in scene.views[0],
                                 "camera_input": CAMERA_VECTOR_KEY in scene.views[0],
-                                "oracle_query_anchor": bool(oracle_query_anchor),
-                                "ground_truth_query_anchor": bool(
-                                    ground_truth_query_anchor
-                                ),
+                                "query_anchor_source": query_anchor_source,
+                                "eval_query_anchor_source": eval_query_anchor_source,
                                 "query_anchors": list(query_anchors),
                                 "base_ratio": drift["base_ratio"],
                                 "anchor_error_m": entry["anchor_error_m"],
@@ -1534,15 +1554,17 @@ def evaluate_held_out(
     metrics = {
         "step": step,
         "query_anchors": list(query_anchors),
-        # Whether the tracks were anchored at ground truth rather than at the
-        # model's reconstruction. Recorded for the reason the spec above is: an
-        # oracle-anchored curve is an upper bound on the geometry, not a
-        # measurement of the model, and must never be read against a real one.
-        "oracle_query_anchor": bool(oracle_query_anchor),
-        # Its realisable sibling: ground-truth depth sampled at the anchor
-        # pixel, what MVTracker actually receives. The pair brackets what
-        # ground-truth depth would buy; neither is comparable with a real curve.
-        "ground_truth_query_anchor": bool(ground_truth_query_anchor),
+        # Whether the tracks were anchored at the query point's true position
+        # (eval source "query_position") rather than at the model's
+        # reconstruction. Kept beside query_anchors for the readers that
+        # predate eval_query_anchor_source, appended below, which names the
+        # reading.
+        "oracle_query_anchor": eval_query_anchor_source == "query_position",
+        # Its sibling: ground-truth depth sampled at the anchor pixel (eval
+        # source "gt_depth"), what MVTracker actually receives. On a head
+        # trained against its own anchor, either reading measures how much the
+        # head depends on that anchor, not what correct geometry buys.
+        "ground_truth_query_anchor": eval_query_anchor_source == "gt_depth",
         "scenes": len(per_scene),
         "position_loss": sum(losses) / len(losses) if losses else None,
         # Per refinement pass, meaned over the scored scenes: entry k is the
@@ -1598,6 +1620,12 @@ def evaluate_held_out(
         # The camera-baseline and anchor-error readouts pooled over the scored
         # scenes; after per_scene so every key above keeps its position.
         **_readout_aggregates(per_scene, scene_anchor_errors),
+        # Last, for the same reason: the anchor the run trained against and
+        # the one this eval scored on. A curve trained against a ground-truth
+        # anchor measures a different model from one trained against its own,
+        # and the two booleans above name only the eval's reading.
+        "query_anchor_source": query_anchor_source,
+        "eval_query_anchor_source": eval_query_anchor_source,
     }
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -2266,8 +2294,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the frozen camera decoder's OUTPUT (pose_enc -> predicted "
             "pointmaps -> Sim(3) -> the query anchor), so this arm's gain does "
             "not arrive purely through the track head: score it ALSO with "
-            "--ground_truth_query_anchor so the anchor path and the track-head "
-            "path separate. Off, the default, is exactly today's behaviour."
+            "--eval_query_anchor_source gt_depth so the anchor path and the "
+            "track-head path separate. Off, the default, is exactly today's "
+            "behaviour."
         ),
     )
     training.add_argument(
@@ -2307,6 +2336,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "exactly 1.0. Refused on resume like the loss weights: it "
             "reweights the objective, and the reported loss -- the final "
             "pass's Huber -- would not show the switch (default: %(default)s)"
+        ),
+    )
+    training.add_argument(
+        "--query_anchor_source",
+        choices=QUERY_ANCHOR_SOURCES,
+        default="predicted",
+        help=(
+            "The query anchor every training step composes the predicted "
+            "displacement on. Training against a ground-truth anchor is what "
+            "measures what correct geometry is worth: a head trained against "
+            "its own anchor compensates it, so swapping a ground-truth anchor "
+            "in at eval time measures that compensation instead. 'predicted' "
+            "is the model's own reconstruction, exactly today's step; "
+            "'query_position' is the "
+            "tracked point's true position at its query time; 'gt_depth' is "
+            "the loaded depth map -- ground truth under the default "
+            "--dataset_name -- unprojected through the ground-truth camera at "
+            "the anchor pixel, what MVTracker receives. The anchor stays "
+            "detached and DualDPT and CameraDec stay frozen, so no gradient "
+            "reaches the reconstruction, and the refiner under --refine_iters "
+            "keeps reading the model's own cloud. The held-out eval scores on "
+            "the same source unless --eval_query_anchor_source says otherwise; "
+            "inference has no ground truth, so score a ground-truth-trained "
+            "run with --eval_query_anchor_source predicted as well. Refused on "
+            "resume: it changes what the loss is computed against "
+            "(default: %(default)s)"
         ),
     )
     training.add_argument(
@@ -2533,37 +2588,45 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     evaluation.add_argument(
+        "--eval_query_anchor_source",
+        choices=QUERY_ANCHOR_SOURCES,
+        default=None,
+        help=(
+            "Eval-only: the query anchor every held-out track is composed on, "
+            "one of the readings --query_anchor_source takes, and by default "
+            "the run's own training source. On a run trained against its own "
+            "anchor, either ground-truth reading measures how much the head "
+            "depends on that "
+            "anchor, not what correct geometry buys -- training with "
+            "--query_anchor_source is what measures that; of the two, "
+            "'query_position' is the more accurate reading, with no pixel "
+            "quantisation and no depth-map sampling. The anchor-error and "
+            "base_ratio readouts keep measuring the model's own anchor "
+            "whatever this says. Changes no gradient and is not stored in the "
+            "checkpoint, so a resume may switch it freely; the eval's "
+            "metrics.json and run_summary.json record it. "
+            "--oracle_query_anchor and --ground_truth_query_anchor are its "
+            "aliases. Needs --val_scenes_file"
+        ),
+    )
+    evaluation.add_argument(
         "--oracle_query_anchor",
         action="store_true",
         help=(
-            "Eval-only diagnostic: anchor every held-out track at the query "
-            "point's ground-truth world position instead of the model's own "
-            "reconstruction of it, leaving the trained model and its predicted "
-            "displacement field untouched. Prices how much of the held-out "
-            "error is the anchor's geometry rather than the motion. Read the "
-            "result as an UPPER BOUND on what ground-truth depth would buy, not "
-            "an estimate of it: the tracked point's true position is at least "
-            "as good as unprojecting ground-truth depth through ground-truth "
-            "cameras at that pixel. Changes no gradient and is not stored in "
-            "the checkpoint, so a resume may toggle it freely; the eval's "
-            "metrics.json and run_summary.json record it. Needs "
-            "--val_scenes_file, since it touches nothing else"
+            "Alias for --eval_query_anchor_source query_position, kept so "
+            "recorded commands still run. Needs --val_scenes_file, and cannot "
+            "be combined with --ground_truth_query_anchor or with an "
+            "--eval_query_anchor_source that names another source"
         ),
     )
     evaluation.add_argument(
         "--ground_truth_query_anchor",
         action="store_true",
         help=(
-            "Eval-only diagnostic: anchor every held-out track at ground-truth "
-            "depth unprojected through the ground-truth camera at the anchor "
-            "pixel -- what MVTracker actually receives -- instead of the "
-            "model's own reconstruction of it. Unlike --oracle_query_anchor, "
-            "a ceiling with no pixel quantisation or depth-map sampling, this "
-            "keeps both, so the pair brackets what ground-truth depth would "
-            "buy. Changes no gradient and is not stored in the checkpoint, so "
-            "a resume may toggle it freely; the eval's metrics.json and "
-            "run_summary.json record it. Needs --val_scenes_file and cannot "
-            "be combined with --oracle_query_anchor"
+            "Alias for --eval_query_anchor_source gt_depth, kept so recorded "
+            "commands still run. Needs --val_scenes_file, and cannot be "
+            "combined with --oracle_query_anchor or with an "
+            "--eval_query_anchor_source that names another source"
         ),
     )
     evaluation.add_argument(
@@ -2742,33 +2805,34 @@ def _validate_args(args: argparse.Namespace) -> None:
             "their own directory, and it cannot be derived from the manifest, "
             "whose rows name the training directory"
         )
-    # Same parse-time refusal, same reason. The flag touches only the held-out
-    # eval, so without a held-out set it is silently inert -- while
-    # run_summary.json would still record it, filing a run as oracle-anchored
-    # when nothing was measured.
+    # Same parse-time refusal, same reason, for the eval's anchor flags. The
+    # readings can train now, through --query_anchor_source, but these flags
+    # touch only the held-out eval, so without a held-out set each is silently
+    # inert -- while run_summary.json would still file the run as scored on
+    # that reading when nothing was measured.
+    if args.eval_query_anchor_source is not None and not args.val_scenes_file:
+        raise ValueError(
+            "--eval_query_anchor_source needs --val_scenes_file: the flag only "
+            "ever reaches the held-out eval, so without a held-out set it "
+            "changes nothing and would label a run it never measured"
+        )
     if args.oracle_query_anchor and not args.val_scenes_file:
         raise ValueError(
-            "--oracle_query_anchor needs --val_scenes_file: the oracle anchor "
-            "only ever reaches the held-out eval, so without a held-out set the "
-            "flag changes nothing and would label a run it never measured"
+            "--oracle_query_anchor needs --val_scenes_file: the flag only ever "
+            "reaches the held-out eval, so without a held-out set it changes "
+            "nothing and would label a run it never measured"
         )
-    # Same parse-time refusal as its sibling, same reason.
     if args.ground_truth_query_anchor and not args.val_scenes_file:
         raise ValueError(
-            "--ground_truth_query_anchor needs --val_scenes_file: the "
-            "ground-truth depth anchor only ever reaches the held-out eval, so "
-            "without a held-out set the flag changes nothing and would label a "
-            "run it never measured"
+            "--ground_truth_query_anchor needs --val_scenes_file: the flag only "
+            "ever reaches the held-out eval, so without a held-out set it "
+            "changes nothing and would label a run it never measured"
         )
-    # One eval writes one curve, and each flag replaces the same anchor with a
-    # different ground-truth reading -- a curve cannot record both.
-    if args.oracle_query_anchor and args.ground_truth_query_anchor:
-        raise ValueError(
-            "--oracle_query_anchor cannot be combined with "
-            "--ground_truth_query_anchor: each replaces the query anchor with "
-            "a different ground-truth reading and the eval writes one curve; "
-            "drop one of the two flags"
-        )
+    # One eval writes one curve, so two spellings naming different readings
+    # are refused -- by the resolver itself, which keeps the precedence and the
+    # conflict rule in one place. Called here for its refusals, at parse time;
+    # the value is derived again where it is used.
+    _eval_query_anchor_source(args)
     # The visual dump rides the held-out eval, so a flag that can never reach
     # one is refused here rather than silently writing nothing. Scene names
     # are checked against the held-out set itself in run_training's preflight,
@@ -2888,6 +2952,9 @@ def _plan_summary(tally, args) -> dict:
     duplicates = [plan.duplicate_track_count for plan in tally.planned]
     tracks = [len(plan.track_indices) for plan in tally.planned]
     transformed = sum(1 for plan in tally.planned if plan.scene_transform)
+    # The reading the held-out eval scores on, or None when there is no
+    # held-out set to score -- the convention realized_val_query_anchors keeps.
+    eval_source = _eval_query_anchor_source(args) if args.val_scenes_file else None
     return {
         "manifest_version_expected": MANIFEST_VERSION,
         "records_read": len(tally.planned) + len(tally.skipped),
@@ -2971,7 +3038,8 @@ def _plan_summary(tally, args) -> dict:
             # checkpoint loadable either way, so only the summary can say which
             # geometry a curve was trained on -- and the camera arm's curve is
             # additionally anchor-contaminated (see --camera_input's help), so
-            # it must be read beside a --ground_truth_query_anchor run.
+            # it must be read beside a run scored with
+            # --eval_query_anchor_source gt_depth.
             "depth_input": bool(args.depth_input),
             "camera_input": bool(args.camera_input),
             # How many unrolled refinement passes each anchor ran, and the
@@ -2982,14 +3050,22 @@ def _plan_summary(tally, args) -> dict:
             # refused pair so an archived summary does.
             "refine_iters": int(args.refine_iters),
             "refine_gamma": float(args.refine_gamma),
-            # Whether the held-out tracks were anchored at ground truth. An
-            # oracle-anchored curve is an upper bound on the geometry, not a
-            # measurement of the model, so it is not comparable with a real one.
-            "oracle_query_anchor": bool(args.oracle_query_anchor),
-            # Its realisable sibling: ground-truth depth at the anchor pixel,
-            # what MVTracker actually receives. Also not comparable with a
-            # real curve; the pair brackets what ground-truth depth would buy.
-            "ground_truth_query_anchor": bool(args.ground_truth_query_anchor),
+            # Which query anchor every step's loss composes on. A curve trained
+            # against a ground-truth anchor measures a different model from one
+            # trained against its own, so it is recorded here beside the
+            # checkpoint's refused copy, for an archived summary to say which.
+            "query_anchor_source": args.query_anchor_source,
+            # Whether the held-out tracks were scored on the query point's true
+            # position, or on ground-truth depth at the anchor pixel: derived
+            # from eval_query_anchor_source below and kept for the readers that
+            # predate it, False both without a held-out set. On a head trained
+            # against its own anchor, either reading measures how much the head
+            # depends on that anchor, not what correct geometry buys.
+            "oracle_query_anchor": eval_source == "query_position",
+            "ground_truth_query_anchor": eval_source == "gt_depth",
+            # The reading the held-out eval scores on, by name: the training
+            # source unless an eval flag overrides it.
+            "eval_query_anchor_source": eval_source,
             "confidence_alpha": args.confidence_alpha,
             # What alpha the run actually trained under, as opposed to what was
             # asked for: None under 'auto' until a step resolves it, which is why
@@ -3298,6 +3374,9 @@ def run_training(
     # subset of args.query_anchors, and it is what the eval applies -- so it is
     # what the refusal below names and what every metrics.json records.
     val_anchors = _val_anchor_spec(args) if val_plans else []
+    # The reading the held-out eval scores on, resolved once for the same
+    # reason: the training source unless an eval flag overrides it.
+    eval_anchor_source = _eval_query_anchor_source(args)
     unsupervisable: list[dict] = []
     for plan in val_plans or []:
         val_scene = scene_provider(plan)
@@ -3496,6 +3575,7 @@ def run_training(
                     merge_synchronized_slots=args.merge_synchronized_slots,
                     refine_iters=args.refine_iters,
                     refine_gamma=args.refine_gamma,
+                    query_anchor_source=args.query_anchor_source,
                 )
             except UnsupervisableSceneError as error:
                 # Skipped like a scene that failed to load, and for the same
@@ -3646,12 +3726,14 @@ def run_training(
                 # write `conf` with no `occ`.
                 confidence_alpha=args.resolved_confidence_alpha,
                 merge_synchronized_slots=args.merge_synchronized_slots,
-                oracle_query_anchor=args.oracle_query_anchor,
-                ground_truth_query_anchor=args.ground_truth_query_anchor,
+                # The anchor the run trains against, recorded, and the one the
+                # eval scores on -- the same unless an eval flag overrides it.
+                query_anchor_source=args.query_anchor_source,
+                eval_query_anchor_source=eval_anchor_source,
                 # The run's own count, so the held-out curve measures the
                 # model as trained and every pass is scored.
                 refine_iters=args.refine_iters,
-                # Eval-only, like the anchor diagnostics: resolved at the
+                # Eval-only, like the eval's anchor source: resolved at the
                 # preflight above and never stored in the checkpoint.
                 visual_scenes=visual_scenes,
                 visual_stride=args.eval_visual_stride,
@@ -3823,6 +3905,12 @@ def _checkpoint_settings(args) -> dict:
         # grad_accum for the weights_only round trip.
         "refine_iters": int(args.refine_iters),
         "refine_gamma": float(args.refine_gamma),
+        # Which query anchor every step's loss composes on: the model's own, or
+        # one of the two ground-truth readings. Refused like a loss weight --
+        # it decides what the position term is computed against. A plain
+        # string, which torch.load(weights_only=True) returns unchanged. The
+        # eval's own source is stored nowhere: it changes no gradient.
+        "query_anchor_source": args.query_anchor_source,
         "confidence_alpha": args.confidence_alpha,
         # Derived state rather than a flag, and so deliberately in NEITHER resume
         # tier: check_resume_settings iterates the two tuples only, so this rides
@@ -3904,6 +3992,10 @@ def _write_checkpoint(
 # gamma reweights the per-pass losses, so it is a loss weight by the rule
 # above: the reported `loss` is the final pass's Huber whatever the discount,
 # so nothing in the history would show a changed gamma either.
+# query_anchor_source is refused on the loss-weight ground too: it decides
+# what every step's position term is computed against -- the model's own query
+# anchor or a ground-truth one -- so a segment that switched it would report
+# one curve over two objectives while `loss` kept its name.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
@@ -3956,6 +4048,7 @@ _RESUME_SETTINGS_REFUSED = (
     "camera_input",
     "refine_iters",
     "refine_gamma",
+    "query_anchor_source",
     "confidence_alpha",
     "precision",
     "grad_accum",
@@ -4026,6 +4119,13 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # trained under, and it is what a same-flags resume presents.
     "refine_iters": 1,
     "refine_gamma": DEFAULT_REFINE_GAMMA,
+    # A checkpoint from before --query_anchor_source could only have been
+    # written by a run whose loss composed on the model's own anchor: both
+    # ground-truth readings reached the eval alone, and train_step gathered
+    # nothing else. So absence resolves to "predicted", pre-flag runs resume
+    # silently, and resuming one against a ground-truth anchor is refused like
+    # any changed value.
+    "query_anchor_source": "predicted",
     # A checkpoint from before --val_seq_len could only have been written by a
     # run whose held-out window already fit the 24-frame clip: run_training
     # loads every held-out scene in its preflight, before step 0 and before the
@@ -4539,6 +4639,59 @@ def _val_anchor_spec(args) -> list[str]:
     return [
         f"{view_slot}:{time_slot}" for view_slot, time_slot in _val_anchor_slots(args)
     ]
+
+
+# The two pre-existing eval flags, each the spelling of one
+# --eval_query_anchor_source reading. Kept so every recorded command still
+# runs; nothing past the resolver below reads them.
+_EVAL_QUERY_ANCHOR_ALIASES = (
+    ("oracle_query_anchor", "query_position"),
+    ("ground_truth_query_anchor", "gt_depth"),
+)
+
+
+def _eval_query_anchor_source(args) -> str:
+    """The query anchor the held-out eval composes the tracks on, from flags.
+
+    ``--eval_query_anchor_source`` when given, else the alias that is set,
+    else the training source, ``--query_anchor_source``: a model is scored on
+    the anchor it trained against unless the flags say otherwise, which is
+    what lets one switch score a ground-truth-trained run on its own predicted
+    anchor.  Two spellings that name different readings raise, since one eval
+    writes one curve -- the two aliases together, or an alias against a
+    canonical flag naming another source; two that agree are one request said
+    twice, and pass.
+
+    Pure, so ``_validate_args``, which calls this for its refusals, stays
+    idempotent over one namespace; run_training and ``_plan_summary`` call it
+    for the value, so the precedence is stated here and nowhere else.
+    """
+
+    named = [
+        (flag, source)
+        for flag, source in _EVAL_QUERY_ANCHOR_ALIASES
+        if getattr(args, flag)
+    ]
+    if len(named) > 1:
+        raise ValueError(
+            f"--{named[0][0]} cannot be combined with --{named[1][0]}: each "
+            "replaces the query anchor with a different ground-truth reading "
+            "and the eval writes one curve; drop one of the two flags"
+        )
+    explicit = args.eval_query_anchor_source
+    if named and explicit is not None and explicit != named[0][1]:
+        flag, source = named[0]
+        raise ValueError(
+            f"--{flag} (--eval_query_anchor_source {source}) cannot be combined "
+            f"with --eval_query_anchor_source {explicit}: each names a different "
+            "query anchor and the eval writes one curve; drop one of the two "
+            "flags"
+        )
+    if explicit is not None:
+        return explicit
+    if named:
+        return named[0][1]
+    return args.query_anchor_source
 
 
 def _val_plans(args) -> list[StepPlan]:

@@ -74,8 +74,18 @@ _UPSCALING = 2.5
 _STEERED = _steered_to({0: 3, 1: 3, 2: 1})
 
 
-def _evaluate(output_dir, scenes, model, *, query_anchors=("0:0",), **kwargs):
-    """evaluate_held_out over ``scenes`` (name -> scene) at step 6."""
+def _evaluate(
+    output_dir,
+    scenes,
+    model,
+    *,
+    query_anchors=("0:0",),
+    query_anchor_source="predicted",
+    **kwargs,
+):
+    """evaluate_held_out over ``scenes`` (name -> scene) at step 6, for a run
+    trained against ``query_anchor_source`` (the model's own anchor unless a
+    test names another)."""
 
     return train_cli.evaluate_held_out(
         model=model,
@@ -89,6 +99,7 @@ def _evaluate(output_dir, scenes, model, *, query_anchors=("0:0",), **kwargs):
         output_dir=output_dir,
         query_anchors=list(query_anchors),
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source=query_anchor_source,
         **kwargs,
     )
 
@@ -202,8 +213,8 @@ def test_the_dump_holds_every_documented_key_at_its_shape_and_dtype(
         "refine_iters": 1,
         "depth_input": False,
         "camera_input": False,
-        "oracle_query_anchor": False,
-        "ground_truth_query_anchor": False,
+        "query_anchor_source": "predicted",
+        "eval_query_anchor_source": "predicted",
         "query_anchors": ["0:0"],
         "base_ratio": entry["drift"]["base_ratio"],
         "anchor_error_m": entry["anchor_error_m"],
@@ -449,20 +460,28 @@ def test_the_dumped_rgb_inverts_the_loaders_normalisation_over_the_full_range():
 
 
 @pytest.mark.parametrize(
-    "diagnostic",
-    ({}, {"oracle_query_anchor": True}, {"ground_truth_query_anchor": True}),
-    ids=("model", "oracle", "ground_truth"),
+    "trained, scored",
+    (
+        ("predicted", "predicted"),
+        ("predicted", "query_position"),
+        ("predicted", "gt_depth"),
+        ("gt_depth", "predicted"),
+    ),
+    ids=("model", "query_position", "gt_depth", "trained_on_gt_depth"),
 )
 def test_the_dumped_anchors_are_what_the_anchor_readout_measures(
-    tmp_path, monkeypatch, diagnostic
+    tmp_path, monkeypatch, trained, scored
 ):
     """The model's own anchors, by construction, whichever anchor was scored.
 
-    The expectation is the same under all three arms: aligned_query_anchors on
-    the model's own gather, which is query_anchor_errors' composition, so the
+    The expectation is the same under every arm: aligned_query_anchors on the
+    model's own gather, which is query_anchor_errors' composition, so the
     stored rows are its output exactly and their distances are the readout's.
     At the live four-anchor spec with rows steered onto two anchors out of
-    camera order, so a key filed by position or sorted fails.
+    camera order, so a key filed by position or sorted fails. The metadata
+    names both readings, so the last arm -- trained against ground-truth
+    depth, scored on its own anchor -- is told apart from a predicted-trained
+    run, and a swapped pair fails.
     """
 
     scene = _scaled_scene(monkeypatch, invisible=_STEERED, **_FOUR_CAMERA_WINDOW)
@@ -473,7 +492,8 @@ def test_the_dumped_anchors_are_what_the_anchor_readout_measures(
         {"0000": scene},
         model,
         query_anchors=_FOUR_ANCHOR_SPEC,
-        **diagnostic,
+        query_anchor_source=trained,
+        eval_query_anchor_source=scored,
         **_dumping("0000"),
     )
     arrays, metadata = _dumped(tmp_path)
@@ -503,18 +523,16 @@ def test_the_dumped_anchors_are_what_the_anchor_readout_measures(
         )
     assert [readout[key].size for key in _FOUR_ANCHOR_SPEC] == [0, 2, 1, 0]
     assert metadata["anchor_error_m"] == metrics["per_scene"][0]["anchor_error_m"]
-    assert metadata["oracle_query_anchor"] is bool(diagnostic.get("oracle_query_anchor"))
-    assert metadata["ground_truth_query_anchor"] is bool(
-        diagnostic.get("ground_truth_query_anchor")
-    )
+    assert metadata["query_anchor_source"] == trained
+    assert metadata["eval_query_anchor_source"] == scored
 
 
 @pytest.mark.parametrize("merge", (False, True), ids=("per_slot", "merged"))
 @pytest.mark.parametrize(
-    "diagnostic", ({}, {"oracle_query_anchor": True}), ids=("model", "oracle")
+    "scored", ("predicted", "query_position"), ids=("model", "query_position")
 )
 def test_the_dumped_tracks_are_the_bundle_that_was_scored(
-    tmp_path, monkeypatch, merge, diagnostic
+    tmp_path, monkeypatch, merge, scored
 ):
     """Every track array is the bundle's own, under either head and anchor."""
 
@@ -526,7 +544,7 @@ def test_the_dumped_tracks_are_the_bundle_that_was_scored(
         {"0000": scene},
         model,
         merge_synchronized_slots=merge,
-        **diagnostic,
+        eval_query_anchor_source=scored,
         **_dumping("0000"),
     )
     arrays, _ = _dumped(tmp_path)
@@ -539,22 +557,33 @@ def test_the_dumped_tracks_are_the_bundle_that_was_scored(
 def test_the_tracks_follow_the_scored_anchor_while_the_anchors_stay_the_models(
     tmp_path, monkeypatch
 ):
-    """The oracle moves what was scored, and the dump moves with it; the
-    anchors the dump draws are the model's under both, as the readout's are."""
+    """Scoring on the query position moves what was scored, and the dump moves
+    with it; the anchors the dump draws are the model's under both, as the
+    readout's are."""
 
     scene = _cpu_eval_scene(monkeypatch, gauge="scaled")
     model = _FakeArc(scene.num_observations, 56, 56)
 
     dumps = {}
-    for name, diagnostic in (("model", {}), ("oracle", {"oracle_query_anchor": True})):
-        _evaluate(tmp_path / name, {"0000": scene}, model, **diagnostic, **_dumping("0000"))
-        dumps[name], _ = _dumped(tmp_path / name)
+    for scored in ("predicted", "query_position"):
+        _evaluate(
+            tmp_path / scored,
+            {"0000": scene},
+            model,
+            eval_query_anchor_source=scored,
+            **_dumping("0000"),
+        )
+        dumps[scored], _ = _dumped(tmp_path / scored)
 
-    assert not np.array_equal(dumps["model"]["track_pred"], dumps["oracle"]["track_pred"])
+    assert not np.array_equal(
+        dumps["predicted"]["track_pred"], dumps["query_position"]["track_pred"]
+    )
     for key in VISUAL_KEYS:
-        if key in ("track_pred", "metadata") or key not in dumps["model"]:
+        if key in ("track_pred", "metadata") or key not in dumps["predicted"]:
             continue
-        np.testing.assert_array_equal(dumps["model"][key], dumps["oracle"][key], key)
+        np.testing.assert_array_equal(
+            dumps["predicted"][key], dumps["query_position"][key], key
+        )
 
 
 @pytest.mark.parametrize("merge", (False, True), ids=("per_slot", "merged"))

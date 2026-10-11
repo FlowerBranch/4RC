@@ -2289,6 +2289,7 @@ def test_train_step_and_the_eval_drive_the_real_refiner_end_to_end(tmp_path, mon
             output_dir=tmp_path / directory,
             query_anchors=["0:0", "1:0"],
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             **extra,
         )
 
@@ -2371,6 +2372,7 @@ def test_evaluate_held_out_scores_every_refinement_pass(tmp_path, monkeypatch, m
             output_dir=tmp_path / directory,
             query_anchors=["0:0", "1:0"],
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             merge_synchronized_slots=merge,
             **extra,
         )
@@ -2455,6 +2457,7 @@ def test_the_eval_refuses_a_stack_that_does_not_end_in_the_reported_field(
             output_dir=tmp_path / "out",
             query_anchors=["0:0", "1:0"],
             confidence_alpha=_EVAL_ALPHA,
+            query_anchor_source="predicted",
             refine_iters=3,
         )
 
@@ -2500,6 +2503,7 @@ def test_the_eval_releases_each_stack_before_the_shuffled_arm_is_scored(tmp_path
         output_dir=tmp_path / "out",
         query_anchors=["0:0", "1:0"],
         confidence_alpha=_EVAL_ALPHA,
+        query_anchor_source="predicted",
         refine_iters=refine_iters,
     )
 
@@ -2511,17 +2515,18 @@ def test_the_eval_releases_each_stack_before_the_shuffled_arm_is_scored(tmp_path
     assert shuffled == [0]
 
 
-@pytest.mark.parametrize("flag", ["ground_truth_query_anchor", "oracle_query_anchor"])
-def test_the_eval_scores_every_pass_in_the_anchor_diagnostics_frame(tmp_path, monkeypatch, flag):
-    """The eval-only anchor diagnostics hand the loss a WORLD-frame anchor,
-    and every pass must be composed in that frame, as the final one is: under
-    the ground-truth or oracle anchor the per-pass curve is the instrument
-    for how much of the error refinement removes once the anchor is right,
-    so an intermediate pass composed as if its anchor were in the model's
-    gauge reports a different curve with nothing to flag it. On the scaled
-    gauge (scale 2.25, a 25-degree rotation and a translation), where the two
-    frames differ, each pass's entry must equal a forced K=1 eval of that
-    pass's field under the same diagnostic."""
+@pytest.mark.parametrize("source", ["gt_depth", "query_position"])
+def test_the_eval_scores_every_pass_in_the_anchor_sources_frame(tmp_path, monkeypatch, source):
+    """A ground-truth eval source hands the loss a WORLD-frame anchor, and
+    every pass must be composed in that frame, as the final one is: for a run
+    trained against a ground-truth anchor -- which its eval scores on by
+    default -- the per-pass curve is the instrument for how much of the error
+    refinement removes once the anchor is right, so an intermediate pass
+    composed as if its anchor were in the model's gauge reports a different
+    curve with nothing to flag it. On the scaled gauge (scale 2.25, a
+    25-degree rotation and a translation), where the two frames differ, each
+    pass's entry must equal a forced K=1 eval of that pass's field at the same
+    source."""
 
     from test_trainer_loop import _cpu_eval_scene
 
@@ -2541,7 +2546,8 @@ def test_the_eval_scores_every_pass_in_the_anchor_diagnostics_frame(tmp_path, mo
             output_dir=tmp_path / directory,
             query_anchors=["0:0"],
             confidence_alpha=_EVAL_ALPHA,
-            **{flag: True},
+            query_anchor_source=source,
+            eval_query_anchor_source=source,
             **extra,
         )
 
@@ -2557,7 +2563,9 @@ def test_the_eval_scores_every_pass_in_the_anchor_diagnostics_frame(tmp_path, mo
 
     assert len(set(expected)) == refine_iters
     assert refined["per_scene"][0]["iteration_position_losses"] == expected
-    assert refined[flag] is True
+    assert refined["eval_query_anchor_source"] == source
+    assert refined["oracle_query_anchor"] is (source == "query_position")
+    assert refined["ground_truth_query_anchor"] is (source == "gt_depth")
 
 
 # ----------------------------------------------------------- signatures ---
