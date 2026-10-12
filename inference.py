@@ -186,8 +186,13 @@ def build_arg_parser():
         help=(
             "Optional train_state.pt written by train_temporal_tracking.py. "
             "Overlays the finetuned parameters recorded for its freeze mode onto "
-            "the base checkpoint. Without it the time embedding stays zero-initialized "
-            "and --time_indices has no effect on the output."
+            "the base checkpoint and runs the forward the patch trained under: "
+            "its refine_iters and, for a run trained with "
+            "--merge_synchronized_slots, the merged head, which runs at one "
+            "camera here, so --time_indices that repeat a time are refused. A "
+            "patch trained with --depth_input or --camera_input is refused: this "
+            "script feeds neither input. Without it the time embedding stays "
+            "zero-initialized and --time_indices has no effect on the output."
         ),
     )
     parser.add_argument("--refine_track_visualization", action="store_true", default=False)
@@ -219,76 +224,38 @@ def main():
     from arc.dust3r.inference_multiview import inference
     from arc.dust3r.utils.image import load_images
 
-    patch_metadata = None
-    from_pretrained_kwargs = {}
     if args.temporal_patch:
-        from arc.training.checkpoint import read_temporal_patch_metadata
+        from arc.training.checkpoint import load_temporal_patch_model
 
-        # Read the patch header first: it names the freeze mode the loader will
-        # demand back and, via the stored embedding shape, the table size the
-        # model must be constructed with.
-        patch_metadata = read_temporal_patch_metadata(args.temporal_patch)
-        if patch_metadata["max_time_indices"] is not None:
-            from_pretrained_kwargs["max_time_indices"] = patch_metadata[
-                "max_time_indices"
-            ]
+        # The helper reads the patch header, builds the base model at the
+        # patch's table size, applies its freeze, overlays it, and returns the
+        # forward keywords the patch trained under. --time_indices is
+        # bound-checked after the load, below, against that table: checking it
+        # first would read train_state.pt a third time -- it carries the
+        # optimizer state, several GB -- only to speed up an error path.
+        model, forward_kwargs = load_temporal_patch_model(
+            args.checkpoint_dir, args.temporal_patch, device=device
+        )
+    else:
+        # Bound-check against the table size before paying for the ~1B-param
+        # checkpoint load. The post-load check below still runs, because a
+        # checkpoint config.json may declare a different max_time_indices.
+        try:
+            validate_time_indices(time_indices, max_time_indices=Arc.MAX_TIME_INDICES)
+        except (TypeError, ValueError) as exc:
+            parser.error(str(exc))
 
-    # Bound-check against the table size before paying for the ~1B-param
-    # checkpoint load. The post-load check below still runs, because a checkpoint
-    # config.json may declare a different max_time_indices.
-    try:
-        validate_time_indices(
-            time_indices,
-            max_time_indices=from_pretrained_kwargs.get(
-                "max_time_indices",
-                Arc.MAX_TIME_INDICES,
-            ),
-        )
-    except (TypeError, ValueError) as exc:
-        parser.error(str(exc))
-
-    model = Arc.from_pretrained(args.checkpoint_dir, **from_pretrained_kwargs).to(device)
-    if args.temporal_patch:
-        from arc.training.checkpoint import load_temporal_tracking_checkpoint
-
-        # set_freeze first, to the mode recorded in the patch: the loader
-        # requires the match and keys the expected parameter set off
-        # requires_grad. The recorded block count comes with it, since the
-        # late-global mode's name does not by itself fix that set -- and the
-        # geometry flags likewise, derived from the patch's own key set, or a
-        # geometry-arm patch's injection tensors surface as unexpected keys.
-        # The refiner flag is the same derivation one module later: a patch
-        # trained at --refine_iters > 1 carries the refiner's tensors, and
-        # they too would surface as unexpected keys under a frozen refiner.
-        model.set_freeze(
-            patch_metadata["freeze_mode"],
-            late_global_blocks=patch_metadata["late_global_blocks"],
-            depth_input=patch_metadata["depth_input"],
-            camera_input=patch_metadata["camera_input"],
-            refine=patch_metadata["refine"],
-        )
-        load_temporal_tracking_checkpoint(model, args.temporal_patch)
-        late_global_note = (
-            ""
-            if patch_metadata["late_global_blocks"] is None
-            else f", late_global_blocks {patch_metadata['late_global_blocks']}"
-        )
-        refine_note = (
-            ""
-            if patch_metadata["refine_iters"] == 1
-            else f", refine_iters {patch_metadata['refine_iters']}"
-        )
-        print(
-            f"Loaded temporal-tracking patch: {args.temporal_patch} "
-            f"(freeze mode {patch_metadata['freeze_mode']}"
-            f"{late_global_note}{refine_note})"
-        )
-    elif TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
-        print(
-            "Warning: this checkpoint has no time-index embedding, so it was "
-            "zero-initialized. --time_indices will not change the output. Pass "
-            "--temporal_patch to load a finetuned embedding."
-        )
+        model = Arc.from_pretrained(args.checkpoint_dir).to(device)
+        # No patch, nothing to unroll and no head geometry to choose:
+        # inference()'s defaults, which are Arc.forward's own, run the
+        # released weights' single per-slot pass, today's forward exactly.
+        forward_kwargs = {}
+        if TIME_EMBEDDING_KEY in getattr(model, "consumed_legacy_missing_keys", frozenset()):
+            print(
+                "Warning: this checkpoint has no time-index embedding, so it was "
+                "zero-initialized. --time_indices will not change the output. Pass "
+                "--temporal_patch to load a finetuned embedding."
+            )
     model = model.eval()
     imgs = load_images(paths, size=512, verbose=True, patch_size=14)
 
@@ -305,16 +272,15 @@ def main():
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
-    # The patch's recorded iteration count reaches Arc.forward as
-    # refine_iters, so a K=4 patch runs its trained refiner four times, as
-    # trained. A patch without the field reads as 1 -- it trained one
-    # iteration, whether written before the field existed or by the retired
-    # one-scene driver, which never refined -- and without --temporal_patch
-    # there is no count: the released weights run one iteration, today's
-    # forward exactly.
+    # The patch's recorded iteration count and head geometry reach Arc.forward
+    # through inference(), so a K=4 patch runs its trained refiner four times
+    # and a merged patch its merged head, as trained. A patch without the
+    # count trained one iteration and one without the flag the per-slot head
+    # (read_temporal_patch_metadata); without --temporal_patch the keywords
+    # are empty and the released weights run today's forward exactly.
     output_dict, profiling = inference(
         imgs, model, device, dtype="bf16-mixed", verbose=True, profiling=True, use_center_as_anchor=False,
-        refine_iters=1 if patch_metadata is None else patch_metadata["refine_iters"],
+        **forward_kwargs,
     )
     print(f"Inference: {profiling['total_time']:.2f}s")
 

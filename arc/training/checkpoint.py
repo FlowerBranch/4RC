@@ -6,6 +6,8 @@ from pathlib import Path
 
 import torch
 
+from arc.models.arc import Arc
+
 
 _TIME_EMBEDDING_KEY = "backbone.pretrained.time_index_embedding.weight"
 _DEPTH_EMBED_KEY = "backbone.pretrained.depth_patch_embed.weight"
@@ -24,7 +26,7 @@ def _trainable_parameters(model) -> dict[str, torch.nn.Parameter]:
     }
 
 
-def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
+def _parse_payload(path: str | Path) -> tuple[str, int | None, int, bool, dict]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if (
         not isinstance(payload, dict)
@@ -99,10 +101,38 @@ def _parse_payload(path: str | Path) -> tuple[str, int | None, int, dict]:
             f"refiner's tensors ({_REFINER_KEY}); the two cannot both be true "
             "of one trained run, so it cannot be run as trained"
         )
+    # The head geometry is the one trained choice neither the key set nor a
+    # top-level field shows: the merged head adds no parameters, so a merged
+    # run's tensors match a per-slot run's name for name, and the trainer
+    # records the flag only in its resume settings (_checkpoint_settings).
+    # Absence resolves as the resume path resolves it
+    # (_RESUME_SETTINGS_ABSENT_DEFAULTS): a payload without the key, or without
+    # settings at all like the retired one-scene saver's, predates the flag and
+    # could only have trained the per-slot head. A stored settings of None
+    # reads as absent, as resume reads it. A stored flag must be a bool, the
+    # only type the trainer writes: anything else is a hand-edited or foreign
+    # payload, and coercing it would guess (bool("false") is True). A stored
+    # None is refused rather than read as absent: the key is present, so
+    # resume compares it, and None matches neither setting.
+    settings = payload.get("settings")
+    if settings is None:
+        settings = {}
+    elif not isinstance(settings, dict):
+        raise RuntimeError(
+            "Patch settings must be a dict or absent, got "
+            f"{type(settings).__name__}"
+        )
+    merge_synchronized_slots = settings.get("merge_synchronized_slots", False)
+    if not isinstance(merge_synchronized_slots, bool):
+        raise RuntimeError(
+            "Patch settings merge_synchronized_slots must be a bool or absent, "
+            f"got {merge_synchronized_slots!r}"
+        )
     return (
         payload["freeze_mode"],
         late_global_blocks,
         refine_iters,
+        merge_synchronized_slots,
         payload["state_dict"],
     )
 
@@ -133,9 +163,22 @@ def read_temporal_patch_metadata(path: str | Path) -> dict:
     disagreement with a ``ValueError`` before either caller sees the values.
     A loader passes ``refine`` into ``set_freeze`` and ``refine_iters`` into
     the forward.
+
+    ``merge_synchronized_slots`` is the one value read from the trainer's
+    stored settings rather than the key set or a top-level field: the merged
+    head adds no parameters, so the weights cannot show it, and the trainer
+    records it nowhere else. It is ``False`` when absent, since a payload
+    without it predates the flag and trained the per-slot head. A loader
+    passes it into the forward beside ``refine_iters``.
     """
 
-    freeze_mode, late_global_blocks, refine_iters, state_dict = _parse_payload(path)
+    (
+        freeze_mode,
+        late_global_blocks,
+        refine_iters,
+        merge_synchronized_slots,
+        state_dict,
+    ) = _parse_payload(path)
     embedding = state_dict.get(_TIME_EMBEDDING_KEY)
     return {
         "freeze_mode": freeze_mode,
@@ -149,18 +192,20 @@ def read_temporal_patch_metadata(path: str | Path) -> dict:
         "camera_input": _CAMERA_PROJ_KEY in state_dict,
         "refine": _REFINER_KEY in state_dict,
         "refine_iters": refine_iters,
+        "merge_synchronized_slots": merge_synchronized_slots,
     }
 
 
 def load_temporal_tracking_checkpoint(model, path: str | Path) -> None:
     """Strictly overlay a saved temporal-tracking patch onto a base Arc model."""
 
-    # The iteration count is the caller's to act on (inference.py hands it to
-    # the forward; the trainer's resume refuses a changed one before reaching
-    # here). _parse_payload has already refused a count that disagrees with
-    # the stored key set; the exact key match below refuses a refiner that
-    # disagrees with the MODEL's freeze, as unexpected or missing tensors.
-    freeze_mode, late_global_blocks, _, state_dict = _parse_payload(path)
+    # The iteration count and the head geometry are the caller's to act on
+    # (load_temporal_patch_model hands both to the forward; the trainer's
+    # resume refuses a changed one before reaching here). _parse_payload has
+    # already refused a count that disagrees with the stored key set; the
+    # exact key match below refuses a refiner that disagrees with the MODEL's
+    # freeze, as unexpected or missing tensors.
+    freeze_mode, late_global_blocks, _, _, state_dict = _parse_payload(path)
     if getattr(model, "freeze", None) != freeze_mode:
         raise ValueError(
             f"This patch was trained under freeze mode '{freeze_mode}'; call "
@@ -205,3 +250,78 @@ def load_temporal_tracking_checkpoint(model, path: str | Path) -> None:
                     f"{tuple(value.shape)} versus {tuple(parameter.shape)}"
                 )
             parameter.copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+
+def load_temporal_patch_model(checkpoint_dir, path: str | Path, *, device):
+    """Build the base model a patch trained on, overlay the patch, and return
+    the forward keywords that run it as trained.
+
+    The one patch loader inference.py and eval/track/launch.py share. The
+    patch header fixes everything the strict load and the forward need: the
+    time table's row count the model is constructed with; the freeze mode,
+    block count and refiner flag set_freeze applies before the load; and the
+    two forward keywords no weight can carry, the unroll count and the head
+    geometry (the merged head adds no parameters). Both callers feed frames
+    with neither depth maps nor camera vectors, and the encoder skips a
+    missing injection silently, so a patch trained with --depth_input or
+    --camera_input is refused here, before the base model is built.
+
+    Returns ``(model, forward_kwargs)``, where ``forward_kwargs`` is exactly
+    ``{"refine_iters": ..., "merge_synchronized_slots": ...}``.
+    """
+
+    # The header first: it names the freeze mode the loader will demand back
+    # and, via the stored embedding shape, the table size the model must be
+    # constructed with.
+    metadata = read_temporal_patch_metadata(path)
+    geometry = [
+        f"--{flag}" for flag in ("depth_input", "camera_input") if metadata[flag]
+    ]
+    if geometry:
+        raise ValueError(
+            f"{path} was trained with {' and '.join(geometry)}, but this script "
+            "feeds no depth maps or camera vectors and the encoder skips a "
+            "missing injection silently, so the patch cannot run as trained here"
+        )
+    construction = (
+        {}
+        if metadata["max_time_indices"] is None
+        else {"max_time_indices": metadata["max_time_indices"]}
+    )
+    model = Arc.from_pretrained(checkpoint_dir, **construction).to(device)
+    # set_freeze before the load, to the mode recorded in the patch: the
+    # loader requires the match and keys the expected parameter set off
+    # requires_grad. The recorded block count comes with it, since the
+    # late-global mode's name does not by itself fix that set, and so does the
+    # refiner flag: a patch trained at --refine_iters > 1 carries the
+    # refiner's tensors, which would surface as unexpected keys under a frozen
+    # refiner. The geometry flags stay at their False default; the refusal
+    # above guarantees the patch carries no injection tensor.
+    model.set_freeze(
+        metadata["freeze_mode"],
+        late_global_blocks=metadata["late_global_blocks"],
+        refine=metadata["refine"],
+    )
+    load_temporal_tracking_checkpoint(model, path)
+    late_global_note = (
+        ""
+        if metadata["late_global_blocks"] is None
+        else f", late_global_blocks {metadata['late_global_blocks']}"
+    )
+    refine_note = (
+        ""
+        if metadata["refine_iters"] == 1
+        else f", refine_iters {metadata['refine_iters']}"
+    )
+    merge_note = (
+        ", merged synchronized slots" if metadata["merge_synchronized_slots"] else ""
+    )
+    print(
+        f"Loaded temporal-tracking patch: {path} "
+        f"(freeze mode {metadata['freeze_mode']}"
+        f"{late_global_note}{refine_note}{merge_note})"
+    )
+    return model, {
+        "refine_iters": metadata["refine_iters"],
+        "merge_synchronized_slots": metadata["merge_synchronized_slots"],
+    }

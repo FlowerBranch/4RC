@@ -85,6 +85,8 @@ def eval_ours_tapvid3d(
     save_predictions=True,
     align="sim3",
     data_root="./data",
+    *,
+    forward_kwargs,
 ):
     return eval_tapvid3d(
         args.output_dir,
@@ -97,10 +99,11 @@ def eval_ours_tapvid3d(
         save_predictions=save_predictions,
         align=align,
         data_root=data_root,
+        forward_kwargs=forward_kwargs,
     )
 
 
-def get_inference_output(args, model, device, filelist, tracks_uv=None, visibility=None, size=None):
+def get_inference_output(args, model, device, filelist, tracks_uv=None, visibility=None, size=None, *, forward_kwargs):
     model.eval()
     if size is None:
         size = args.size
@@ -141,7 +144,10 @@ def get_inference_output(args, model, device, filelist, tracks_uv=None, visibili
                 view[name] = view[name].to(device, non_blocking=True)
 
         with torch.no_grad():
-            predictions = model(views, inference_track=True)
+            # A temporal patch's refine_iters and head geometry, from
+            # launch.py --temporal_patch; empty for the released weights,
+            # which keeps this call exactly upstream's.
+            predictions = model(views, inference_track=True, **forward_kwargs)
 
     pred_tracks = torch.cat([pred["track"] for pred in predictions], dim=0)  # (T, H, W, 3)
     return pred_tracks
@@ -158,6 +164,8 @@ def eval_tapvid3d(
     save_predictions=False,
     align="sim3",
     data_root="./data",
+    *,
+    forward_kwargs,
 ):
     if save_predictions:
         pred_dir = os.path.join(output_dir, f"saved_predictions_{data_type}")
@@ -188,6 +196,7 @@ def eval_tapvid3d(
             pred_tracks = get_inference_output(
                 args, model, device, filelist,
                 tracks_uv=None, visibility=None,
+                forward_kwargs=forward_kwargs,
             )
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             if not isinstance(e, torch.cuda.OutOfMemoryError) and "out of memory" not in str(e).lower():
@@ -197,6 +206,7 @@ def eval_tapvid3d(
             pred_tracks = get_inference_output(
                 args, model, device, filelist,
                 tracks_uv=None, visibility=None, size=336,
+                forward_kwargs=forward_kwargs,
             )
         if save_predictions:
             save_path = save_prediction_as_npy(pred_tracks, pred_dir, video_name)

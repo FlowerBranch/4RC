@@ -6,7 +6,7 @@
 #   uv pip install -r requirements-dev.txt
 #
 # Only packages reachable from arc/training, arc/models/arc, arc/dust3r/utils,
-# inference.py and tests/ are listed here.
+# inference.py, eval/track and tests/ are listed here.
 
 --extra-index-url https://download.pytorch.org/whl/cpu
 
@@ -24,6 +24,9 @@ Pillow
 opencv-python
 matplotlib
 tqdm
+# eval/track's two eval modules import it at the top, and
+# tests/test_temporal_patch_scripts.py drives them through launch.py.
+natsort
 # The headless viewer test (tests/test_viser_multiview_eval.py). Pinned to the
 # version requirements.txt pins, which is what $RC_ENV runs.
 viser==1.0.30

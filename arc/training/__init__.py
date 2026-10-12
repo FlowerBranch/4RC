@@ -1,6 +1,7 @@
 """Small, explicit training utilities for bounded 4RC experiments."""
 
 from .checkpoint import (
+    load_temporal_patch_model,
     load_temporal_tracking_checkpoint,
     read_temporal_patch_metadata,
 )
@@ -132,6 +133,7 @@ __all__ = [
     "build_visual_arrays",
     "read_visual_dump",
     "write_visual_dump",
+    "load_temporal_patch_model",
     "load_temporal_tracking_checkpoint",
     "ManifestPlanError",
     "LEGACY_PREDICTION_KEYS",

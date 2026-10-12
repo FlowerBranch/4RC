@@ -324,6 +324,11 @@ class Arc(
     def _synchronized_views_per_time(self, time_indices, num_views: int) -> int:
         """How many cameras observe each time index, from this forward's inputs.
 
+        A window with no time metadata is the legacy monocular reading -- every
+        view its own frame of one camera -- so it has one view per time. That
+        is how the official monocular eval, which attaches no time_index, runs
+        a merged patch: the merged head at V=1.
+
         Accepts a batch whose every row has each distinct time index exactly
         ``views_per_time`` times AND, reshaped camera-major to (V, T), every
         camera row a permutation of the distinct set.  Uniform multiplicity
@@ -337,10 +342,7 @@ class Arc(
         """
 
         if time_indices is None:
-            raise ValueError(
-                "merge_synchronized_slots needs a per-view 'time_index' on "
-                "every view to group the observation slots by time"
-            )
+            return 1
         views_per_time = None
         for row in time_indices:
             _, counts = torch.unique(row, return_counts=True)
@@ -732,14 +734,6 @@ class Arc(
         refine_iters: int = 1,
         **kwargs
     ):
-        if merge_synchronized_slots and not force_no_output_conversion:
-            raise ValueError(
-                "merge_synchronized_slots=True requires "
-                "force_no_output_conversion=True: _postprocess_output unbinds "
-                "track_multi over the observation axis against per-view world "
-                "points, and the merged head emits one row per time index, not "
-                "per observation slot"
-            )
         if profiling:
             profiling_info = {} if profiling else None
             start_time = time.time()
@@ -747,6 +741,26 @@ class Arc(
         images, track_query_idx, time_indices, depth_maps, camera_vectors = (
             self._preprocess_input(views)
         )
+        # _postprocess_output unbinds track_multi over the observation axis
+        # against per-view world points, while the merged head emits one row
+        # per time index. At one camera per time the two axes coincide, row for
+        # slot in order, so only V > 1 needs the raw output. Checked once the
+        # inputs are parsed, since V comes from their time indices, and before
+        # _forward, so a refused call never runs the encoder; with the merge
+        # off the condition short-circuits before any derivation.
+        if (
+            merge_synchronized_slots
+            and not force_no_output_conversion
+            and self._synchronized_views_per_time(time_indices, images.shape[1]) != 1
+        ):
+            raise ValueError(
+                "merge_synchronized_slots=True with more than one camera per "
+                "time requires force_no_output_conversion=True: "
+                "_postprocess_output unbinds track_multi over the observation "
+                "axis against per-view world points, and the merged head emits "
+                "one row per time index, not per observation slot (at one "
+                "camera the two coincide)"
+            )
 
         predictions = self._forward(
             images,

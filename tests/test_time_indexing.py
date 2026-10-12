@@ -725,16 +725,21 @@ def test_main_rejects_a_non_positive_frame_cap(monkeypatch):
         inference_cli.main()
 
 
-def test_inference_multiview_threads_refine_iters_to_the_model():
-    """The executed half of the inference route pin.
+def test_inference_multiview_threads_the_patch_keywords_to_the_model():
+    """inference() and loss_of_one_batch hand a patch's refine_iters and
+    merge_synchronized_slots to the model, on both the profiling and the
+    plain return shape.
 
     Recording is weight-free: a keyword dropped at inference() or at
     loss_of_one_batch leaves every output plausible -- a K=3 patch loads
-    cleanly and runs its trained refiner zero times -- and only a recorder
-    that sees the model call can tell. The default arm pins that a caller
-    passing nothing (app.py) reaches the model with refine_iters=1,
-    Arc.forward's own default and today's single pass, on both the profiling
-    and the plain return shape.
+    cleanly and runs its trained refiner zero times, a merged patch runs the
+    per-slot head -- and only a recorder that sees the model call can tell.
+    loss_of_one_batch spells the model call once per return shape, so each
+    shape gets both values. The default arm pins that a caller passing
+    nothing (app.py) reaches the model with refine_iters=1 and
+    merge_synchronized_slots=False, Arc.forward's own defaults and today's
+    single per-slot pass. inference.main's own hop is executed in
+    test_temporal_patch_scripts.
     """
 
     from arc.dust3r.inference_multiview import inference as run_inference
@@ -752,54 +757,25 @@ def test_inference_multiview_threads_refine_iters_to_the_model():
         return [{"img": torch.zeros(1, 3, 4, 4)} for _ in range(2)]
 
     recorder = _Recorder()
-    run_inference(
-        views(), recorder, torch.device("cpu"), "bf16-mixed",
-        verbose=False, profiling=True, refine_iters=3,
-    )
-    assert recorder.calls == [{"profiling": True, "refine_iters": 3}]
-
-    recorder.calls.clear()
-    run_inference(
-        views(), recorder, torch.device("cpu"), "bf16-mixed",
-        verbose=False, profiling=False,
-    )
-    assert recorder.calls == [{"profiling": False, "refine_iters": 1}]
-
-
-def test_inference_wires_the_patch_refine_fields_to_freeze_and_forward():
-    """The inspected half: the fed-but-frozen pin for inference.main.
-
-    test_trainer_loop's AST pin covers the two training drivers only. Here
-    the silent case is the forward hop: a set_freeze that dropped refine=
-    fails loudly on unexpected refiner keys, but an inference() call that
-    dropped refine_iters= loads a K=4 patch cleanly and runs one iteration.
-    main() cannot be executed past the model import on CPU, so both calls
-    are read from the source, the way the driver pin reads its drivers.
-    """
-
-    import ast
-    from pathlib import Path
-
-    calls = {}
-    for node in ast.walk(ast.parse(Path(inference_cli.__file__).read_text())):
-        if isinstance(node, ast.Call):
-            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            calls.setdefault(name, []).append(node)
-
-    def keyword_sources(call):
-        return {keyword.arg: ast.unparse(keyword.value) for keyword in call.keywords}
-
-    assert calls.get("set_freeze"), "inference.py has no set_freeze call"
-    for call in calls["set_freeze"]:
-        assert keyword_sources(call).get("refine") == "patch_metadata['refine']"
-    assert calls.get("inference"), "inference.py has no inference() call"
-    # The whole expression, not a substring of it: an inverted None check
-    # still spells patch_metadata['refine_iters'], and would run every loaded
-    # patch at one pass while crashing the patch-less path.
-    for call in calls["inference"]:
-        assert keyword_sources(call).get("refine_iters") == (
-            "1 if patch_metadata is None else patch_metadata['refine_iters']"
+    for profiling in (True, False):
+        recorder.calls.clear()
+        run_inference(
+            views(), recorder, torch.device("cpu"), "bf16-mixed",
+            verbose=False, profiling=profiling, refine_iters=3,
+            merge_synchronized_slots=True,
         )
+        assert recorder.calls == [
+            {"profiling": profiling, "refine_iters": 3, "merge_synchronized_slots": True}
+        ]
+
+        recorder.calls.clear()
+        run_inference(
+            views(), recorder, torch.device("cpu"), "bf16-mixed",
+            verbose=False, profiling=profiling,
+        )
+        assert recorder.calls == [
+            {"profiling": profiling, "refine_iters": 1, "merge_synchronized_slots": False}
+        ]
 
 
 def test_time_count_is_checked_before_subsampling_and_after_loading():
@@ -2209,7 +2185,26 @@ def test_patch_records_freeze_mode_and_embedding_rows(tmp_path):
         "camera_input": False,
         "refine": False,
         "refine_iters": 1,
+        "merge_synchronized_slots": False,
     }
+
+
+def test_patch_records_the_merged_head_from_the_trainer_settings(tmp_path):
+    """The merge adds no parameters, so the key set cannot show it: a merged
+    run's tensors match a per-slot run's name for name. The trainer's own
+    writer records it in the resume settings, and the reader must find it
+    there -- a payload hand-built here could put the flag wherever the reader
+    looks. Every other field reads the same for both runs."""
+
+    trained = _TinyHubArc(freeze="temporal_tracking")
+    per_slot = read_temporal_patch_metadata(_trainer_patch(trained, tmp_path / "per_slot"))
+    merged = read_temporal_patch_metadata(
+        _trainer_patch(trained, tmp_path / "merged", merge_synchronized_slots=True)
+    )
+
+    assert per_slot["merge_synchronized_slots"] is False
+    assert merged["merge_synchronized_slots"] is True
+    assert {**merged, "merge_synchronized_slots": False} == per_slot
 
 
 def test_a_geometry_arm_patch_records_its_flags_and_loads_back(tmp_path):

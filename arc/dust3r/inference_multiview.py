@@ -21,7 +21,7 @@ from arc.dust3r.utils.misc import invalid_to_nans
 
 def loss_of_one_batch(
     batch, model, criterion, device, precision, symmetrize_batch=False, use_amp=False, ret=None, profiling=False,
-    refine_iters=1,
+    refine_iters=1, merge_synchronized_slots=False,
 ):
     """
     Args:
@@ -51,16 +51,23 @@ def loss_of_one_batch(
     
 
     with torch.autocast(**autocast_dict):
-        # refine_iters is a temporal patch's recorded unroll count, threaded
-        # from inference.py; 1 is Arc.forward's own default and today's single
-        # pass, so app.py and every caller that sets nothing run unchanged.
-        # Named, and passed on both arms rather than only above 1: no injected
-        # fake binds this call, so there is no spelling to preserve and one
-        # call shape is the rule.
+        # refine_iters and merge_synchronized_slots are a temporal patch's
+        # recorded unroll count and head geometry, threaded from inference.py;
+        # 1 and False are Arc.forward's own defaults and today's single
+        # per-slot pass, so app.py and every caller that sets nothing run
+        # unchanged. Named, and passed on both arms rather than only off their
+        # defaults: no injected fake binds this call, so there is no spelling
+        # to preserve and one call shape is the rule.
         if profiling:
-            preds, profiling_info = model(views, profiling=profiling, refine_iters=refine_iters)
+            preds, profiling_info = model(
+                views, profiling=profiling, refine_iters=refine_iters,
+                merge_synchronized_slots=merge_synchronized_slots,
+            )
         else:
-            preds = model(views, profiling=profiling, refine_iters=refine_iters)
+            preds = model(
+                views, profiling=profiling, refine_iters=refine_iters,
+                merge_synchronized_slots=merge_synchronized_slots,
+            )
 
         # loss is supposed to be symmetric
         loss = (
@@ -75,7 +82,7 @@ def loss_of_one_batch(
 
 
 @torch.no_grad()
-def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True, profiling=False, use_center_as_anchor=False, refine_iters=1):
+def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True, profiling=False, use_center_as_anchor=False, refine_iters=1, merge_synchronized_slots=False):
     if verbose:
         print(f">> Inference with model on {len(multiple_views_in_one_sample)} images")
     result = []
@@ -94,7 +101,7 @@ def inference(multiple_views_in_one_sample, model, device, dtype, verbose=True, 
     # Get the result from loss_of_one_batch
     res = loss_of_one_batch(
         collate_with_cat([tuple(multiple_views_in_one_sample)]), model, None, device, dtype, profiling=profiling,
-        refine_iters=refine_iters,
+        refine_iters=refine_iters, merge_synchronized_slots=merge_synchronized_slots,
     )
     
     # Extract profiling_info before to_cpu if it exists

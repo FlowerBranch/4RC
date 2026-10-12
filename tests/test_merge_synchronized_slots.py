@@ -20,6 +20,8 @@ here are load-bearing enough to pin at the head level:
 
 import pytest
 import torch
+import torch.nn as nn
+from addict import Dict
 
 import inference as inference_cli
 from arc.models.arc.heads.dpt_head import DPTHead
@@ -350,7 +352,7 @@ def test_arc_derives_views_per_time_from_the_time_indices():
     layout the positional pooling mis-merges.  The accept/refuse table is the
     substance: camera-major and the shuffled arm's per-camera reversal pass,
     a time-major window and a ragged one are refused by name, and a window
-    with no time metadata cannot be merged at all.
+    with no time metadata merges as one camera.
     """
 
     model = _merged_fake_arc()
@@ -416,20 +418,28 @@ def test_arc_derives_views_per_time_from_the_time_indices():
             merge_synchronized_slots=True,
         )
 
+    # No time metadata is the legacy monocular reading, one view per time: the
+    # merged branch at V=1, not a refusal. It is how the official monocular
+    # eval, which attaches no time_index, runs a merged patch's head.
     model = _merged_fake_arc()
     views = [{"img": torch.zeros(1, 3, 2, 2)} for _ in range(8)]
     inference_cli.attach_frame_metadata(views, track_query_idx=[0])
-    with pytest.raises(ValueError, match="time_index"):
-        model(views, force_no_output_conversion=True, merge_synchronized_slots=True)
+    output = model(views, force_no_output_conversion=True, merge_synchronized_slots=True)
+    assert model.backbone.seen_time_indices is None
+    assert output["track_multi"].shape == (1, 1, 8, 2, 2, 3)
+    assert model.motion_decoder.seen_views_per_time == [1, 1, 1, 1]
+    assert model.motion_decoder.seen_merge == [True] * 4
 
 
 def test_the_merge_refuses_the_postprocessing_output_path():
     """_postprocess_output unbinds track_multi per input view; refuse, not garble.
 
     inference.py and app.py convert outputs by default, and a merged T-row
-    track_multi would be unbound against S per-view pointmaps -- a shape error
-    at best, a silent misalignment at worst. The guard must fire before any
-    work is done.
+    track_multi with more than one camera per time would be unbound against S
+    per-view pointmaps -- a shape error at best, a silent misalignment at
+    worst. At one camera the rows are the views, in order, and the merge takes
+    the conversion (the next test); above one the guard must fire before the
+    encoder runs.
     """
 
     model = _merged_fake_arc()
@@ -438,6 +448,79 @@ def test_the_merge_refuses_the_postprocessing_output_path():
             _metadata_views([0, 1, 2, 3, 0, 1, 2, 3]),
             merge_synchronized_slots=True,
         )
+    assert model.backbone.seen_time_indices is None
+
+
+class _AddictDepthHead(nn.Module):
+    """A unit depth with a unit confidence in the real head's addict Dict, so
+    _postprocess_output can read pose_enc as an attribute and unbind
+    depth_conf per view."""
+
+    def forward(self, feats, H, W, patch_start_idx):
+        B, S = feats[0][0].shape[:2]
+        return Dict(depth=torch.ones(B, S, H, W), depth_conf=torch.ones(B, S, H, W))
+
+
+class _RowNamingTrackHead(nn.Module):
+    """Row r of the field, and of its confidence, holds r + 1: a value that
+    names the row it was computed for, so the per-view outputs show which row
+    each view received."""
+
+    def forward(self, aggregated_tokens_list, images, patch_start_idx, frames_chunk_size):
+        B, rows, _, H, W = images.shape
+        names = torch.arange(1, rows + 1, dtype=torch.float32).view(1, rows, 1, 1)
+        confidence = names.expand(B, rows, H, W).clone()
+        return confidence.unsqueeze(-1).expand(B, rows, H, W, 3).clone(), confidence
+
+
+@pytest.mark.parametrize("refine_iters", [1, 2])
+@pytest.mark.parametrize("times", [None, (2, 0, 3, 1)], ids=["no-time-index", "distinct"])
+def test_the_merged_head_at_one_camera_takes_the_postprocessing_path(times, refine_iters):
+    """The monocular eval's call: merge on, outputs converted per view, no
+    force_no_output_conversion. At one camera per time the merged head's rows
+    are the slots in order, so view i must receive row i: each row's value
+    names it, a roll along the rows lands on the wrong view, and the query
+    view's world points are what the conversion adds. The decoder must have
+    been asked for the merged branch at V=1 on every call -- the recorder is
+    what tells this from a forward that quietly ran the per-slot head when it
+    converted, whose rows would line up just the same. Covers the window with
+    no time metadata the gate feeds, distinct indices out of order (rows
+    follow slots, not time values), and K=2, whose refinement loop runs the
+    merged head again on every pass.
+    """
+
+    from test_track_refinement import (
+        _RecordingRefineDecoder,
+        _SquareTranslationPoseDecoder,
+    )
+
+    model = _arc_shell(max_time_indices=32)
+    model.backbone = _FakeBackbone()
+    model.head = _AddictDepthHead()
+    model.cam_dec = _SquareTranslationPoseDecoder()
+    model.motion_decoder = _RecordingRefineDecoder()
+    model.track_head = _RowNamingTrackHead()
+    model.eval()
+    query = 1
+    views = [{"img": torch.zeros(1, 3, 28, 42)} for _ in range(4)]
+    inference_cli.attach_frame_metadata(views, track_query_idx=[query], time_indices=times)
+
+    with torch.no_grad():
+        outputs = model(views, merge_synchronized_slots=True, refine_iters=refine_iters)
+
+    decoder_calls = 4 * refine_iters
+    assert model.motion_decoder.seen_merge == [True] * decoder_calls
+    assert model.motion_decoder.seen_views_per_time == [1] * decoder_calls
+    seen_times = model.backbone.seen_time_indices
+    assert (seen_times is None) == (times is None)
+    assert len(outputs) == 4
+    query_points = outputs[query]["pts"]
+    for view, output in enumerate(outputs):
+        assert torch.equal(output["track"], query_points + (view + 1))
+        assert torch.equal(output["track"], output["track_multi"][:, 0])
+        assert torch.equal(output["conf_track"], torch.full((1, 28, 42), float(view + 1)))
+        rolled = (view + 1) % 4
+        assert not torch.equal(output["track"], query_points + (rolled + 1))
 
 
 # ------------------------------------------------ the track head slice is shape-only ---

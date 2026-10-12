@@ -27,6 +27,23 @@ def get_args_parser():
     parser.add_argument("--model_type", type=str, default="4rc", help="model type (4rc, vggt, pi3, da3)")
     parser.add_argument("--align", type=str, default="sim3", choices=["global", "pertraj", "sim3", "sim3_closed"], help="alignment method for evaluation metrics")
     parser.add_argument("--track_query_idx", type=int, default=11, help="frame index used as tracking query")
+    parser.add_argument(
+        "--temporal_patch",
+        default=None,
+        help=(
+            "Optional train_state.pt written by train_temporal_tracking.py. "
+            "Builds the base model at the patch's time-table size, overlays the "
+            "patch's trained parameters, and runs the forward the patch trained "
+            "under: its refine_iters and, for a run trained with "
+            "--merge_synchronized_slots, the merged head, here at one camera. A "
+            "patch trained with --depth_input or --camera_input is refused: this "
+            "eval feeds neither input. Not an exact replay of training: the eval "
+            "attaches no time_index, so the patch's time-index table is never "
+            "read. The trainer numbers each window's times from 0, so only the "
+            "first rows ever train, and numbering this eval's frames would read "
+            "rows that never trained."
+        ),
+    )
     return parser
 
 
@@ -45,7 +62,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     checkpoint = args.checkpoint_dir if args.checkpoint_dir else "Luo-Yihang/4RC"
-    model = Arc.from_pretrained(checkpoint).to(device)
+    if args.temporal_patch:
+        from arc.training.checkpoint import load_temporal_patch_model
+
+        model, forward_kwargs = load_temporal_patch_model(
+            checkpoint, args.temporal_patch, device=device
+        )
+    else:
+        model = Arc.from_pretrained(checkpoint).to(device)
+        forward_kwargs = {}
     model.eval()
 
     track_eval_data_types = [args.data_type]
@@ -63,6 +88,7 @@ def main():
             save_predictions=args.save_predictions,
             align=args.align,
             data_root=args.data_root,
+            forward_kwargs=forward_kwargs,
         )
 
 if __name__ == "__main__":

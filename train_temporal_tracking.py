@@ -3948,8 +3948,10 @@ def _write_checkpoint(
         # a trained refiner (its keys in state_dict, since the saver keys off
         # requires_grad) with no pass count, or a count with no refiner, cannot
         # be run as trained, and read_temporal_patch_metadata refuses it. The
-        # settings dict carries the same number for the resume tier; this copy
-        # is for inference.py, which opens the patch and never the settings.
+        # settings dict carries the same number for the resume tier;
+        # _parse_payload reads this copy, and reads the settings only for
+        # merge_synchronized_slots, which adds no parameters and so has no
+        # record outside them.
         "refine_iters": int(args.refine_iters),
         "state_dict": {
             name: parameter.detach().cpu()

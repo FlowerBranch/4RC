@@ -1199,7 +1199,9 @@ def test_arc_forward_loops_one_iteration_and_detaches_the_carry(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "time_indices, views", [((0, 1, 0, 1), 2), ((0, 1, 2, 3), 1)]
+    "time_indices, views",
+    [((0, 1, 0, 1), 2), ((0, 1, 2, 3), 1), (None, 1)],
+    ids=["two-cameras", "one-camera", "no-time-index"],
 )
 def test_arc_forward_merges_the_carry_rows_by_time(time_indices, views):
     """The merged arm of the loop: the head emits one row per time, T = S / V,
@@ -1209,19 +1211,27 @@ def test_arc_forward_merges_the_carry_rows_by_time(time_indices, views):
     them) and the anchor is still the anchor SLOT's cloud, which is what the
     refiner pools by time itself. A carry sized on S here would fail the
     refiner's row check on the real decoder and pass any fake that ignores
-    it. Two layouts: two cameras observing two times, and one camera
-    observing four -- the merge is defined at V=1 too (the pooled key row is
-    the slot's own patches behind its camera token), and a refinement that
-    fell back to the per-slot branch there would change the head geometry of
-    a single-camera window under a flag that promises the merged one."""
+    it. Three layouts: two cameras observing two times, one camera observing
+    four -- the merge is defined at V=1 too (the pooled key row is the slot's
+    own patches behind its camera token), and a refinement that fell back to
+    the per-slot branch there would change the head geometry of a
+    single-camera window under a flag that promises the merged one -- and
+    the same one camera with no time metadata at all, the window the official
+    monocular eval feeds a merged patch, which reads as V=1."""
 
     model, calls = _refining_shell(cloud=True)
+    window = _views(times=(0, 1, 2, 3) if time_indices is None else time_indices, anchors=(0, 3))
+    if time_indices is None:
+        # _views always attaches indices; the eval's views carry none.
+        for view in window:
+            del view["time_index"]
     output = model(
-        _views(times=time_indices, anchors=(0, 3)),
+        window,
         force_no_output_conversion=True,
         merge_synchronized_slots=True,
         refine_iters=2,
     )
+    assert (model.backbone.seen_time_indices is None) == (time_indices is None)
 
     slots, height, width = 4, 28, 42
     times = slots // views
@@ -2599,6 +2609,11 @@ def test_refinement_signatures_are_keyword_only_and_default_off():
     for function in (Arc.forward, inference_multiview.inference, inference_multiview.loss_of_one_batch):
         parameter = inspect.signature(function).parameters["refine_iters"]
         assert parameter.default == 1 and type(parameter.default) is int
+        # The head geometry rides the same three surfaces the same way: a
+        # patch's merge flag reaches the model through inference(), and a
+        # caller passing nothing (app.py) gets Arc.forward's per-slot default.
+        parameter = inspect.signature(function).parameters["merge_synchronized_slots"]
+        assert parameter.default is False
     for name in ("refine", "refine_iters", "refinement"):
         assert name not in inspect.signature(Arc.__init__).parameters
         assert name not in inspect.signature(MotionDecoder.__init__).parameters
