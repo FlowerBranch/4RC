@@ -54,6 +54,10 @@ EXPECTED_TRAINABLE_SETS = {
     # Pinned at DEFAULT_LATE_GLOBAL_BLOCKS; every other k derives from it via
     # LATE_GLOBAL_PER_BLOCK in expected_trainable_set.
     "temporal_tracking_late_global": (303, 427_899_172),
+    # The global-attention set plus the reconstruction heads the point loss
+    # trains: DualDPT's depth path (62 / 35_540_194) and CameraDec without its
+    # fov head (8 / 18_902_023). The ray branch and fc_fov stay frozen.
+    "temporal_tracking_global_attention_geometry": (553, 765_710_349),
 }
 # One global-attention block, measured on a meta-device Arc. The 14 are exactly
 # homogeneous, so k of them cost exactly k times this.
@@ -292,18 +296,25 @@ def build_optimizer(
     lr: float,
     embedding_lr: float | None = None,
     encoder_lr: float | None = None,
+    geometry_lr: float | None = None,
 ) -> tuple[torch.optim.AdamW, dict[str, float], list]:
     """AdamW over named parameter groups with per-group learning rates.
 
     The embedding gets its own group so its rate is a free knob, and unfrozen
-    encoder blocks get a lower default because the frozen geometry heads read
-    the features those blocks produce.  Weight decay stays 0 everywhere: no
-    regularizer is part of this proof, and decoupled decay must not drag the
-    unsupervised confidence output around.
+    encoder blocks get a lower default because the geometry heads read the
+    features those blocks produce -- pretrained against them, and frozen under
+    every preset but the geometry one.  Under that preset the trainable parts
+    of the geometry heads (DualDPT, CameraDec) get their own ``geometry``
+    group, at the encoder blocks' rate unless ``geometry_lr`` says otherwise:
+    they are pretrained weights too, not fresh capacity.  Weight decay stays 0
+    everywhere: no regularizer is part of this proof, and decoupled decay must
+    not drag the unsupervised confidence output around.
 
     Mode-agnostic by construction: the groups are selected by ``requires_grad``
     and the embedding's name, never by the freeze mode, so a preset that unfreezes
-    a different block set needs no change here.  A test drives all three presets
+    a different block set needs no change here.  A group with no parameter is
+    left out, so every preset that trains no geometry head builds exactly the
+    groups it built before that group existed.  A test drives all four presets
     against this rather than leaving it as a claim.
     """
 
@@ -344,10 +355,18 @@ def build_optimizer(
         and "depth_patch_embed" not in name
         and "camera_proj" not in name
     ]
+    geometry_parameters = [
+        parameter
+        for module in (model.head, model.cam_dec)
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
+    encoder_rate = lr * 0.1 if encoder_lr is None else encoder_lr
     learning_rates = {
         "decoder": lr,
         "embedding": lr if embedding_lr is None else embedding_lr,
-        "encoder_blocks": (lr * 0.1 if encoder_lr is None else encoder_lr),
+        "encoder_blocks": encoder_rate,
+        "geometry": encoder_rate if geometry_lr is None else geometry_lr,
     }
     groups = [
         {"params": head_parameters, "lr": learning_rates["decoder"]},
@@ -359,6 +378,12 @@ def build_optimizer(
         )
     else:
         learning_rates["encoder_blocks"] = None
+    if geometry_parameters:
+        groups.append(
+            {"params": geometry_parameters, "lr": learning_rates["geometry"]}
+        )
+    else:
+        learning_rates["geometry"] = None
 
     grouped = sum(parameter.numel() for group in groups for parameter in group["params"])
     trainable = sum(
@@ -410,7 +435,9 @@ def cut_features(feats):
     summed gradient through the encoder exactly once.  Summing gradients at a
     cut is the chain rule, so this is identical to one combined backward -- not
     an approximation -- while the encoder is neither re-run nor re-differentiated
-    per anchor.
+    per anchor.  The point term rides the same boundary: under it the
+    reconstruction reads the leaves too, and its backward lands on them before
+    the first head pass.
     """
 
     pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -430,7 +457,8 @@ def cut_features(feats):
 
 
 def backward_through_cut(pairs) -> None:
-    """Push the anchors' accumulated gradients back through the encoder once."""
+    """Push the accumulated gradients -- every anchor's, and the point term's
+    when it runs -- back through the encoder once."""
 
     if not pairs:
         return
@@ -442,8 +470,14 @@ def backward_through_cut(pairs) -> None:
     torch.autograd.backward(originals, gradients)
 
 
-def encode_and_reconstruct(model, views):
-    """The per-step work that does not depend on which frame is the query."""
+def encode_views(model, views):
+    """The images and the backbone taps: the per-step work no query depends on.
+
+    The reconstruction is not run here: the caller decides first whether to
+    cut the taps (:func:`cut_features`), and ``model.reconstruct`` reads
+    whichever it hands over -- the cut leaves whenever a cut is taken, so the
+    point term's backward lands on the same cut the anchors' do.
+    """
 
     images, _, time_indices, depth_maps, camera_vectors = model._preprocess_input(views)
     feats = model.encode_features(
@@ -452,7 +486,7 @@ def encode_and_reconstruct(model, views):
         depth_maps=depth_maps,
         camera_vectors=camera_vectors,
     )
-    return images, feats, model.reconstruct(feats, images)
+    return images, feats
 
 
 def anchor_tracks(

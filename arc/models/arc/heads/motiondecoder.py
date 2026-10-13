@@ -227,15 +227,17 @@ class TrackRefiner(nn.Module):
     see gradient proportional to corr, and corr is zero while either
     projection is zero -- so only the offset columns would ever learn.
 
-    The cloud, the kNN indices and the offsets carry NO gradient: under
-    every temporal freeze mode Arc.reconstruct runs the depth head and the
-    camera decoder inside its frozen_reconstruction no_grad block,
-    predicted_pointmaps detaches on top of that, and the read below is under
-    no_grad besides. Gradient reaches the refiner only through the
-    displacement -- previous_field is the caller's detached carry, so
-    through THIS iteration's field_embed and read_proj weights and the token
-    content -- which is what the freeze intends: the frozen geometry heads
-    are read, never trained through. No depth-validity filtering: this
+    The cloud, the kNN indices and the offsets carry NO gradient:
+    predicted_pointmaps runs under no_grad and detaches, the read below is
+    under no_grad besides, and under every temporal freeze mode but the
+    geometry ones Arc.reconstruct already ran the depth head and the camera
+    decoder inside its frozen_reconstruction no_grad block. Gradient reaches
+    the refiner only through the displacement -- previous_field is the
+    caller's detached carry, so through THIS iteration's field_embed and
+    read_proj weights and the token content -- which is what the freeze
+    intends: the geometry heads are read here, never trained through; under
+    the geometry presets only the training point loss trains them. No
+    depth-validity filtering: this
     cloud is the model's own prediction, defined at every pixel; MVTracker's
     corr_filter_invalid_depth exists for handed sensor depth with holes, and
     MVTracker itself ships it off (mvtracker.py:112,

@@ -1500,8 +1500,10 @@ def test_temporal_tracking_drops_the_frozen_reconstruction_graph():
     """Frozen depth/camera heads must not retain a backward graph.
 
     Their outputs are consumed only through detached paths, so the retained
-    dual-pyramid DPT graph is about 1.2 GB per observation of pure waste. Values
-    must be unchanged and the tracking branch must stay differentiable.
+    dual-pyramid DPT graph -- 0.94 GiB of saved tensors per observation at
+    378x504 -- is pure waste. Values must be unchanged and the tracking branch
+    must stay differentiable. The geometry preset is the one exception; see
+    test_point_loss.
     """
 
     def build(freeze):
@@ -2558,10 +2560,11 @@ def test_a_malformed_refine_count_is_refused(tmp_path, value, match):
 def test_runtime_step_helpers_drive_the_split_forward():
     """The multi-anchor step's glue, exercised on the real Arc methods.
 
-    ``encode_and_reconstruct`` and ``anchor_tracks`` are what a training step
-    calls instead of ``model(views)``. They are thin, but they are the only new
-    code between the model and the loss, and a shape or key mistake in them
-    would surface as a wasted GPU allocation rather than a test failure.
+    ``encode_views``, ``reconstruct`` and ``anchor_tracks`` are what a
+    training step calls instead of ``model(views)``. They are thin, but they
+    are the only new code between the model and the loss, and a shape or key
+    mistake in them would surface as a wasted GPU allocation rather than a
+    test failure.
     """
 
     from arc.training import runtime
@@ -2585,7 +2588,8 @@ def test_runtime_step_helpers_drive_the_split_forward():
         num_observations=len(views),
     )
 
-    images, feats, recon = runtime.encode_and_reconstruct(model, views)
+    images, feats = runtime.encode_views(model, views)
+    recon = model.reconstruct(feats, images)
 
     assert images.shape == (1, 4, 3, 2, 2)
     # The reconstruction is built once and shared: it is what the Sim(3) fit and

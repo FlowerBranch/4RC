@@ -579,6 +579,32 @@ def unproject_depth(
     return world_points
 
 
+def unproject_pose_encoding(depth: torch.Tensor, pose_encoding: torch.Tensor) -> torch.Tensor:
+    """World points of a (B, S, H, W) depth through a (B, S, 9) pose encoding.
+
+    Returns (B, S, H, W, 3) in the reconstruction's own gauge. The one
+    unprojection of the model's reconstruction: ``predicted_pointmaps``
+    runs it under no_grad for the Sim(3) fit, the anchors and the refiner's
+    cloud, and the training point loss runs it with the graph kept. The
+    gradient reaches the depth and the camera's translation and rotation,
+    never the intrinsics, which are detached here: the two fovs, the only
+    learned intrinsics (the principal point is fixed at the image centre),
+    are not trained. Under no_grad the detach is a view, so the no-grad
+    caller's values are unchanged. Dtype and autocast are the caller's.
+    """
+
+    height, width = depth.shape[-2:]
+    camera_to_world, intrinsics = pose_encoding_to_extri_intri(
+        pose_encoding,
+        (height, width),
+    )
+    return unproject_depth(
+        depth[..., None],
+        intrinsics.detach(),
+        as_homogeneous(camera_to_world),
+    )
+
+
 def predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
     """Model-gauge world points of the model's own reconstruction, (1, S, H, W, 3).
 
@@ -588,11 +614,12 @@ def predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
     ``Arc._postprocess_output`` adds to the tracks, computed in torch here
     and in numpy there from the same pose encoding, so equal up to float
     rounding. float32, detached, on depth's device; B must be 1, which every
-    caller is. Moved here verbatim from
-    ``arc.training.sparse_tracking._predicted_pointmaps`` so the model can
-    read its own cloud (TrackRefiner) without importing from arc.training;
-    sparse_tracking imports it back under the old name for its three callers
-    and for the tests that plant a known gauge through that name.
+    caller is. Lives here, not in ``arc.training.sparse_tracking``, so the
+    model can read its own cloud (TrackRefiner) without importing from
+    arc.training; sparse_tracking imports it back as ``_predicted_pointmaps``
+    for its three callers and for the tests that plant a known gauge through
+    that name. The unprojection itself is :func:`unproject_pose_encoding`,
+    which the training point loss shares with the graph kept.
     """
 
     required = {"depth", "pose_enc"}
@@ -621,17 +648,9 @@ def predicted_pointmaps(raw_predictions: dict) -> torch.Tensor:
         device_type=depth.device.type,
         enabled=False,
     ):
-        depth = depth.detach().float()
-        pose_encoding = pose_encoding.detach().float()
-        height, width = depth.shape[-2:]
-        camera_to_world, intrinsics = pose_encoding_to_extri_intri(
-            pose_encoding,
-            (height, width),
-        )
-        pointmaps = unproject_depth(
-            depth[..., None],
-            intrinsics,
-            as_homogeneous(camera_to_world),
+        pointmaps = unproject_pose_encoding(
+            depth.detach().float(),
+            pose_encoding.detach().float(),
         )
     return pointmaps.detach()
 

@@ -26,6 +26,7 @@ from arc.models.arc.utils.transform import (
     # callers (the Sim(3) fit, the anchor gather and visual_geometry), and the
     # tests that plant a known gauge through this name, unchanged.
     predicted_pointmaps as _predicted_pointmaps,
+    unproject_pose_encoding,
 )
 from arc.training.diagnostics import (
     confidence_occlusion_diagnostics,
@@ -36,6 +37,7 @@ from arc.training.losses import (
     adjacent_pair_indices,
     compose_tracking_loss,
     per_sample_huber_error,
+    point_loss,
     resolve_confidence_alpha,
     synchronized_consistency_loss,
     synchronized_pair_indices,
@@ -489,6 +491,92 @@ def fit_scene_sim3(
     return sim3, report
 
 
+def reconstruction_point_loss(
+    raw_predictions: dict,
+    scene: DumpedKubricScene,
+    alignment: DetachedSim3,
+    *,
+    huber_delta_m: float,
+) -> torch.Tensor:
+    """The point term: the predicted reconstruction against ground-truth points.
+
+    Every observation slot's predicted depth is unprojected through its
+    predicted camera by :func:`unproject_pose_encoding` -- the unprojection
+    :func:`_predicted_pointmaps` runs under no_grad for the Sim(3) fit and the
+    anchors, run here with the graph kept and the intrinsics detached --
+    mapped into the stored world through this step's detached ``alignment``,
+    lifted to metres by ``track_upscaling_factor`` exactly as the track term
+    lifts its positions, and compared with :func:`_metric_pointmap_at_anchor`
+    at that slot's valid pixels by :func:`point_loss`: one mean over the valid
+    pixels of all slots.  Its gradient reaches the depth and the cameras'
+    translation and rotation, so DualDPT and CameraDec train through this
+    term alone; the alignment and the anchors stay detached, so the track
+    loss never reaches them.
+
+    Depth outside the mask is replaced by zero before the unprojection.  The
+    camera-to-world product sums the pose gradient over every pixel, so a
+    non-finite depth at an unsupervised pixel would otherwise turn the camera
+    gradient NaN through ``0 * inf``; at zero depth that pixel lands on the
+    camera centre and contributes exactly nothing.
+    """
+
+    if huber_delta_m <= 0 or not np.isfinite(huber_delta_m):
+        raise ValueError("huber_delta_m must be finite and positive")
+    missing = {"depth", "pose_enc"} - set(raw_predictions)
+    if missing:
+        raise KeyError(
+            f"Raw predictions are missing reconstruction fields: {sorted(missing)}"
+        )
+    depth = raw_predictions["depth"]
+    pose_encoding = raw_predictions["pose_enc"]
+    observation_count = scene.num_observations
+    if depth.ndim != 4 or depth.shape[:2] != (1, observation_count):
+        raise ValueError(
+            f"depth must have shape (1,{observation_count},H,W) for "
+            f"{observation_count} inputs, got {tuple(depth.shape)}"
+        )
+    if pose_encoding.shape != (1, observation_count, 9):
+        raise ValueError(
+            f"pose_enc must have shape (1,{observation_count},9), got "
+            f"{tuple(pose_encoding.shape)}"
+        )
+
+    targets, valid = zip(
+        *(_metric_pointmap_at_anchor(scene, slot) for slot in range(observation_count))
+    )
+    device = depth.device
+    target_positions = torch.from_numpy(np.stack(targets)).to(
+        device=device,
+        dtype=torch.float32,
+    )
+    mask = torch.from_numpy(np.stack(valid)).to(device)
+    if target_positions.shape[1:3] != depth.shape[2:]:
+        raise ValueError(
+            f"Predicted depth {tuple(depth.shape[2:])} and metric pointmaps "
+            f"{tuple(target_positions.shape[1:3])} disagree"
+        )
+
+    metric_factor = float(scene.track_upscaling_factor)
+    # fp32 with autocast off, like predicted_pointmaps: the unprojection must
+    # not run in an enclosing BF16 region.
+    with torch.autocast(device_type=device.type, enabled=False):
+        supervised_depth = torch.where(mask[None], depth.float(), 0.0)
+        points = unproject_pose_encoding(supervised_depth, pose_encoding.float())[0]
+        predicted_metric = (
+            alignment.to(device=device, dtype=torch.float32).apply_points(points)
+            * metric_factor
+        )
+    target_metric = target_positions * metric_factor
+    if not torch.isfinite(predicted_metric).all(dim=-1)[mask].all():
+        raise FloatingPointError("Predicted reconstruction contains NaN or Inf")
+    return point_loss(
+        predicted_metric,
+        target_metric,
+        mask,
+        huber_delta=huber_delta_m,
+    )
+
+
 def _mean_max(values: list[float]) -> dict[str, float] | None:
     """``{mean, max}`` over a group, or ``None`` when the group is empty."""
 
@@ -533,7 +621,7 @@ def reconstruction_drift_report(
     scene: DumpedKubricScene,
     alignment: DetachedSim3,
 ) -> dict:
-    """Score the frozen reconstruction against the scene's ground truth.
+    """Score the reconstruction against the scene's ground truth.
 
     The per-step Sim(3) report watches one observation at the top confidence
     quintile, which is nearly blind to where degradation starts.  This instead
@@ -873,7 +961,8 @@ def gather_query_anchor_points(
     loss on ``--query_anchor_source`` and the held-out eval on
     ``--eval_query_anchor_source``, which defaults to the training source.
     Every reading is detached, so whichever one a step trains against, no
-    gradient reaches the reconstruction.
+    gradient reaches the reconstruction through the anchor; only the point
+    term (:func:`reconstruction_point_loss`) trains it.
 
     * ``"predicted"``, the default: the model's own pointmap at the anchor
       pixel, in the reconstruction's gauge.  Frame ``"model"``.

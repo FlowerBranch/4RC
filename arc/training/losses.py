@@ -6,9 +6,12 @@ or the filesystem.  Gathering, masking and alignment stay on the geometry side i
 ``sparse_tracking.py``, which keeps the dependency one-way and lets every term be
 unit-tested from hand-built tensors with no scene fixture.
 
-Adding a term later means writing one function here and giving it a weight in
-:func:`compose_tracking_loss`; nothing else has to change.  Reporting that is not
-differentiable belongs in ``diagnostics.py``, not here.
+Adding a per-anchor term later means writing one function here and giving it a
+weight in :func:`compose_tracking_loss`; nothing else has to change.  A per-step
+term -- :func:`point_loss`, which scores the reconstruction once rather than each
+anchor's field -- is written here the same way but weighted and backwarded by the
+training step itself.  Reporting that is not differentiable belongs in
+``diagnostics.py``, not here.
 """
 
 from __future__ import annotations
@@ -53,6 +56,37 @@ def track_position_loss(
     )
     if not torch.isfinite(loss):
         raise FloatingPointError("Track position loss produced NaN or Inf")
+    return loss
+
+
+def point_loss(
+    predicted: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    huber_delta: float,
+) -> torch.Tensor:
+    """Huber loss on the reconstruction's world points, in metres.
+
+    The position term's Huber applied to the predicted reconstruction rather
+    than to the tracks: the same physical knee (``huber_delta`` in metres) and
+    the same single ``reduction="mean"`` over the masked ``(K,3)`` selection,
+    so ``--huber_delta_m`` sets both and the two read on one scale.  ``mask``
+    selects the pixels with ground-truth depth, pooled across every slot, so
+    a slot weighs by its supervised pixels -- not a mean of per-slot means.
+    """
+
+    if mask.dtype == torch.bool and not mask.any():
+        raise ValueError("No pixels selected for the point loss")
+    _validate_position_inputs(predicted, target, mask, huber_delta)
+    loss = F.huber_loss(
+        predicted[mask],
+        target[mask],
+        reduction="mean",
+        delta=huber_delta,
+    )
+    if not torch.isfinite(loss):
+        raise FloatingPointError("Point loss produced NaN or Inf")
     return loss
 
 

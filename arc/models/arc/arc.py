@@ -45,7 +45,13 @@ class Arc(
         "temporal_tracking",
         "temporal_tracking_global_attention",
         "temporal_tracking_late_global",
+        "temporal_tracking_global_attention_geometry",
     )
+    # The temporal presets that also train the reconstruction heads --
+    # DualDPT's depth path and CameraDec's translation and rotation -- through
+    # the training point loss (--point_weight). reconstruct keeps their graph
+    # under these; every other temporal preset runs them under no_grad.
+    GEOMETRY_FREEZE_MODES = ("temporal_tracking_global_attention_geometry",)
     LEGACY_CHECKPOINT_MISSING_KEYS = (
         "backbone.pretrained.time_index_embedding.weight",
         "backbone.pretrained.depth_patch_embed.weight",
@@ -498,10 +504,12 @@ class Arc(
                 f"'temporal_tracking_late_global'; got mode {freeze!r}"
             )
         unfrozen_block_indices = ()
-        if freeze == "temporal_tracking_global_attention":
+        if freeze in ("temporal_tracking_global_attention", *self.GEOMETRY_FREEZE_MODES):
             # Cross-view fusion can only be learned in the blocks that attend
             # across frames, so this mode adds exactly the global-attention
-            # blocks and leaves the interleaved local blocks frozen.
+            # blocks and leaves the interleaved local blocks frozen. The
+            # geometry preset trains the same blocks, plus the reconstruction
+            # heads below.
             unfrozen_block_indices = self._global_attention_block_indices(freeze)
         elif freeze == "temporal_tracking_late_global":
             # The middle rung: the same fusion argument, but confined to the
@@ -529,6 +537,27 @@ class Arc(
                     f"{len(available)} global-attention blocks this encoder has"
                 )
             unfrozen_block_indices = available[-late_global_blocks:]
+        # The parts of the reconstruction heads the point loss cannot train,
+        # resolved here, before the first requires_grad_ call, so a head that
+        # lacks one raises with the model untouched. The loss reads depth and
+        # the camera's translation and rotation with the intrinsics detached:
+        # DualDPT's ray branch feeds no training loss, so it would reach
+        # assert_trainable_gradients_finite with grad None, and CameraDec's
+        # fov head would receive an exact zero gradient (pose_enc's
+        # concatenation hands its slice zeros) that no guard sees -- the focal
+        # length is not trained, so it is frozen by name, not left inert.
+        untrained_reconstruction = ()
+        if freeze in self.GEOMETRY_FREEZE_MODES:
+            scratch = self.head.scratch
+            untrained_reconstruction = (
+                scratch.refinenet1_aux,
+                scratch.refinenet2_aux,
+                scratch.refinenet3_aux,
+                scratch.refinenet4_aux,
+                scratch.output_conv1_aux,
+                scratch.output_conv2_aux,
+                self.cam_dec.fc_fov,
+            )
 
         self.requires_grad_(True)
         if freeze in self.TEMPORAL_FREEZE_MODES:
@@ -559,6 +588,14 @@ class Arc(
                 self.backbone.pretrained.depth_patch_embed.requires_grad_(True)
             if camera_input:
                 self.backbone.pretrained.camera_proj.requires_grad_(True)
+            # The reconstruction heads train under the geometry presets only,
+            # unfrozen whole and then re-frozen by name where the point loss
+            # cannot reach (resolved above), the refiner's pattern.
+            if freeze in self.GEOMETRY_FREEZE_MODES:
+                self.head.requires_grad_(True)
+                self.cam_dec.requires_grad_(True)
+                for module in untrained_reconstruction:
+                    module.requires_grad_(False)
         for index in unfrozen_block_indices:
             self.backbone.pretrained.blocks[index].requires_grad_(True)
 
@@ -955,19 +992,27 @@ class Arc(
         # the same behaviour on both devices, without the warning.
         device_type = next(self.parameters()).device.type
         with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=device_type == "cuda"):
-            # Under every temporal freeze mode the depth head and camera decoder
-            # are frozen and their outputs are consumed only through detached
-            # paths (arc.models.arc.utils.transform.predicted_pointmaps is
-            # no_grad plus .detach(), and the track refiner reads its cloud
-            # under no_grad again), so retaining the dual-pyramid DPT graph
-            # costs about 1.2 GB per observation for nothing. This holds even
-            # when encoder blocks are trainable: no loss reads these outputs
-            # undetached, so no gradient is lost by cutting the graph here.
-            # Keep the values, drop the graph. Nested inside the autocast
-            # above, which is doing real work forcing fp32 for these heads
-            # under an outer bf16 autocast.
+            # Under every temporal freeze mode but the geometry ones the depth
+            # head and camera decoder are frozen and their outputs are consumed
+            # only through detached paths
+            # (arc.models.arc.utils.transform.predicted_pointmaps is no_grad
+            # plus .detach(), and the track refiner reads its cloud under
+            # no_grad again), so retaining the dual-pyramid DPT graph would
+            # cost 0.94 GiB of saved tensors per observation for nothing
+            # (measured on CPU at 378x504: 0.41 on the depth path, 0.53 on the
+            # ray branch). This holds even when encoder blocks are trainable:
+            # no loss reads these outputs undetached there, so no gradient is
+            # lost by cutting the graph. Keep the values, drop the graph.
+            # Under GEOMETRY_FREEZE_MODES the training point loss backwards
+            # depth and pose_enc, so the graph stays -- the ray branch's share
+            # included, since its input requires grad even though its
+            # parameters stay frozen and nothing backwards it. Nested inside
+            # the autocast above, which is doing real work forcing fp32 for
+            # these heads under an outer bf16 autocast.
+            freeze = getattr(self, "freeze", "none")
             frozen_reconstruction = (
-                getattr(self, "freeze", "none") in self.TEMPORAL_FREEZE_MODES
+                freeze in self.TEMPORAL_FREEZE_MODES
+                and freeze not in self.GEOMETRY_FREEZE_MODES
             )
             with torch.no_grad() if frozen_reconstruction else nullcontext():
                 output = self.head(feats, H, W, patch_start_idx=0)

@@ -272,6 +272,14 @@ def _loop_args(tmp_path, **overrides):
         confidence_weight=0.0,
         sync_weight=0.0,
         velocity_weight=0.0,
+        # The point term and the preset it requires, at the parser's defaults:
+        # weight 0 under the global-attention preset, the contract every
+        # existing test assumes. point_weight is stored and refused like the
+        # weights above; _validate_args reads all three for the coupling, and
+        # main's build_optimizer reads the rate.
+        point_weight=0.0,
+        freeze_mode="temporal_tracking_global_attention",
+        geometry_lr=None,
         # Head geometry: per-slot, the contract every existing test assumes.
         # _checkpoint_settings stores it and check_resume_settings refuses a
         # change, so every loop test needs it present.
@@ -1302,7 +1310,8 @@ class _FakeArc(nn.Module):
         pretrained.pretrained = embedding
         self.backbone = pretrained
         # The reconstruction and camera heads are frozen under every temporal
-        # preset. Leaving them trainable here would trip
+        # preset but the geometry one, which trains them through the point
+        # term this fake never feeds. Leaving them trainable here would trip
         # assert_trainable_gradients_finite on parameters the real model never
         # asks for a gradient on -- the guard is right, the fake was wrong.
         self.head.requires_grad_(False)
@@ -1447,6 +1456,7 @@ def test_the_real_train_step_runs_end_to_end_on_cpu(monkeypatch):
         confidence_alpha=None,
         sync_weight=0.0,
         velocity_weight=0.0,
+        point_weight=0.0,
         learning_rates=[1e-3],
         step=0,
         accum_steps=1,
@@ -1813,6 +1823,7 @@ def test_each_anchor_source_reaches_the_eval_gather_and_the_step_gather(
         confidence_alpha=None,
         sync_weight=0.0,
         velocity_weight=0.0,
+        point_weight=0.0,
         learning_rates=[1e-3],
         step=0,
         accum_steps=1,
@@ -3286,6 +3297,7 @@ def _micro_step(model, scene, optimizer, *, step, accum_steps, index, last):
         confidence_alpha=None,
         sync_weight=0.0,
         velocity_weight=0.0,
+        point_weight=0.0,
         learning_rates=[1e-3],
         step=step,
         accum_steps=accum_steps,
@@ -3700,6 +3712,7 @@ def test_a_step_at_fewer_anchors_reduces_over_its_own_samples(monkeypatch):
         confidence_alpha=None,
         sync_weight=0.0,
         velocity_weight=0.0,
+        point_weight=0.0,
         learning_rates=[1e-3],
         step=0,
         accum_steps=1,
@@ -3737,7 +3750,7 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(monkeypatch):
     from arc.training.runtime import (
         anchor_sample_counts,
         anchor_tracks,
-        encode_and_reconstruct,
+        encode_views,
         tracking_only,
     )
 
@@ -3759,7 +3772,8 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(monkeypatch):
     reference = copy.deepcopy(model)
     correspondences, _ = build_anchor_correspondences(scene)
     counts = anchor_sample_counts(scene, correspondences, 2)
-    images, feats, recon = encode_and_reconstruct(reference, scene.views)
+    images, feats = encode_views(reference, scene.views)
+    recon = reference.reconstruct(feats, images)
     reference_alignment, _ = fit_scene_sim3(recon, scene)
     anchor_points, anchor_frame = gather_query_anchor_points(
         recon, scene, correspondences
@@ -3797,6 +3811,7 @@ def test_a_two_anchor_step_runs_end_to_end_on_the_dumped_fixture(monkeypatch):
         confidence_alpha=None,
         sync_weight=0.0,
         velocity_weight=0.0,
+        point_weight=0.0,
         learning_rates=[1e-3],
         step=0,
         accum_steps=1,
@@ -3915,6 +3930,7 @@ def test_a_zero_supervision_scene_raises_the_typed_skip_before_any_gpu_work(
             confidence_alpha=None,
             sync_weight=0.0,
             velocity_weight=0.0,
+            point_weight=0.0,
             learning_rates=[1e-3],
             step=0,
             accum_steps=1,
@@ -4107,6 +4123,7 @@ def _weighted_step(monkeypatch, *, scene=None, **weights):
     """
 
     weights.setdefault("velocity_weight", 0.0)
+    weights.setdefault("point_weight", 0.0)
 
     scene = scene or _step_scene(
         monkeypatch, query_anchors=((0, 0), (1, 0)), invisible=((0, 0, 2),)

@@ -201,7 +201,7 @@ def test_build_optimizer_places_injections_in_the_decoder_group(
             assert id(parameter) in decoder_group
 
 
-def test_encode_and_reconstruct_threads_geometry_to_encode_features():
+def test_encode_views_threads_geometry_to_encode_features():
     """Pins the runtime forwarding hop independently of zero init: recording
     is weight-free, so a dropped kwarg fails here even though every output
     would be bit-identical."""
@@ -224,10 +224,7 @@ def test_encode_and_reconstruct_threads_geometry_to_encode_features():
             recorded.update(kwargs)
             return [images]
 
-        def reconstruct(self, feats, images):
-            return {}
-
-    runtime.encode_and_reconstruct(_Recorder(), [])
+    runtime.encode_views(_Recorder(), [])
 
     assert recorded["depth_maps"] is depth_sentinel
     assert recorded["camera_vectors"] is camera_sentinel
@@ -364,6 +361,7 @@ def test_anchor_tracks_passes_refinement_only_when_set():
         ("temporal_tracking", None),
         ("temporal_tracking_global_attention", None),
         ("temporal_tracking_late_global", runtime.DEFAULT_LATE_GLOBAL_BLOCKS),
+        ("temporal_tracking_global_attention_geometry", None),
     ],
 )
 def test_build_optimizer_covers_every_trainable_parameter_in_every_preset(
@@ -373,10 +371,12 @@ def test_build_optimizer_covers_every_trainable_parameter_in_every_preset(
     """The claim that let the extraction leave this function alone.
 
     ``build_optimizer`` selects groups by ``requires_grad`` and the embedding's
-    name, never by the freeze mode, so a new preset needs no change here. That is
-    an argument until a preset it was not written against is driven through it --
-    ``temporal_tracking_late_global`` postdates the function, so it is the one
-    that makes this a check rather than a restatement.
+    name, never by the freeze mode, so a new preset needs no change here unless
+    it trains a module no group selects -- the geometry preset's reconstruction
+    heads, which got their own group. That is an argument until a preset it was
+    not written against is driven through it -- ``temporal_tracking_late_global``
+    postdates the function, so it is the one that makes this a check rather than
+    a restatement.
     """
 
     model = _meta_arc(freeze_mode, late_global_blocks=late_global_blocks)

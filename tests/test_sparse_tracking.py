@@ -3550,7 +3550,10 @@ def test_build_optimizer_rejects_a_parameter_outside_every_group():
     reports."""
 
     model = _optimizer_model("temporal_tracking_late_global", late_global_blocks=1)
-    model.head.requires_grad_(True)
+    # A trainable module no group selects. Not the depth head any more: the
+    # geometry group now collects the reconstruction heads' trainable
+    # parameters, so unfreezing one of them would be grouped, not escaped.
+    model.stray = torch.nn.Linear(2, 2)
 
     with pytest.raises(RuntimeError, match="escaped every group"):
         runtime_module.build_optimizer(model, lr=1e-5)

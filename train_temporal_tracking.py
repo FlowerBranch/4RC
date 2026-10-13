@@ -45,6 +45,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from arc.models.arc.arc import Arc
 from arc.training.manifest_plan import (
     SKIP_EXCLUDED_DATA_ROOT,
     ManifestPlanError,
@@ -67,7 +68,7 @@ from arc.training.runtime import (
     build_optimizer,
     confidence_stats,
     cut_features,
-    encode_and_reconstruct,
+    encode_views,
     gradient_norm,
     move_views_to_cuda,
     tracking_only,
@@ -195,7 +196,8 @@ class StepOutcome:
     # (test_best_fitting_anchor_wins_over_an_earlier_worse_one). None from
     # injected step functions, like `eligibility`.
     anchor_sample_counts: list[int] | None = None
-    # The step's unweighted per-term values, share-combined across its anchors:
+    # The step's unweighted per-term values, share-combined across its anchors
+    # -- all but `point`, the reconstruction term, which is one value per step:
     # what says whether the chosen weights actually balance the terms, since
     # position and confidence differ by orders of magnitude at their natural
     # scales. Unweighted so runs at different weights stay comparable, which is
@@ -513,6 +515,20 @@ def finish_window(*, model, optimizer, scaler, grad_clip: float) -> dict:
         raise RuntimeError("Temporal embedding gradient norm is zero")
     if norms["motion_decoder"] == 0 or norms["track_head"] == 0:
         raise RuntimeError("MotionDecoder or track-head gradient norm is zero")
+    # The reconstruction heads' share of the window's gradient, only when they
+    # train (the geometry presets): the clip below bounds the TOTAL norm, so a
+    # large point-term gradient scales the track gradients down, and this is
+    # the number that shows it beside clipped_total. Report-only, and taken
+    # before the clip like the three above; a disconnected head is already
+    # refused by assert_trainable_gradients_finite as a missing gradient.
+    reconstruction_parameters = [
+        parameter
+        for module in (model.head, model.cam_dec)
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    ]
+    if reconstruction_parameters:
+        norms["reconstruction"] = gradient_norm(reconstruction_parameters)
     # Clip after unscale_ and before step, or the threshold is applied to scaled
     # gradients and means nothing.
     norms["clipped_total"] = float(
@@ -540,6 +556,7 @@ def train_step(
     confidence_alpha: float | None,
     sync_weight: float,
     velocity_weight: float,
+    point_weight: float,
     learning_rates: list[float],
     step: int,
     accum_steps: int,
@@ -568,17 +585,17 @@ def train_step(
     bit-identical to the pre-accumulation one.
 
     Several anchors are supervised one track-head pass at a time: the encoder and
-    the frozen reconstruction run once, each anchor's track-head pass backwards
+    the reconstruction run once, each anchor's track-head pass backwards
     immediately onto a detached cut of the backbone taps, and the summed cut
     gradients flow through the encoder exactly once afterwards
     (:func:`arc.training.runtime.cut_features` — the chain rule makes that
     identical to one combined backward, while only one track-head graph is ever
     alive; the marginal anchor was measured at a flat ~2.3 GiB where a widened
-    Q axis would not fit the card). At a single active anchor the cut
-    is bypassed -- at ``--refine_iters 1``; see below -- and the step runs the
-    exact pre-multi-anchor graph: ``Arc._forward`` is encode → reconstruct →
-    per-query track with no other glue, so the decomposition changes no kernel
-    and no number.
+    Q axis would not fit the card). At a single active anchor the cut is
+    bypassed -- at ``--refine_iters 1`` and ``--point_weight 0``; see below --
+    and the step runs the exact pre-multi-anchor graph: ``Arc._forward`` is
+    encode → reconstruct → per-query track with no other glue, so the
+    decomposition changes no kernel and no number.
 
     Under ``--refine_iters K > 1`` each anchor's head pass is unrolled K times
     on the same encoder taps. Pass k conditions the query patch tokens on pass
@@ -613,8 +630,22 @@ def train_step(
     transform. It is gathered once, detached, from the scene-level
     correspondences before any head pass, like the Sim(3), so every anchor and
     every pass is scored against the same points and no gradient reaches the
-    reconstruction. Only the loss's composition moves: the refiner at K > 1
-    still reads the model's own cloud and carried field.
+    reconstruction through it. Only the loss's composition moves: the refiner
+    at K > 1 still reads the model's own cloud and carried field.
+
+    ``point_weight`` adds the point term (:func:`reconstruction_point_loss`):
+    every slot's predicted depth unprojected through its predicted camera,
+    mapped into the stored world through this step's detached Sim(3), against
+    the ground-truth points. It is the one loss that reaches the
+    reconstruction heads, which train under the geometry freeze preset. The
+    reconstruction then reads the cut leaves -- so the cut is taken even at
+    one anchor, for the reason K > 1 takes it -- and the term is backwarded
+    once, before the first head pass: its gradient lands on DualDPT,
+    CameraDec and the cut, every anchor's joins it there, and
+    ``backward_through_cut`` pushes the sum through the encoder once, which
+    the chain rule makes one backward of the weighted sum. Backwarding it
+    first frees the depth path's graph before any head graph allocates. 0
+    builds nothing: today's step exactly.
     """
 
     from arc.models.arc.heads.motiondecoder import RefinementInput, patch_centre_points
@@ -624,6 +655,7 @@ def train_step(
         camera_major_layout,
         fit_scene_sim3,
         gather_query_anchor_points,
+        reconstruction_point_loss,
         refinement_iteration_weights,
         sparse_tracking_loss,
     )
@@ -746,7 +778,34 @@ def train_step(
         velocity_shares = [0.0] * anchor_count
 
     with autocast_context(precision):
-        images, feats, recon = encode_and_reconstruct(model, scene.views)
+        images, feats = encode_views(model, scene.views)
+        # The cut is decided before the reconstruction runs, because the
+        # reconstruction reads whichever taps it is handed.
+        if len(active_anchors) == 1 and refine_iters == 1 and point_weight == 0.0:
+            # One anchor needs no cut: its backward is the only one and runs
+            # straight through the encoder, exactly the pre-multi-anchor graph.
+            # The cut is not free — it holds an accumulated .grad on every
+            # backbone tap for the whole step — and the committed window was
+            # sized against the memory ceiling without one.
+            #
+            # Any --refine_iters above 1 needs the cut even at one anchor: pass
+            # k's backward frees the encoder graph pass k+1 would need, and a
+            # second head backward onto freed taps is autograd's "backward
+            # through the graph a second time" error. The cut's detached
+            # leaves are what let every pass backward onto the same taps.
+            #
+            # So does the point term, for the same reason: its backward and the
+            # anchor's both reach the taps. With the cut, the reconstruction
+            # reads the leaves, so the term's gradient joins every anchor's
+            # there and crosses the encoder once. At --refine_iters 1 and
+            # --point_weight 0 this condition is today's exactly.
+            cut_feats, cut_pairs = feats, []
+        else:
+            cut_feats, cut_pairs = cut_features(feats)
+        # The leaves whenever a cut is taken. Under every preset but the
+        # geometry one the reconstruction runs under no_grad, and the leaves
+        # hold the taps' own storage, so it reads the same values either way.
+        recon = model.reconstruct(cut_feats, images)
         alignment, alignment_report = fit_scene_sim3(recon, scene)
         # Gathered ONCE from the scene-level correspondences; each anchor's
         # slice stays aligned with its rebased set via the row mask. A rebased
@@ -763,8 +822,9 @@ def train_step(
         # consumes, as does the anchor gather at the predicted source -- it
         # runs under no_grad in fp32 itself, so this line is safe inside the
         # autocast block -- and so the cloud the refiner reads into is the
-        # gauge the displacement field lives in; no second unprojection
-        # anywhere. That holds under every --query_anchor_source: a
+        # gauge the displacement field lives in; the point term below runs the
+        # same unprojection with its graph kept, never a second formula. That
+        # holds under every --query_anchor_source: a
         # ground-truth source moves only the point the loss composes the field
         # on, never what the refiner reads. None at --refine_iters 1: nothing
         # reads it, and building it would move peak_bytes on the flag-off step,
@@ -774,22 +834,22 @@ def train_step(
             if refine_iters == 1
             else patch_centre_points(predicted_pointmaps(recon), model.PATCH_SIZE)
         )
-        if len(active_anchors) == 1 and refine_iters == 1:
-            # One anchor needs no cut: its backward is the only one and runs
-            # straight through the encoder, exactly the pre-multi-anchor graph.
-            # The cut is not free — it holds an accumulated .grad on every
-            # backbone tap for the whole step — and the committed window was
-            # sized against the memory ceiling without one.
-            #
-            # Any --refine_iters above 1 needs the cut even at one anchor: pass
-            # k's backward frees the encoder graph pass k+1 would need, and a
-            # second head backward onto freed taps is autograd's "backward
-            # through the graph a second time" error. The cut's detached
-            # leaves are what let every pass backward onto the same taps. At
-            # --refine_iters 1 this condition is today's exactly.
-            cut_feats, cut_pairs = feats, []
-        else:
-            cut_feats, cut_pairs = cut_features(feats)
+
+    # The point term, once per step and before the first head pass. Its
+    # gradient lands on DualDPT, CameraDec and the cut, where every anchor's
+    # joins it for the one backward_through_cut, and backwarding it here frees
+    # the depth path's graph before any head graph allocates; the ray branch's
+    # graph stays until the final del, since nothing backwards it. Weighted by
+    # the term's weight and the window scale only: it is the step's term, not
+    # an anchor's or a pass's. None at --point_weight 0, where nothing is built.
+    step_point_loss = None
+    if point_weight > 0.0:
+        point_loss = reconstruction_point_loss(
+            recon, scene, alignment, huber_delta_m=huber_delta_m
+        )
+        scaler.scale(point_loss * point_weight * window_scale).backward()
+        step_point_loss = float(point_loss.detach().item())
+        del point_loss
 
     stats = None
     step_loss = None
@@ -1016,7 +1076,8 @@ def train_step(
         del previous_field
 
     # Unweighted, in the order sparse_tracking_loss composes its own terms, so
-    # this reads like its loss_breakdown. None when nothing but
+    # this reads like its loss_breakdown, and the point term last: it is the
+    # step's own term, composed by no anchor's loss. None when nothing but
     # position ran: an all-None dict would claim a breakdown that has no terms.
     loss_breakdown = {"position": step_loss}
     if step_sync_loss is not None:
@@ -1025,6 +1086,8 @@ def train_step(
         loss_breakdown["velocity"] = step_velocity_loss
     if step_confidence_loss is not None:
         loss_breakdown["confidence"] = step_confidence_loss
+    if step_point_loss is not None:
+        loss_breakdown["point"] = step_point_loss
     if len(loss_breakdown) == 1:
         loss_breakdown = None
 
@@ -1108,7 +1171,7 @@ def evaluate_held_out(
     which is exactly what work-order test 5 asserts. And the **module modes**: the
     step loop leaves `model.head` and `model.cam_dec` in `eval()` while the root
     is in `train()`, so a bare `model.train()` here would silently re-enable the
-    frozen heads' training behaviour for every step after the first eval.
+    geometry heads' training behaviour for every step after the first eval.
 
     Predictions are written in the cluster scorers' schema and **not scored** --
     ``evaluate_3dpt`` lives in the other environment.
@@ -2220,7 +2283,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--encoder_lr",
         type=float,
         default=None,
-        help="Default 0.1 x --lr; low because the frozen geometry heads read these features",
+        help=(
+            "Default 0.1 x --lr; low because the geometry heads read these "
+            "features, pretrained against them and frozen under every preset "
+            "but the geometry one"
+        ),
+    )
+    training.add_argument(
+        "--geometry_lr",
+        type=float,
+        default=None,
+        help=(
+            "Rate of the geometry heads' own optimizer group -- DualDPT's depth "
+            "path and CameraDec without its fov head -- under --freeze_mode "
+            "temporal_tracking_global_attention_geometry, the one preset that "
+            "trains them; refused under any other. Default: the encoder blocks' "
+            "rate (--encoder_lr, else 0.1 x --lr), since they are pretrained "
+            "weights, not fresh capacity"
+        ),
     )
     training.add_argument(
         "--min_lr_scale",
@@ -2291,7 +2371,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(camera-to-world pose encoding plus the model-grid principal "
             "point) added into the camera token through a zero-initialised "
             "projection; no new token slot. NOTE the injected pose also changes "
-            "the frozen camera decoder's OUTPUT (pose_enc -> predicted "
+            "the camera decoder's OUTPUT (pose_enc -> predicted "
             "pointmaps -> Sim(3) -> the query anchor), so this arm's gain does "
             "not arrive purely through the track head: score it ALSO with "
             "--eval_query_anchor_source gt_depth so the anchor path and the "
@@ -2354,8 +2434,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "the loaded depth map -- ground truth under the default "
             "--dataset_name -- unprojected through the ground-truth camera at "
             "the anchor pixel, what MVTracker receives. The anchor stays "
-            "detached and DualDPT and CameraDec stay frozen, so no gradient "
-            "reaches the reconstruction, and the refiner under --refine_iters "
+            "detached, so no gradient reaches the reconstruction through it "
+            "(only --point_weight trains DualDPT and CameraDec), and the refiner "
+            "under --refine_iters "
             "keeps reading the model's own cloud. The held-out eval scores on "
             "the same source unless --eval_query_anchor_source says otherwise; "
             "inference has no ground truth, so score a ground-truth-trained "
@@ -2382,6 +2463,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "displacement and is not comparable with a stride-1 run's. Its "
             "residual is reported in the held-out eval whatever this is set to, "
             "so read velocity_error_m at weight 0 first."
+        ),
+    )
+    training.add_argument(
+        "--point_weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Weight of the point term, the one loss that trains the "
+            "reconstruction: every slot's predicted depth unprojected through "
+            "its predicted camera (intrinsics detached -- the focal length is "
+            "not trained), mapped into the stored world through the step's "
+            "detached Sim(3) and compared with the ground-truth points by the "
+            "position term's Huber in metres (--huber_delta_m), one mean over "
+            "the valid pixels of every slot. Requires --freeze_mode "
+            "temporal_tracking_global_attention_geometry, which in turn requires "
+            "a positive weight; the track loss still sends no gradient into the "
+            "reconstruction. Under --depth_input or --camera_input the encoder "
+            "receives the very ground truth this term supervises, so the heads "
+            "can learn to copy it: such an arm measures oracle geometry, not the "
+            "reconstruction. 0 (the default) builds nothing, exactly today's "
+            "step. Refused on resume like the other loss weights."
         ),
     )
     training.add_argument(
@@ -2415,7 +2517,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "moved every step would not be one the optimizer could descend."
         ),
     )
-    training.add_argument("--freeze_mode", default="temporal_tracking_global_attention")
+    training.add_argument(
+        "--freeze_mode",
+        default="temporal_tracking_global_attention",
+        help=(
+            "Which parameters train: temporal_tracking (the time table, motion "
+            "decoder and track head), temporal_tracking_global_attention (plus "
+            "the encoder's global-attention blocks), temporal_tracking_late_global "
+            "(plus the last --late_global_blocks of them), or "
+            "temporal_tracking_global_attention_geometry (the global-attention "
+            "set plus DualDPT's depth path and CameraDec without its fov head, "
+            "trained by --point_weight alone: the two flags require each "
+            "other) (default: %(default)s)"
+        ),
+    )
     training.add_argument("--late_global_blocks", type=int, default=None)
     training.add_argument(
         "--precision", choices=("32", "16-mixed", "bf16-mixed"), default="bf16-mixed"
@@ -2746,6 +2861,12 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--sync_weight must be finite and non-negative")
     if not math.isfinite(args.velocity_weight) or args.velocity_weight < 0:
         raise ValueError("--velocity_weight must be finite and non-negative")
+    if not math.isfinite(args.point_weight) or args.point_weight < 0:
+        raise ValueError("--point_weight must be finite and non-negative")
+    if args.geometry_lr is not None and (
+        not math.isfinite(args.geometry_lr) or args.geometry_lr <= 0
+    ):
+        raise ValueError("--geometry_lr must be finite and positive")
     # refinement_iteration_weights repeats both checks, but at the first
     # executed step, after the model load and the provider preflight; refused
     # here by flag name like the weights above. bool is rejected explicitly:
@@ -2789,6 +2910,33 @@ def _validate_args(args: argparse.Namespace) -> None:
             "the merged head emits one displacement field per time index, so "
             "there are no synchronized slot pairs for the consistency term to "
             "compare; drop one of the two flags"
+        )
+    # The point term and the geometry preset require each other, refused here
+    # rather than one model load later. Any other preset runs the
+    # reconstruction under no_grad, so the term would have no graph to
+    # backward; and the preset unfreezes DualDPT and CameraDec, which nothing
+    # but the term reaches, so at weight 0 the first window's guard would stop
+    # the run on their missing gradients. --geometry_lr sets the rate of the
+    # group only that preset fills, so anywhere else it would change nothing.
+    geometry_preset = args.freeze_mode in Arc.GEOMETRY_FREEZE_MODES
+    if args.point_weight > 0 and not geometry_preset:
+        raise ValueError(
+            f"--point_weight {args.point_weight} needs --freeze_mode "
+            f"{Arc.GEOMETRY_FREEZE_MODES[0]}: every other preset keeps DualDPT "
+            "and CameraDec frozen and runs them under no_grad, so the point "
+            "term would have nothing to train"
+        )
+    if geometry_preset and args.point_weight == 0:
+        raise ValueError(
+            f"--freeze_mode {args.freeze_mode} needs --point_weight > 0: the "
+            "preset unfreezes DualDPT and CameraDec, and the point term is the "
+            "only loss that reaches them"
+        )
+    if args.geometry_lr is not None and not geometry_preset:
+        raise ValueError(
+            f"--geometry_lr needs --freeze_mode {Arc.GEOMETRY_FREEZE_MODES[0]}: "
+            "it sets the rate of the geometry heads' optimizer group, which only "
+            "that preset trains, so under any other it would change nothing"
         )
     # Refused HERE, at parse time, and not where the plans are built: that call
     # sits after `Arc.from_pretrained(...).to("cuda")`, so raising there would
@@ -3029,6 +3177,9 @@ def _plan_summary(tally, args) -> dict:
             "confidence_weight": float(args.confidence_weight),
             "sync_weight": float(args.sync_weight),
             "velocity_weight": float(args.velocity_weight),
+            # The reconstruction's own term; nonzero exactly when the run
+            # trained DualDPT and CameraDec under the geometry preset.
+            "point_weight": float(args.point_weight),
             # Which head geometry the run trains -- per-slot fields penalised
             # into agreement, or one merged field per time. Not enforced by any
             # test the way the weights are; recorded because the two curves are
@@ -3567,6 +3718,7 @@ def run_training(
                     confidence_alpha=args.resolved_confidence_alpha,
                     sync_weight=args.sync_weight,
                     velocity_weight=args.velocity_weight,
+                    point_weight=args.point_weight,
                     learning_rates=learning_rates,
                     step=step,
                     accum_steps=accum,
@@ -3884,6 +4036,11 @@ def _checkpoint_settings(args) -> dict:
         "confidence_weight": float(args.confidence_weight),
         "sync_weight": float(args.sync_weight),
         "velocity_weight": float(args.velocity_weight),
+        # The point term's weight, refused like the three above. It is also
+        # what refuses a resume across the geometry preset by name: parse time
+        # ties a positive weight to that preset, and the freeze mode itself is
+        # refused by the patch loader against the payload's top-level field.
+        "point_weight": float(args.point_weight),
         # Which head geometry the run trains: per-slot fields penalised into
         # agreement, or one merged field per time index. Refused like
         # grad_accum -- changing it mid-run continues the step counter over a
@@ -3979,8 +4136,8 @@ def _write_checkpoint(
 # (time_embedding_init and its scale -- a different init is a different set of
 # per-index offsets, so the encoder is conditioned differently from step 0 and
 # every weight downstream of it descends from that), which objective the run
-# descends at all (confidence_weight, sync_weight, velocity_weight and
-# confidence_alpha -- a segment that changes a loss weight and keeps counting
+# descends at all (confidence_weight, sync_weight, velocity_weight, point_weight
+# and confidence_alpha -- a segment that changes a loss weight and keeps counting
 # steps reports one curve over two objectives, and the reported `loss` stays
 # the position-only Huber throughout, so nothing in the history would show
 # the switch), which head geometry it trains (merge_synchronized_slots: per-slot
@@ -4045,6 +4202,7 @@ _RESUME_SETTINGS_REFUSED = (
     "confidence_weight",
     "sync_weight",
     "velocity_weight",
+    "point_weight",
     "merge_synchronized_slots",
     "depth_input",
     "camera_input",
@@ -4094,6 +4252,13 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     "confidence_weight": 0.0,
     "sync_weight": 0.0,
     "velocity_weight": 0.0,
+    # A checkpoint from before --point_weight could only have been written
+    # without the term: no loss reached the reconstruction, and no preset
+    # trained it. So absence resolves to 0, pre-flag runs resume silently, and
+    # resuming one with the term on is refused like any changed weight -- the
+    # parse-time coupling would also have to switch it onto the geometry
+    # preset, which the patch loader refuses by mode.
+    "point_weight": 0.0,
     "confidence_alpha": None,
     # A checkpoint from before --grad_accum could only have been written at 1:
     # every step was its own window. So absence resolves, pre-flag runs resume
@@ -4379,7 +4544,6 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    from arc.models.arc.arc import Arc
     from arc.training.scene_provider import MVTrackerSceneProvider
 
     install_signal_handlers()
@@ -4432,6 +4596,7 @@ def main() -> None:
         lr=args.lr,
         embedding_lr=args.embedding_lr,
         encoder_lr=args.encoder_lr,
+        geometry_lr=args.geometry_lr,
     )
     print(f"learning_rates={learning_rates}")
     scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "16-mixed")
