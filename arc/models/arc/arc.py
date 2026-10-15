@@ -545,17 +545,13 @@ class Arc(
         # assert_trainable_gradients_finite with grad None, and CameraDec's
         # fov head would receive an exact zero gradient (pose_enc's
         # concatenation hands its slice zeros) that no guard sees -- the focal
-        # length is not trained, so it is frozen by name, not left inert.
+        # length is not trained, so it is frozen by name, not left inert. The
+        # ray branch comes from DualDPT.RAY_BRANCH, the list DualDPT's forward
+        # keys its graph on, so frozen here it also records no graph.
         untrained_reconstruction = ()
         if freeze in self.GEOMETRY_FREEZE_MODES:
-            scratch = self.head.scratch
             untrained_reconstruction = (
-                scratch.refinenet1_aux,
-                scratch.refinenet2_aux,
-                scratch.refinenet3_aux,
-                scratch.refinenet4_aux,
-                scratch.output_conv1_aux,
-                scratch.output_conv2_aux,
+                *self.head.ray_branch_modules(),
                 self.cam_dec.fc_fov,
             )
 
@@ -997,18 +993,19 @@ class Arc(
             # only through detached paths
             # (arc.models.arc.utils.transform.predicted_pointmaps is no_grad
             # plus .detach(), and the track refiner reads its cloud under
-            # no_grad again), so retaining the dual-pyramid DPT graph would
-            # cost 0.94 GiB of saved tensors per observation for nothing
-            # (measured on CPU at 378x504: 0.41 on the depth path, 0.53 on the
-            # ray branch). This holds even when encoder blocks are trainable:
-            # no loss reads these outputs undetached there, so no gradient is
-            # lost by cutting the graph. Keep the values, drop the graph.
-            # Under GEOMETRY_FREEZE_MODES the training point loss backwards
-            # depth and pose_enc, so the graph stays -- the ray branch's share
-            # included, since its input requires grad even though its
-            # parameters stay frozen and nothing backwards it. Nested inside
-            # the autocast above, which is doing real work forcing fp32 for
-            # these heads under an outer bf16 autocast.
+            # no_grad again), so retaining the depth path's graph would cost
+            # 0.41 GiB of saved tensors per observation for nothing (measured
+            # on CPU at 378x504; DualDPT already records none for its frozen
+            # ray branch, which would add 0.53). This holds even when encoder
+            # blocks are trainable: no loss reads these outputs undetached
+            # there, so no gradient is lost by cutting the graph. Keep the
+            # values, drop the graph. Under GEOMETRY_FREEZE_MODES the training
+            # point loss backwards depth and pose_enc, so the depth path's
+            # graph stays; the ray branch's does not, since its parameters stay
+            # frozen and DualDPT records its graph only while one of them
+            # trains (DualDPT.RAY_BRANCH). Nested inside the autocast above,
+            # which is doing real work forcing fp32 for these heads under an
+            # outer bf16 autocast.
             freeze = getattr(self, "freeze", "none")
             frozen_reconstruction = (
                 freeze in self.TEMPORAL_FREEZE_MODES

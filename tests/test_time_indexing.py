@@ -1499,10 +1499,11 @@ def test_forward_recomposes_from_its_three_public_pieces():
 def test_temporal_tracking_drops_the_frozen_reconstruction_graph():
     """Frozen depth/camera heads must not retain a backward graph.
 
-    Their outputs are consumed only through detached paths, so the retained
-    dual-pyramid DPT graph -- 0.94 GiB of saved tensors per observation at
-    378x504 -- is pure waste. Values must be unchanged and the tracking branch
-    must stay differentiable. The geometry preset is the one exception; see
+    Their outputs are consumed only through detached paths, so retaining the
+    depth path's graph -- 0.41 GiB of saved tensors per observation at 378x504;
+    DualDPT itself records none for its frozen ray branch -- is pure waste.
+    Values must be unchanged and the tracking branch must stay
+    differentiable. The geometry preset is the one exception; see
     test_point_loss.
     """
 

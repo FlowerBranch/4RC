@@ -973,12 +973,24 @@ def test_the_geometry_preset_prices_the_injections_and_the_refiner(
     assert not model.cam_dec.fc_fov[0].weight.requires_grad
 
 
-def test_a_head_without_the_named_modules_is_refused_untouched():
+def _dualdpt_missing_a_ray_module():
+    model = _GeometryTinyArc(freeze=_GLOBAL)
+    del model.head.scratch.refinenet4_aux
+    return model
+
+
+@pytest.mark.parametrize(
+    "build",
+    [lambda: _GlobalAttnTinyArc(freeze=_GLOBAL), _dualdpt_missing_a_ray_module],
+    ids=["stand_in_head", "dualdpt_missing_a_ray_module"],
+)
+def test_a_head_without_the_named_modules_is_refused_untouched(build):
     """set_freeze resolves the modules it re-freezes before its first
     requires_grad_ call, so a head lacking them raises with every flag, and
-    the mode, exactly as they were."""
+    the mode, exactly as they were: a stand-in head without DualDPT's
+    surface, and a DualDPT missing one of the modules RAY_BRANCH names."""
 
-    model = _GlobalAttnTinyArc(freeze=_GLOBAL)
+    model = build()
     before = {name: p.requires_grad for name, p in model.named_parameters()}
 
     with pytest.raises(AttributeError):
@@ -1096,6 +1108,365 @@ def test_a_geometry_patch_runs_back_as_trained_and_only_under_its_preset(
     other = _GeometryTinyArc(freeze=_GLOBAL, max_time_indices=6)
     with pytest.raises(ValueError, match=f"trained under freeze mode '{_GEOMETRY}'"):
         load_temporal_tracking_checkpoint(other, patch)
+
+
+# ------------------------------------------------- the ray branch's graph ---
+
+
+# Written out here rather than read from DualDPT.RAY_BRANCH, so the tests check
+# that list instead of trusting it.
+_RAY_MODULES = (
+    "refinenet1_aux",
+    "refinenet2_aux",
+    "refinenet3_aux",
+    "refinenet4_aux",
+    "output_conv1_aux",
+    "output_conv2_aux",
+)
+_RAY_OUTPUTS = ("ray", "ray_conf", "ray_list", "ray_conf_list")
+# 2 x 3 patches, so the two image axes stay distinct.
+_IMAGE_SIZE = (28, 42)
+
+
+def _taps(observations, *, dim=8, size=_IMAGE_SIZE):
+    """Four encoder taps as reconstruct reads them -- patch tokens
+    (1, S, patches, C) and a camera token (1, S, C) each -- distinct per
+    element and requiring grad, as the cut's leaves do in a geometry step.
+    Without the grad a frozen ray branch would record no graph whatever the
+    gate does, and the tests below would pass vacuously."""
+
+    generator = torch.Generator().manual_seed(0)
+    height, width = size
+    patches = (height // 14) * (width // 14)
+    return [
+        (
+            torch.randn(1, observations, patches, dim, generator=generator).requires_grad_(),
+            torch.randn(1, observations, dim, generator=generator).requires_grad_(),
+        )
+        for _ in range(4)
+    ]
+
+
+def _images(observations, size=_IMAGE_SIZE):
+    return torch.zeros(1, observations, 3, *size)
+
+
+def _flatten(output, keys):
+    """Every tensor under ``keys``, list entries included."""
+
+    for key in keys:
+        value = output[key]
+        yield from value if isinstance(value, list) else (value,)
+
+
+def _open_the_gate(model):
+    """Through the gate's own condition, not a switch: the ray branch trains."""
+
+    for name in _RAY_MODULES:
+        getattr(model.head.scratch, name).requires_grad_(True)
+
+
+def _as_the_trainer_runs_it(model):
+    """train_step's modes: the model in train(), DualDPT and CameraDec in
+    eval(), which is the mode every geometry step runs the gate in."""
+
+    model.train()
+    model.head.eval()
+    model.cam_dec.eval()
+    return model
+
+
+def _reconstruct_recording_saves(model, feats, images):
+    """reconstruct, plus how many tensors autograd saved for backward while
+    each ray module ran, and in all. The hooks sit on every submodule with a
+    nesting counter, because a ModuleList's own forward never runs and both
+    output_conv*_aux are ModuleLists."""
+
+    depth = dict.fromkeys(_RAY_MODULES, 0)
+    saves = dict.fromkeys(_RAY_MODULES, 0)
+    total = 0
+    handles = []
+    for name in _RAY_MODULES:
+        for module in getattr(model.head.scratch, name).modules():
+
+            def enter(module, args, name=name):
+                depth[name] += 1
+
+            def leave(module, args, output, name=name):
+                depth[name] -= 1
+
+            handles.append(module.register_forward_pre_hook(enter))
+            handles.append(module.register_forward_hook(leave))
+
+    def pack(tensor):
+        nonlocal total
+        total += 1
+        for name, level in depth.items():
+            if level:
+                saves[name] += 1
+        return tensor
+
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            output = model.reconstruct(feats, images)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return output, saves, total
+
+
+# DualDPT's mode: eval() as train_step runs it, and train() too, so a gate that
+# read the module mode fails one of the two.
+_HEAD_MODES = pytest.mark.parametrize(
+    "head_training", [False, True], ids=["head_eval", "head_train"]
+)
+
+
+@_HEAD_MODES
+@pytest.mark.parametrize("observations", [4, 10])
+def test_the_geometry_preset_records_no_graph_for_the_ray_branch(observations, head_training):
+    """depth and pose_enc keep their graph for the point backward; no ray
+    output requires grad, and nothing is saved for backward inside any of
+    the six ray modules. The per-module count is what catches one un-gated
+    refinenet: output_conv1_aux's gate downstream drops that level's graph
+    before _fuse returns, so the outputs alone would still read clean. Four
+    observations run DualDPT in one chunk, ten through its chunk loop. The
+    recorder's list is pinned against RAY_BRANCH and against the head's own
+    *_aux children, so neither can lose a module unseen."""
+
+    model = _GeometryTinyArc(freeze=_GEOMETRY)
+    model.head.train(head_training)
+    model.cam_dec.train(head_training)
+    feats = _taps(observations)
+
+    output, saves, total = _reconstruct_recording_saves(model, feats, _images(observations))
+
+    assert set(_RAY_MODULES) == set(DualDPT.RAY_BRANCH)
+    assert set(_RAY_MODULES) == {
+        name for name, _ in model.head.scratch.named_children() if name.endswith("_aux")
+    }
+    assert all(tensor.requires_grad for tap in feats for tensor in tap)
+    assert output["depth"].requires_grad
+    assert output["pose_enc"].requires_grad
+    assert not any(tensor.requires_grad for tensor in _flatten(output, _RAY_OUTPUTS))
+    assert saves == dict.fromkeys(_RAY_MODULES, 0)
+    assert total > 0
+
+
+def _missing_reconstruction_gradients(model, output):
+    """Backward a loss reading every output; the head and camera-decoder
+    parameters it did not reach."""
+
+    sum(tensor.mean() for tensor in _flatten(output, output.keys())).backward()
+    reconstruction = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if name.startswith(_RECONSTRUCTION)
+    }
+    assert any("_aux" in name for name in reconstruction)
+    return [name for name, parameter in reconstruction.items() if parameter.grad is None]
+
+
+@_HEAD_MODES
+@pytest.mark.parametrize("observations", [4, 10])
+def test_none_keeps_the_ray_branch_graph_and_trains_every_parameter(observations, head_training):
+    """Under none the ray branch trains: every ray output requires grad, each
+    of the six modules saves tensors (so the recorder above is not blind),
+    and a loss reading every output reaches every head and camera-decoder
+    parameter. Outputs that merely require grad would let one module run
+    under no_grad and silently stop training."""
+
+    model = _GeometryTinyArc(freeze="none")
+    model.head.train(head_training)
+    model.cam_dec.train(head_training)
+
+    output, saves, _ = _reconstruct_recording_saves(
+        model, _taps(observations), _images(observations)
+    )
+
+    assert all(tensor.requires_grad for tensor in _flatten(output, _RAY_OUTPUTS))
+    assert all(count > 0 for count in saves.values()), saves
+    assert _missing_reconstruction_gradients(model, output) == []
+
+
+def test_the_gate_keys_on_the_ray_parameters_not_on_the_taps():
+    """A trainable ray branch records its graph whether or not its input
+    requires grad: on detached taps -- a head trained on frozen features --
+    every ray output requires grad and every parameter is reached."""
+
+    model = _as_the_trainer_runs_it(_GeometryTinyArc(freeze="none"))
+    feats = [tuple(tensor.detach() for tensor in tap) for tap in _taps(10)]
+
+    output = model.reconstruct(feats, _images(10))
+
+    assert all(tensor.requires_grad for tensor in _flatten(output, _RAY_OUTPUTS))
+    assert _missing_reconstruction_gradients(model, output) == []
+
+
+@pytest.mark.parametrize("observations", [4, 10])
+def test_the_gate_never_turns_grad_on_under_a_callers_no_grad(observations):
+    """The official eval and inference.py run the released model -- every
+    parameter requiring grad, in eval() -- under torch.no_grad(). The gate may
+    only turn grad off: a bare set_grad_enabled(<ray trains>) would switch it
+    back on for the ray branch. Nothing at all is saved for backward, in one
+    chunk and through DualDPT's chunk loop -- the outputs alone would miss a
+    graph recorded inside the branch and dropped before its end. The taps are
+    built outside no_grad, as a backbone with a graph would hand them over, so
+    only the caller's context stands in the way."""
+
+    model = _GeometryTinyArc(freeze="none").eval()
+    assert all(parameter.requires_grad for parameter in model.parameters())
+    feats = _taps(observations)
+
+    with torch.no_grad():
+        output, _, total = _reconstruct_recording_saves(model, feats, _images(observations))
+
+    assert not any(tensor.requires_grad for tensor in _flatten(output, output.keys()))
+    assert total == 0
+
+
+@pytest.mark.parametrize("freeze", ["none", *Arc.TEMPORAL_FREEZE_MODES])
+def test_the_gate_changes_no_value_in_any_preset(freeze):
+    """Gated, and with the gate opened through its own condition, every
+    output is EQUAL: the gate decides only whether a graph is recorded. Under
+    none the two runs coincide and under the frozen presets reconstruct's
+    no_grad decides first; the geometry preset is the pair that differs."""
+
+    model = _GeometryTinyArc()
+    model.set_freeze(
+        freeze,
+        late_global_blocks=1 if freeze == "temporal_tracking_late_global" else None,
+    )
+    _as_the_trainer_runs_it(model)
+    feats = _taps(10)
+
+    gated = model.reconstruct(feats, _images(10))
+    _open_the_gate(model)
+    opened = model.reconstruct(feats, _images(10))
+
+    if freeze in Arc.GEOMETRY_FREEZE_MODES:
+        assert not gated["ray"].requires_grad
+        assert opened["ray"].requires_grad
+    assert gated.keys() == opened.keys()
+    for key in gated:
+        pairs = zip(_flatten(gated, [key]), _flatten(opened, [key]), strict=True)
+        for left, right in pairs:
+            assert torch.equal(left, right), key
+
+
+def test_the_gate_changes_no_depth_or_pose_gradient():
+    """The ray branch never reached the point loss, so cutting its graph
+    moves no gradient: from a loss on depth, its confidence and pose_enc,
+    every parameter gradient and every tap gradient is EQUAL gated and with
+    the gate opened, and the two runs are pinned as gated and opened."""
+
+    model = _as_the_trainer_runs_it(_GeometryTinyArc(freeze=_GEOMETRY))
+    pose_weights = torch.arange(1.0, 10.0)
+
+    def gradients():
+        feats = _taps(10)
+        output = model.reconstruct(feats, _images(10))
+        model.zero_grad(set_to_none=True)
+        loss = (
+            output["depth"].mean()
+            + 0.5 * output["depth_conf"].mean()
+            + (output["pose_enc"] * pose_weights).sum()
+        )
+        loss.backward()
+        parameters = {
+            name: parameter.grad.clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        # What reconstruct reads: the four patch taps and the camera token
+        # CameraDec takes from the last tap.
+        read = [tap[0] for tap in feats] + [feats[-1][1]]
+        return parameters, [tensor.grad for tensor in read], output["ray"].requires_grad
+
+    gated_parameters, gated_taps, gated_ray = gradients()
+    _open_the_gate(model)
+    opened_parameters, opened_taps, opened_ray = gradients()
+
+    assert not gated_ray
+    assert opened_ray
+    assert any(name.startswith("head.") for name in gated_parameters)
+    assert any(name.startswith("cam_dec.") for name in gated_parameters)
+    assert gated_parameters.keys() == opened_parameters.keys()
+    for name, gradient in gated_parameters.items():
+        assert torch.equal(opened_parameters[name], gradient), name
+    for gated_tap, opened_tap in zip(gated_taps, opened_taps, strict=True):
+        assert torch.equal(gated_tap, opened_tap)
+
+
+def _shapes(module):
+    return {name: tuple(parameter.shape) for name, parameter in module.named_parameters()}
+
+
+def test_the_geometry_preset_saves_no_ray_branch_tensors_at_production_width():
+    """The point of the change, at Arc's own head widths and one 378x504
+    observation: gated, the forward saves at least 0.5 GiB less for backward
+    than with the gate opened -- the ray branch's share, measured at 0.532
+    GiB (0.942 against 0.409 per observation). Relative rather than
+    absolute, since the totals move with what a torch release has autograd
+    keep for each op. Distinct storages, counted at pack time, without the
+    parameters' and the taps' own storage, which exist with or without a
+    graph."""
+
+    torch.manual_seed(0)
+    model = _GeometryTinyArc()
+    model.head = DualDPT(dim_in=3072, output_dim=2, features=256)
+    model.cam_dec = CameraDec(dim_in=3072)
+    model.set_freeze(_GEOMETRY)
+    _as_the_trainer_runs_it(model)
+    reference = _meta_arc()
+    assert _shapes(model.head) == _shapes(reference.head)
+    assert _shapes(model.cam_dec) == _shapes(reference.cam_dec)
+    size = (378, 504)
+    feats = _taps(1, dim=3072, size=size)
+    kept = {parameter.untyped_storage().data_ptr() for parameter in model.parameters()}
+    kept |= {tensor.untyped_storage().data_ptr() for tap in feats for tensor in tap}
+
+    def saved_bytes():
+        storages = {}
+
+        def pack(tensor):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() not in kept:
+                storages[storage.data_ptr()] = storage.nbytes()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+            output = model.reconstruct(feats, _images(1, size=size))
+        assert output["depth"].requires_grad
+        return sum(storages.values())
+
+    gated = saved_bytes()
+    _open_the_gate(model)
+    opened = saved_bytes()
+
+    gib = 2**30
+    assert opened - gated >= 0.5 * gib, (
+        f"gated {gated / gib:.3f} GiB, opened {opened / gib:.3f} GiB"
+    )
+
+
+@pytest.mark.parametrize("position", [0, -1], ids=["first", "last"])
+@pytest.mark.parametrize("name", _RAY_MODULES)
+def test_any_one_trainable_ray_parameter_opens_the_gate(name, position):
+    """A ray parameter -- not all of them, and not a whole module: under the
+    geometry preset with this one tensor trainable, the first or the last of
+    its module, the whole branch records its graph again, so every ray
+    output requires grad and a loss on them reaches that tensor."""
+
+    model = _as_the_trainer_runs_it(_GeometryTinyArc(freeze=_GEOMETRY))
+    parameter = list(getattr(model.head.scratch, name).parameters())[position]
+    parameter.requires_grad_(True)
+
+    output = model.reconstruct(_taps(4), _images(4))
+
+    assert all(tensor.requires_grad for tensor in _flatten(output, _RAY_OUTPUTS))
+    sum(tensor.mean() for tensor in _flatten(output, _RAY_OUTPUTS)).backward()
+    assert parameter.grad is not None
 
 
 # ---------------------------------------------------------------- the flags ---

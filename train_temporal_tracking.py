@@ -838,10 +838,10 @@ def train_step(
     # The point term, once per step and before the first head pass. Its
     # gradient lands on DualDPT, CameraDec and the cut, where every anchor's
     # joins it for the one backward_through_cut, and backwarding it here frees
-    # the depth path's graph before any head graph allocates; the ray branch's
-    # graph stays until the final del, since nothing backwards it. Weighted by
-    # the term's weight and the window scale only: it is the step's term, not
-    # an anchor's or a pass's. None at --point_weight 0, where nothing is built.
+    # the reconstruction's whole graph before any head graph allocates: DualDPT
+    # records none for its frozen ray branch. Weighted by the term's weight and
+    # the window scale only: it is the step's term, not an anchor's or a pass's.
+    # None at --point_weight 0, where nothing is built.
     step_point_loss = None
     if point_weight > 0.0:
         point_loss = reconstruction_point_loss(

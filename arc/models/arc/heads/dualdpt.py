@@ -40,6 +40,19 @@ class DualDPT(nn.Module):
       - `feature_only` is fixed to False.
     """
 
+    # The ray branch -- the auxiliary fusion chain and its per-level heads --
+    # by attribute name under `scratch`, named once: Arc.set_freeze re-freezes
+    # exactly these under the geometry presets, and _forward_impl records their
+    # graph only while one of their parameters trains.
+    RAY_BRANCH = (
+        "refinenet1_aux",
+        "refinenet2_aux",
+        "refinenet3_aux",
+        "refinenet4_aux",
+        "output_conv1_aux",
+        "output_conv2_aux",
+    )
+
     def __init__(
         self,
         dim_in: int,
@@ -147,6 +160,10 @@ class DualDPT(nn.Module):
                 for _ in range(self.aux_levels)
             ]
         )
+
+    def ray_branch_modules(self) -> Tuple[nn.Module, ...]:
+        """The modules RAY_BRANCH names, resolved on this head."""
+        return tuple(getattr(self.scratch, name) for name in self.RAY_BRANCH)
 
     # -------------------------------------------------------------------------
     # Public forward (supports frame chunking for memory)
@@ -257,8 +274,26 @@ class DualDPT(nn.Module):
             x = self.resize_layers[stage_idx](x)  # align scales
             resized_feats.append(x)
 
+        # The ray branch runs under the caller's grad mode only while one of
+        # its parameters trains. Frozen -- under the geometry presets, where no
+        # loss reads it -- it still reads the shared layer*_rn trunk, which
+        # requires grad because the depth path trains, so autograd would save
+        # its activations (0.53 GiB per observation at 378x504) for a graph
+        # nothing backwards. The gate only ever turns grad off: the official
+        # eval and inference run the released model, every parameter
+        # trainable, under no_grad, and must stay there. The values are the
+        # same either way; only whether a graph is recorded changes. The cost
+        # of keying on the parameters: a loss on the ray outputs with every
+        # ray parameter frozen would get no gradient into the trunk through
+        # them. No loss in this repo reads them.
+        ray_grad = torch.is_grad_enabled() and any(
+            parameter.requires_grad
+            for module in self.ray_branch_modules()
+            for parameter in module.parameters()
+        )
+
         # 2) Fuse pyramid (main & aux are completely independent)
-        fused_main, fused_aux_pyr = self._fuse(resized_feats)
+        fused_main, fused_aux_pyr = self._fuse(resized_feats, ray_grad)
 
         # 3) Upsample to target resolution and (optional) add pos-embed again
         h_out = int(ph * self.patch_size / self.down_ratio)
@@ -282,19 +317,20 @@ class DualDPT(nn.Module):
         # Keep each level at its native resolution (no upsampling)
         aux_pred_list = []
         aux_conf_list = []
-        for level_idx, aux_feat in enumerate(fused_aux_pyr):
-            # aux_feat = custom_interpolate(
-            #     aux_feat, (h_out // 2, w_out // 2), mode="bilinear", align_corners=True
-            # )
-            if self.pos_embed:
-                aux_feat = self._add_pos_embed(aux_feat, W, H)
-            # Apply level-specific output conv at native resolution
-            aux_logits = self.scratch.output_conv2_aux[level_idx](aux_feat)
-            fmap_aux = aux_logits.permute(0, 2, 3, 1)
-            aux_pred_level = self._apply_activation_single(fmap_aux[..., :-1], "linear")
-            aux_conf_level = self._apply_activation_single(fmap_aux[..., -1], self.conf_activation)
-            aux_pred_list.append(aux_pred_level)
-            aux_conf_list.append(aux_conf_level)
+        with torch.set_grad_enabled(ray_grad):
+            for level_idx, aux_feat in enumerate(fused_aux_pyr):
+                # aux_feat = custom_interpolate(
+                #     aux_feat, (h_out // 2, w_out // 2), mode="bilinear", align_corners=True
+                # )
+                if self.pos_embed:
+                    aux_feat = self._add_pos_embed(aux_feat, W, H)
+                # Apply level-specific output conv at native resolution
+                aux_logits = self.scratch.output_conv2_aux[level_idx](aux_feat)
+                fmap_aux = aux_logits.permute(0, 2, 3, 1)
+                aux_pred_level = self._apply_activation_single(fmap_aux[..., :-1], "linear")
+                aux_conf_level = self._apply_activation_single(fmap_aux[..., -1], self.conf_activation)
+                aux_pred_list.append(aux_pred_level)
+                aux_conf_list.append(aux_conf_level)
 
         # Use the last level (finest) as the main aux output (backward compatible)
         aux_pred = aux_pred_list[-1]
@@ -313,9 +349,13 @@ class DualDPT(nn.Module):
     # Subroutines
     # -------------------------------------------------------------------------
 
-    def _fuse(self, feats: List[torch.Tensor]) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def _fuse(
+        self, feats: List[torch.Tensor], ray_grad: bool
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         """
         Feature pyramid fusion.
+        Args:
+            ray_grad:   Grad mode for the ray branch's calls (see _forward_impl).
         Returns:
             fused_main: Tensor at finest scale (after refinenet1)
             aux_pyr:    List of aux tensors at each level (pre out_conv1_aux)
@@ -327,32 +367,39 @@ class DualDPT(nn.Module):
         l3_rn = self.scratch.layer3_rn(l3)
         l4_rn = self.scratch.layer4_rn(l4)
 
+        # Each ray-branch call gets its own set_grad_enabled: the object sets
+        # the mode when it is built, so one instance cannot be re-entered.
         # level 4 -> 3
         out = self.scratch.refinenet4(l4_rn, size=l3_rn.shape[2:])
-        aux_out = self.scratch.refinenet4_aux(l4_rn, size=l3_rn.shape[2:])
+        with torch.set_grad_enabled(ray_grad):
+            aux_out = self.scratch.refinenet4_aux(l4_rn, size=l3_rn.shape[2:])
         aux_list: List[torch.Tensor] = []
         if self.aux_levels >= 4:
             aux_list.append(aux_out)
 
         # level 3 -> 2
         out = self.scratch.refinenet3(out, l3_rn, size=l2_rn.shape[2:])
-        aux_out = self.scratch.refinenet3_aux(aux_out, l3_rn, size=l2_rn.shape[2:])
+        with torch.set_grad_enabled(ray_grad):
+            aux_out = self.scratch.refinenet3_aux(aux_out, l3_rn, size=l2_rn.shape[2:])
         if self.aux_levels >= 3:
             aux_list.append(aux_out)
 
         # level 2 -> 1
         out = self.scratch.refinenet2(out, l2_rn, size=l1_rn.shape[2:])
-        aux_out = self.scratch.refinenet2_aux(aux_out, l2_rn, size=l1_rn.shape[2:])
+        with torch.set_grad_enabled(ray_grad):
+            aux_out = self.scratch.refinenet2_aux(aux_out, l2_rn, size=l1_rn.shape[2:])
         if self.aux_levels >= 2:
             aux_list.append(aux_out)
 
         # level 1 (final)
         out = self.scratch.refinenet1(out, l1_rn)
-        aux_out = self.scratch.refinenet1_aux(aux_out, l1_rn)
+        with torch.set_grad_enabled(ray_grad):
+            aux_out = self.scratch.refinenet1_aux(aux_out, l1_rn)
         aux_list.append(aux_out)
 
         out = self.scratch.output_conv1(out)
-        aux_list = [self.scratch.output_conv1_aux[i](aux) for i, aux in enumerate(aux_list)]
+        with torch.set_grad_enabled(ray_grad):
+            aux_list = [self.scratch.output_conv1_aux[i](aux) for i, aux in enumerate(aux_list)]
 
         return out, aux_list
 
