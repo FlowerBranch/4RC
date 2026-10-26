@@ -334,6 +334,14 @@ def _loop_args(tmp_path, **overrides):
         # existing test assumes.
         eval_visual_scenes=[],
         eval_visual_stride=4,
+        # The eval's extra anchors and its benchmark source: eval-only too, so
+        # NOT stored by _checkpoint_settings and in no resume tier. run_training
+        # resolves the anchors for every eval, and _validate_args and
+        # _has_held_out read all three, so every loop test needs them present.
+        # None is the parser's default: no extra anchor, no benchmark.
+        eval_query_anchors=None,
+        eval_benchmark_dataset=None,
+        eval_benchmark_root=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -1851,7 +1859,7 @@ def test_the_oracle_anchor_moves_only_the_predicted_track(
     part, by O(|gt|).  The bundle's other arrays -- ``query_points`` above
     all, which was ground truth already -- are byte-identical.  Two mechanisms
     carry the delta through the writer, one per merge parametrization, and
-    they are NOT the same one: on the per-slot path ``_prediction_arrays``
+    they are NOT the same one: on the per-slot path ``_prediction_columns``
     fuses each time's cameras by a confidence-weighted mean, and the delta is
     constant across a query's cameras, so a normalised weighted mean of it is
     the delta itself; under the merge there is no fusion at all -- the
@@ -1980,7 +1988,7 @@ def test_the_ground_truth_anchor_matches_an_exact_reconstruction(
             assert np.array_equal(gt[key], off[key]), key
             assert np.array_equal(oracle[key], off[key]), key
 
-    # The bundle rides _prediction_arrays' anchor_frame; these two ride the
+    # The bundle rides _prediction_columns' anchor_frame; these two ride the
     # loss calls' query_anchor_frame, one per eval arm. metric_error_m reduces
     # over the main arm alone and position_loss_shuffled is all the shuffled
     # arm feeds, so neither assertion covers the other. Not an equality: fp32
@@ -2138,13 +2146,12 @@ def test_a_raw_prediction_without_a_confidence_channel_is_refused(monkeypatch):
     }
 
     with pytest.raises(KeyError, match="conf_track_multi"):
-        train_cli._prediction_arrays(
+        train_cli._prediction_columns(
             raw,
             scene,
             correspondences,
             DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
             torch.zeros(correspondences.count, 3),
-            _EVAL_ALPHA,
         )
 
 
@@ -2393,9 +2400,18 @@ def test_the_eval_reports_the_camera_baseline_and_the_anchor_error(
     assert abs(np.median(pooled) - np.median(per_scene_medians)) > 0.5
 
     # Appended after per_scene, and followed only by the two anchor-source
-    # keys appended after them, so every earlier key kept its position.
-    assert list(metrics)[-len(_READOUT_KEYS) - 2 : -2] == list(_READOUT_KEYS)
-    assert list(metrics)[-2:] == ["query_anchor_source", "eval_query_anchor_source"]
+    # keys and then the two eval-only keys appended after them, so every
+    # earlier key kept its position.
+    assert list(metrics)[-len(_READOUT_KEYS) - 4 : -4] == list(_READOUT_KEYS)
+    assert list(metrics)[-4:] == [
+        "query_anchor_source",
+        "eval_query_anchor_source",
+        "eval_query_anchors",
+        "eval_benchmark",
+    ]
+    # Null without either flag.
+    assert metrics["eval_query_anchors"] is None
+    assert metrics["eval_benchmark"] is None
     # Cameras in first-seen order, which is spec order.
     assert list(metrics["anchor_error_m_by_camera"]) == ["0", "3", "1", "2"]
     assert list(metrics["base_ratio_by_camera"]) == ["0", "3", "1", "2"]
@@ -2959,7 +2975,11 @@ def test_the_oracle_anchor_needs_a_held_out_set(tmp_path):
     args = _validator_args(tmp_path, oracle_query_anchor=True)
 
     with pytest.raises(
-        ValueError, match="--oracle_query_anchor needs --val_scenes_file"
+        ValueError,
+        match=(
+            r"--oracle_query_anchor needs a held-out set "
+            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+        ),
     ):
         train_cli._validate_args(args)
 
@@ -2976,7 +2996,11 @@ def test_the_ground_truth_anchor_needs_a_held_out_set(tmp_path):
     args = _validator_args(tmp_path, ground_truth_query_anchor=True)
 
     with pytest.raises(
-        ValueError, match="--ground_truth_query_anchor needs --val_scenes_file"
+        ValueError,
+        match=(
+            r"--ground_truth_query_anchor needs a held-out set "
+            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+        ),
     ):
         train_cli._validate_args(args)
 
@@ -3068,7 +3092,9 @@ def test_the_held_out_set_is_proved_reachable_before_the_first_step(tmp_path):
             scene_provider=provider,
             step_fn=_recording_step([]),
             output_dir=tmp_path,
-            val_plans=val,
+            held_out=train_cli.HeldOut(
+                plans=val, scene_provider=provider, benchmark=None
+            ),
         )
 
     # Before any training step ran, which is the whole point.
@@ -3129,7 +3155,11 @@ def test_a_scene_failing_on_an_eval_boundary_still_produces_its_curve_point(
             learning_rates=[1e-3], gradient_norms={},
         ),
         output_dir=tmp_path,
-        val_plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        held_out=train_cli.HeldOut(
+            plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+            scene_provider=provider,
+            benchmark=None,
+        ),
     )
 
     # Step 1 failed to load, and completed == 2 is an eval boundary.
@@ -3179,7 +3209,9 @@ def test_the_eval_records_the_anchors_the_held_out_window_actually_seated(
                 learning_rates=[1e-3], gradient_norms={},
             ),
             output_dir=directory,
-            val_plans=val,
+            held_out=train_cli.HeldOut(
+                plans=val, scene_provider=lambda _plan: scene, benchmark=None
+            ),
         )
         return json.loads(
             (directory / "eval" / "step-4" / "metrics.json").read_text()
@@ -5029,12 +5061,17 @@ def test_a_malformed_anchor_pair_is_refused_at_parse_time():
         [],
     ):
         with pytest.raises(ValueError):
-            train_cli.parse_query_anchor_slots(bad)
+            train_cli.parse_query_anchor_slots(bad, flag="--query_anchors")
     # "00:0" parses to the same slot as "0:0": a duplicate, not a new anchor.
-    with pytest.raises(ValueError, match="more than once"):
-        train_cli.parse_query_anchor_slots(["0:0", "00:0"])
+    with pytest.raises(ValueError, match="--query_anchors 0:0 is listed more than once"):
+        train_cli.parse_query_anchor_slots(["0:0", "00:0"], flag="--query_anchors")
+    # The refusals name the flag the values came from.
+    with pytest.raises(ValueError, match="^--eval_query_anchors entries must look like"):
+        train_cli.parse_query_anchor_slots(["0"], flag="--eval_query_anchors")
     # Order is preserved, never sorted: the first anchor owns the Sim(3).
-    assert train_cli.parse_query_anchor_slots(["1:0", "0:0"]) == ((1, 0), (0, 0))
+    assert train_cli.parse_query_anchor_slots(
+        ["1:0", "0:0"], flag="--query_anchors"
+    ) == ((1, 0), (0, 0))
 
 
 def _validator_args(tmp_path, **overrides):
@@ -5133,7 +5170,9 @@ def test_adaptive_seats_what_the_held_out_window_holds_and_drops_the_rest(tmp_pa
     plan = train_cli._val_plans(args)[0]
     assert len(plan.cameras) == 4 and len(plan.times) == 12
     provider = MVTrackerSceneProvider(
-        query_anchor_slots=train_cli.parse_query_anchor_slots(args.query_anchors),
+        query_anchor_slots=train_cli.parse_query_anchor_slots(
+            args.query_anchors, flag="--query_anchors"
+        ),
         adaptive_query_anchors=True,
     )
     assert provider.resolve_query_anchors(plan) == ((0, 0), (1, 0), (2, 0), (3, 0)), (
@@ -5310,7 +5349,9 @@ def test_the_parse_time_anchor_check_sees_the_clamped_window(tmp_path):
     train_cli._validate_args(args)
     assert train_cli._val_anchor_slots(args) == ((0, 0),)
     provider = MVTrackerSceneProvider(
-        query_anchor_slots=train_cli.parse_query_anchor_slots(args.query_anchors),
+        query_anchor_slots=train_cli.parse_query_anchor_slots(
+            args.query_anchors, flag="--query_anchors"
+        ),
         adaptive_query_anchors=True,
     )
     assert provider.resolve_query_anchors(train_cli._val_plans(args)[0]) == ((0, 0),)
@@ -5988,10 +6029,14 @@ def test_an_unsupervisable_val_scene_does_not_end_the_run(tmp_path, monkeypatch)
             learning_rates=[1e-3], gradient_norms={},
         ),
         output_dir=tmp_path,
-        val_plans=[
-            plan_record(_record(seq_name=name), budget=48, stride=2)
-            for name in ("val-bad", "val-good")
-        ],
+        held_out=train_cli.HeldOut(
+            plans=[
+                plan_record(_record(seq_name=name), budget=48, stride=2)
+                for name in ("val-bad", "val-good")
+            ],
+            scene_provider=lambda plan: bad if plan.seq_name == "val-bad" else good,
+            benchmark=None,
+        ),
     )
 
     assert result["completed_steps"] == 4, "the run reaches its full step count"
@@ -6030,7 +6075,11 @@ def test_a_wholly_unsupervisable_held_out_set_dies_at_step_zero(
             scene_provider=lambda _plan: bad,
             step_fn=lambda **kwargs: stepped.append(kwargs),
             output_dir=tmp_path,
-            val_plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+            held_out=train_cli.HeldOut(
+                plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+                scene_provider=lambda _plan: bad,
+                benchmark=None,
+            ),
         )
 
     assert stepped == [], "before any training time was spent, which is the point"

@@ -13,7 +13,7 @@ names predate the live path; nothing here reads a dump.)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -347,6 +347,60 @@ def _resolve_view_indices(
     return tuple(resolved)
 
 
+def _validated_query_anchors(
+    query_anchors: Sequence[tuple[int, int]],
+    camera_ids: Sequence[int],
+    times: Sequence[int],
+) -> tuple[tuple[int, int], ...]:
+    """``(camera id, original time)`` anchors checked against one window.
+
+    Every anchor must name a selected camera and a selected time, since an
+    anchor is one of the window's own observations.  Shared by
+    :func:`build_scene` -- which checks before decoding a single frame -- and
+    :func:`with_query_anchors`, so a window refuses the same anchors whichever
+    way it was anchored.
+    """
+
+    query_anchors = _as_query_anchor_pairs(query_anchors)
+    for position, (anchor_camera, anchor_time) in enumerate(query_anchors):
+        if anchor_camera not in camera_ids:
+            raise ValueError(
+                f"query_anchors[{position}] camera {anchor_camera} is not in "
+                f"selected cameras {camera_ids}"
+            )
+        if anchor_time not in times:
+            raise ValueError(
+                f"query_anchors[{position}] time {anchor_time} is not in "
+                f"selected times {times}"
+            )
+    return query_anchors
+
+
+def _anchor_slots(
+    query_anchors: Sequence[tuple[int, int]],
+    view_ids: np.ndarray,
+    observations: Sequence[Observation],
+) -> list[int]:
+    """Each validated anchor's observation slot, in anchor order.
+
+    Camera ids resolve through ``view_ids`` onto view positions first, as every
+    other camera lookup in a scene does.
+    """
+
+    slots = []
+    for anchor_camera, anchor_time in query_anchors:
+        (view_index,) = _resolve_view_indices((anchor_camera,), view_ids)
+        slots.append(
+            next(
+                observation.slot
+                for observation in observations
+                if observation.camera == view_index
+                and observation.original_time == anchor_time
+            )
+        )
+    return slots
+
+
 def _frame_member_name(camera: int, time_index: int) -> str:
     """The ``view_<v>/<t>.png`` part of a frame's label.
 
@@ -622,18 +676,7 @@ def build_scene(
         )
     if query_anchors is None:
         query_anchors = ((cameras[0], times[0]),)
-    query_anchors = _as_query_anchor_pairs(query_anchors)
-    for position, (anchor_camera, anchor_time) in enumerate(query_anchors):
-        if anchor_camera not in cameras:
-            raise ValueError(
-                f"query_anchors[{position}] camera {anchor_camera} is not in "
-                f"selected cameras {cameras}"
-            )
-        if anchor_time not in times:
-            raise ValueError(
-                f"query_anchors[{position}] time {anchor_time} is not in "
-                f"selected times {times}"
-            )
+    query_anchors = _validated_query_anchors(query_anchors, cameras, times)
 
     view_count, time_count = visibility.shape[:2]
     view_ids = _as_numpy(view_ids, np.int64).reshape(-1)
@@ -647,10 +690,6 @@ def build_scene(
 
     camera_ids = cameras
     cameras = _resolve_view_indices(camera_ids, view_ids)
-    anchor_view_pairs = tuple(
-        (_resolve_view_indices((anchor_camera,), view_ids)[0], anchor_time)
-        for anchor_camera, anchor_time in query_anchors
-    )
     for time_index in times:
         if time_index >= time_count:
             raise ValueError(
@@ -786,15 +825,7 @@ def build_scene(
     # One dense query field per anchor, in the caller's priority order, while
     # every selected observation stays in S. Anchor 0 is primary: it owns the
     # scene Sim(3) and the reconstruction drift report.
-    anchor_slots = [
-        next(
-            observation.slot
-            for observation in observations
-            if observation.camera == anchor_camera
-            and observation.original_time == anchor_time
-        )
-        for anchor_camera, anchor_time in anchor_view_pairs
-    ]
+    anchor_slots = _anchor_slots(query_anchors, view_ids, observations)
     query_observation_slot = anchor_slots[0]
     track_query_observation_slots = torch.tensor(anchor_slots, dtype=torch.long)
     for view in views:
@@ -840,6 +871,45 @@ def build_scene(
             input_camera_vectors=input_camera_vectors,
         )
     return scene
+
+
+def with_query_anchors(
+    scene: DumpedKubricScene,
+    query_anchors: Sequence[tuple[int, int]],
+) -> DumpedKubricScene:
+    """The same window, anchored at ``query_anchors`` instead; the first is primary.
+
+    ``query_anchors`` are ``(camera id, original time)`` pairs, refused exactly
+    where :func:`build_scene` would refuse them.  Nothing is reloaded or
+    re-derived: the frames, arrays and observations are ``scene``'s own, and
+    only the anchor fields change -- ``query_anchors``, the primary
+    ``query_observation_slot``, ``track_query_observation_slots``, and every
+    view's ``track_query_idx``, which is set on shallow copies of the view
+    dicts and on the device the old one sat on.  ``scene`` itself is never
+    touched.  The held-out eval adds and drops its eval-only anchors this way,
+    one built window serving every anchor set it scores.
+    """
+
+    query_anchors = _validated_query_anchors(
+        query_anchors, scene.camera_ids, scene.times
+    )
+    slots = _anchor_slots(query_anchors, scene.view_ids.numpy(), scene.observations)
+    track_query_observation_slots = torch.tensor(slots, dtype=torch.long)
+    views = []
+    for view in scene.views:
+        copy = dict(view)
+        # A fresh tensor per view, as build_scene's clone gives.
+        copy["track_query_idx"] = track_query_observation_slots.to(
+            view["track_query_idx"].device, copy=True
+        )
+        views.append(copy)
+    return replace(
+        scene,
+        views=views,
+        query_anchors=query_anchors,
+        query_observation_slot=slots[0],
+        track_query_observation_slots=track_query_observation_slots,
+    )
 
 
 def scene_from_datapoint(

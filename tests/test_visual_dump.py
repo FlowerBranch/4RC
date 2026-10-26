@@ -828,7 +828,10 @@ _HELD_OUT = {"val_scenes_file": "val.json", "val_data_root": "/held/out/dir"}
 @pytest.mark.parametrize(
     "overrides, message",
     (
-        ({"eval_visual_scenes": ["0000"], "eval_every": 500}, "needs --val_scenes_file"),
+        (
+            {"eval_visual_scenes": ["0000"], "eval_every": 500},
+            r"needs a held-out set \(--val_scenes_file or --eval_benchmark_dataset\)",
+        ),
         (
             {"eval_visual_scenes": ["0000"], "eval_every": 0, **_HELD_OUT},
             "needs a nonzero --eval_every",
@@ -913,9 +916,14 @@ def _run(output_dir, scenes, default_scene, **overrides):
         scene_provider=lambda plan: scenes.get(plan.seq_name, default_scene),
         step_fn=_no_op_step,
         output_dir=output_dir,
-        val_plans=[
-            plan_record(_record(seq_name=name), budget=48, stride=2) for name in scenes
-        ],
+        held_out=train_cli.HeldOut(
+            plans=[
+                plan_record(_record(seq_name=name), budget=48, stride=2)
+                for name in scenes
+            ],
+            scene_provider=lambda plan: scenes.get(plan.seq_name, default_scene),
+            benchmark=None,
+        ),
     )
 
 

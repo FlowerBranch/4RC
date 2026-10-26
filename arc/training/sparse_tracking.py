@@ -1406,6 +1406,15 @@ ELIGIBILITY_ROLLUP_RULE = (
     "at any anchor, so the per-reason counts are mutually exclusive and, with "
     "eligible_query_count, sum to total_query_count."
 )
+# Appended to the assignment rule when a call names a priority tier; {count} is
+# the tier's size. The held-out eval's extra anchors sit behind the training
+# spec's this way, so they reach only what the spec cannot.
+ELIGIBILITY_PRIORITY_RULE = (
+    "The first {count} anchors form a priority tier: a query any of them can "
+    "supervise is assigned among them alone, by the ordering above, and the "
+    "anchors behind the tier assign only the queries the tier leaves unsupervised, "
+    "so adding anchors behind it never moves a row the tier assigns."
+)
 
 
 def _anchor_candidate(
@@ -1472,6 +1481,7 @@ def build_anchor_correspondences(
     scene: DumpedKubricScene,
     *,
     anchor_depth_tolerance_m: float = 0.10,
+    priority_anchor_count: int | None = None,
 ) -> tuple[SparseCorrespondences, dict]:
     """Project depth-verifiable queries into every declared anchor.
 
@@ -1481,6 +1491,15 @@ def build_anchor_correspondences(
     occluded in the first, and anchoring at several times is what reaches
     queries that do not start at frame 0.  Each query is then supervised exactly
     once, from the anchor it fits best; see :data:`ELIGIBILITY_ASSIGNMENT_RULE`.
+
+    ``priority_anchor_count`` makes the first that many anchors a tier that
+    assigns first (:data:`ELIGIBILITY_PRIORITY_RULE`): a query any of them can
+    supervise is ranked among them alone, so their rows, counts and contested
+    margins are exactly what a call on those anchors alone returns, and the
+    anchors behind the tier take only the queries it leaves.  That is how the
+    held-out eval's extra anchors reach later-starting queries without moving
+    a single row of the training spec's.  ``None``, the default, is one pool:
+    every training step and the eval without extra anchors.
 
     Returns the correspondences and an eligibility report accounting for every
     query, so the recovery a given anchor set buys is measured rather than
@@ -1493,6 +1512,16 @@ def build_anchor_correspondences(
     ):
         raise ValueError(
             "anchor_depth_tolerance_m must be finite and positive"
+        )
+    anchor_count = len(scene.anchor_observation_slots)
+    if priority_anchor_count is not None and (
+        isinstance(priority_anchor_count, bool)
+        or not isinstance(priority_anchor_count, int)
+        or not 1 <= priority_anchor_count <= anchor_count
+    ):
+        raise ValueError(
+            "priority_anchor_count must be None or an integer in "
+            f"[1, {anchor_count}], got {priority_anchor_count!r}"
         )
 
     query_points = scene.query_points.detach().cpu().numpy().astype(np.float64)
@@ -1699,6 +1728,17 @@ def build_anchor_correspondences(
     assigned_depth_errors: list[list[float]] = [[] for _ in per_anchor_report]
     contested_margins: list[list[float]] = [[] for _ in per_anchor_report]
     for trajectory_index, trajectory_candidates in candidates.items():
+        if priority_anchor_count is not None:
+            # Filtered BEFORE ranking, so a tier anchor's runner-up -- what
+            # sole_anchor and the contested margin read -- is never an anchor
+            # behind the tier.
+            in_tier = [
+                candidate
+                for candidate in trajectory_candidates
+                if candidate[2] < priority_anchor_count
+            ]
+            if in_tier:
+                trajectory_candidates = in_tier
         ranked = sorted(trajectory_candidates)
         depth_error_m, _, anchor_index, row, column = ranked[0]
         selected.append((anchor_index, trajectory_index, row, column))
@@ -1766,7 +1806,13 @@ def build_anchor_correspondences(
         # Equal to eligible_query_count by construction: one anchor per point.
         "supervised_pair_count": int(eligible_indices.size),
         "anchor_count": len(per_anchor_report),
-        "assignment_rule": ELIGIBILITY_ASSIGNMENT_RULE,
+        "assignment_rule": (
+            ELIGIBILITY_ASSIGNMENT_RULE
+            if priority_anchor_count is None
+            else ELIGIBILITY_ASSIGNMENT_RULE
+            + " "
+            + ELIGIBILITY_PRIORITY_RULE.format(count=priority_anchor_count)
+        ),
         "rollup_rule": ELIGIBILITY_ROLLUP_RULE,
         "rejected": rolled_up,
         "per_anchor": per_anchor_report,

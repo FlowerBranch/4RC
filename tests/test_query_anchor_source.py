@@ -562,7 +562,11 @@ def test_run_training_threads_the_training_source_and_the_resolved_eval_source(
         scene_provider=lambda _plan: scene,
         step_fn=_no_op_step(handed),
         output_dir=tmp_path,
-        val_plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+        held_out=train_cli.HeldOut(
+            plans=[plan_record(_record(seq_name="0000"), budget=48, stride=2)],
+            scene_provider=lambda _plan: scene,
+            benchmark=None,
+        ),
     )
 
     assert handed == [flags["query_anchor_source"]] * 4
@@ -638,6 +642,13 @@ def test_the_trainer_wires_both_anchor_sources_into_the_step_and_the_eval():
     eval_gathers = calls_named(functions["evaluate_held_out"], "gather_query_anchor_points")
     assert [[item.arg for item in call.keywords] for call in eval_gathers] == [["source"], []]
     assert is_name(keyword(eval_gathers[0], "source"), "eval_query_anchor_source")
+    # The extra held-out anchors gather the same way in their own helper, which
+    # the eval hands its own source.
+    extra_gathers = calls_named(functions["_eval_anchor_rows"], "gather_query_anchor_points")
+    assert [[item.arg for item in call.keywords] for call in extra_gathers] == [["source"], []]
+    assert is_name(keyword(extra_gathers[0], "source"), "eval_query_anchor_source")
+    (extra_call,) = calls_named(functions["evaluate_held_out"], "_eval_anchor_rows")
+    assert is_name(keyword(extra_call, "eval_query_anchor_source"), "eval_query_anchor_source")
 
 
 # ---------------------------------------------------------- the eval flags ---
@@ -720,7 +731,13 @@ def test_the_eval_anchor_flag_needs_a_held_out_set_and_the_training_flag_does_no
     defines what every step trains on and needs no held-out set at all."""
 
     parser = train_cli.build_arg_parser()
-    with pytest.raises(ValueError, match="--eval_query_anchor_source needs --val_scenes_file"):
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"--eval_query_anchor_source needs a held-out set "
+            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+        ),
+    ):
         train_cli._validate_args(
             parser.parse_args(["--manifest", "m.jsonl", "--eval_query_anchor_source", "gt_depth"])
         )

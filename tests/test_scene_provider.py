@@ -844,8 +844,11 @@ def test_cameras_are_fused_per_timestep_by_confidence(dumped_scene):
     alignment = DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3))
     anchors = torch.zeros(correspondences.count, 3)
 
-    arrays = train_cli._prediction_arrays(
-        raw, scene, correspondences, alignment, anchors, _ALPHA
+    arrays = build_prediction_arrays(
+        **train_cli._prediction_columns(
+            raw, scene, correspondences, alignment, anchors
+        ),
+        confidence_alpha=_ALPHA,
     )
 
     covered = sorted({int(t) for t in scene.slot_times.tolist()})
@@ -887,13 +890,15 @@ def test_the_covered_timestep_column_indexes_the_window_not_the_frames(dumped_sc
         "track_query_idx": scene.track_query_observation_slots.clone(),
     }
 
-    arrays = train_cli._prediction_arrays(
-        raw,
-        scene,
-        correspondences,
-        DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
-        torch.zeros(correspondences.count, 3),
-        _ALPHA,
+    arrays = build_prediction_arrays(
+        **train_cli._prediction_columns(
+            raw,
+            scene,
+            correspondences,
+            DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
+            torch.zeros(correspondences.count, 3),
+        ),
+        confidence_alpha=_ALPHA,
     )
 
     covered = sorted({int(t) for t in scene.slot_times.tolist()})
@@ -936,14 +941,16 @@ def test_the_merged_bundle_is_written_without_a_fusion_step(dumped_scene):
         "track_query_idx": scene.track_query_observation_slots.clone(),
     }
 
-    arrays = train_cli._prediction_arrays(
-        raw,
-        scene,
-        correspondences,
-        DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
-        torch.zeros(correspondences.count, 3),
-        _ALPHA,
-        merge_synchronized_slots=True,
+    arrays = build_prediction_arrays(
+        **train_cli._prediction_columns(
+            raw,
+            scene,
+            correspondences,
+            DetachedSim3(torch.tensor(1.0), torch.eye(3), torch.zeros(3)),
+            torch.zeros(correspondences.count, 3),
+            merge_synchronized_slots=True,
+        ),
+        confidence_alpha=_ALPHA,
     )
 
     metric = float(scene.track_upscaling_factor)

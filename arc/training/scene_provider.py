@@ -53,6 +53,7 @@ absent.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -175,6 +176,33 @@ def apply_recorded_scene_transform(sample, scene_transform: dict | None):
     # because the invariant is the composition -- and it is a no-op at scale 1.0.
     sample.track_upscaling_factor = float(sample.track_upscaling_factor) / scale
     return sample
+
+
+def resolve_anchor_slots(slots, plan, *, adaptive: bool) -> tuple[tuple[int, int], ...]:
+    """A plan's absolute ``(camera id, original time)`` anchors, from relative slots.
+
+    ``(plan.cameras[view_slot], plan.times[time_slot])`` per slot, in slot
+    order, so the first is primary.  A slot the plan cannot seat is dropped
+    under ``adaptive`` and raises ``ValueError`` otherwise -- see
+    :meth:`MVTrackerSceneProvider.resolve_query_anchors` for what each mode
+    means and why the error is not a ``SceneProviderError``.  One arithmetic
+    for the training stream, the held-out eval's extra anchors and the
+    benchmark's scenes.
+    """
+
+    anchors = []
+    for view_slot, time_slot in slots:
+        if view_slot >= len(plan.cameras) or time_slot >= len(plan.times):
+            if adaptive:
+                continue
+            raise ValueError(
+                f"query anchor slot {view_slot}:{time_slot} does not fit "
+                f"scene {plan.seq_name!r} with {len(plan.cameras)} views x "
+                f"{len(plan.times)} times; the anchor spec must fit every "
+                "planned step"
+            )
+        anchors.append((plan.cameras[view_slot], plan.times[time_slot]))
+    return tuple(anchors)
 
 
 class MVTrackerSceneProvider:
@@ -492,19 +520,9 @@ class MVTrackerSceneProvider:
         never returns empty.
         """
 
-        anchors = []
-        for view_slot, time_slot in self.query_anchor_slots:
-            if view_slot >= len(plan.cameras) or time_slot >= len(plan.times):
-                if self.adaptive_query_anchors:
-                    continue
-                raise ValueError(
-                    f"query anchor slot {view_slot}:{time_slot} does not fit "
-                    f"scene {plan.seq_name!r} with {len(plan.cameras)} views x "
-                    f"{len(plan.times)} times; the anchor spec must fit every "
-                    "planned step"
-                )
-            anchors.append((plan.cameras[view_slot], plan.times[time_slot]))
-        return tuple(anchors)
+        return resolve_anchor_slots(
+            self.query_anchor_slots, plan, adaptive=self.adaptive_query_anchors
+        )
 
     def __call__(self, plan):
         from arc.training import scene_from_datapoint
@@ -539,5 +557,233 @@ class MVTrackerSceneProvider:
             size=self.size,
             patch_size=self.patch_size,
             input_depth_max=self.max_depth if self.input_depth else None,
+            input_camera_vectors=self.input_camera_vectors,
+        )
+
+
+# --- Held-out benchmarks. The eval can score an MVTracker benchmark in place of
+# the --val_scenes_file scenes, and such a set is opened by the benchmark's OWN
+# protocol -- MVTracker's from_name at subset "test", exactly the call 4I4's
+# triton/4rc/multiview/dump_common.py::build_dataset makes -- never by the
+# replay's dataset_overrides above: the point is to score the queries
+# MVTracker's figures are scored on. One entry per dataset family, matched by
+# name prefix, so Panoptic or DexYCB is one more entry.
+
+
+def _kubric_benchmark_refusal(name: str) -> str | None:
+    """Why a Kubric name cannot be a held-out benchmark, or None.
+
+    Only a ``-cached`` name reads the shipped track set: without it the loader
+    redraws every scene's tracks and queries (kubric_multiview_dataset.py:945,
+    MVTracker 4002795), so the scored queries would not be the benchmark's.
+    """
+
+    if not name.endswith("-cached"):
+        return (
+            f"--eval_benchmark_dataset {name!r} reads no cached track set: only a "
+            "name ending in -cached scores the benchmark's own queries (512 per "
+            "scene, shipped with the test data); any other redraws them per scene"
+        )
+    return None
+
+
+def _open_kubric_benchmark(name: str, root: str, *, max_depth: float):
+    """MVTracker's Kubric test set, by its own protocol plus one label-depth cap.
+
+    The kwargs are ``from_name``'s at subset ``"test"`` with exactly one key
+    set on top, ``max_depth``: the constructor's evaluation default is 1000,
+    while the held-out scenes load at the run's ``--kubric_max_depth``. It only
+    zeroes depth maps (kubric_multiview_dataset.py:882), which feed the Sim(3)
+    fit and the anchor depth gate, so without it the benchmark would align and
+    admit on far background the held-out curve never sees. The scored tracks,
+    visibility and queries come from the track cache, whose key ignores
+    ``max_depth`` (kubric_multiview_dataset.py:515-527).
+
+    Refuses a set with a scene whose track cache is missing: the loader would
+    redraw that scene's queries and write a new cache file into the dataset
+    root on first load (kubric_multiview_dataset.py:925-934).  The location
+    rule is the loader's own (:925-931): an archived scene keeps its cache
+    under ``<data_root>/_trackcache/<scene>/``, a directory scene under
+    ``<scene>/cache/``.
+    """
+
+    try:
+        from mvtracker.datasets.kubric_multiview_dataset import KubricMultiViewDataset
+        from mvtracker.datasets.scene_archive import ARCHIVE_SUFFIX
+    except ImportError as error:  # pragma: no cover - environment-dependent
+        raise SceneProviderError(
+            "the benchmark needs MVTracker's loader importable, so that it is "
+            "opened by the benchmark's own protocol. Run in RC_ENV with the "
+            f"mvtracker checkout on PYTHONPATH ({error})"
+        ) from error
+
+    kwargs = KubricMultiViewDataset.from_name(
+        name, dataset_root=root, subset="test", just_return_kwargs=True
+    )
+    kwargs["max_depth"] = max_depth
+    dataset = KubricMultiViewDataset(**kwargs)
+    missing = []
+    for scene_name, scene_path in zip(dataset.seq_names, dataset.seq_paths):
+        cache_root = (
+            os.path.join(dataset.data_root, "_trackcache", scene_name)
+            if scene_path.endswith(ARCHIVE_SUFFIX)
+            else os.path.join(scene_path, "cache")
+        )
+        cache_file = os.path.join(cache_root, f"{dataset.cache_name}.npz")
+        if not os.path.isfile(cache_file):
+            missing.append(cache_file)
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(dataset.seq_names)} scenes of {name!r} at "
+            f"{kwargs['data_root']!r} have no cached track file (first: "
+            f"{missing[0]}). MVTracker would redraw their queries and write the "
+            "file into the dataset root on first load, so the scored queries "
+            "would not be the benchmark's"
+        )
+    return dataset, kwargs
+
+
+# (name prefix, parse-time refusal, opener)
+BENCHMARK_DATASETS = (
+    ("kubric-multiview-v3", _kubric_benchmark_refusal, _open_kubric_benchmark),
+)
+
+
+def benchmark_name_refusal(name: str) -> str | None:
+    """Why ``name`` cannot be a held-out benchmark, or None; imports nothing.
+
+    The parse-time half of the benchmark's checks: what a name alone decides,
+    answerable before the model loads and without MVTracker importable.
+    """
+
+    for prefix, refusal, _ in BENCHMARK_DATASETS:
+        if name.startswith(prefix):
+            return refusal(name)
+    prefixes = [prefix for prefix, _, _ in BENCHMARK_DATASETS]
+    return (
+        f"--eval_benchmark_dataset {name!r} is not a supported benchmark; "
+        f"supported names start with one of {prefixes}"
+    )
+
+
+class BenchmarkSceneProvider:
+    """``StepPlan -> DumpedKubricScene`` for a held-out benchmark's test scenes.
+
+    Built once, before the model loads, so every refusal costs no model load:
+    the name, the dataset's own cameras against ``--val_cameras`` (the
+    window's camera set, a refused resume key), its clip length against
+    ``--val_seq_len``, and -- through the opener -- a missing track cache.
+
+    A scene is the benchmark's sample as loaded: no world transform and no
+    column selection, so the scene's tracks and queries are exactly the
+    dataset's, in its order.  The anchors are the training spec's seated
+    held-out slots, resolved strictly (they were checked against the window at
+    parse time).  ``--kubric_max_depth`` caps both depths, as on the held-out
+    path: the labels through the opener, the encoder's input under
+    ``--depth_input`` through ``input_depth_max``.  A scene that fails to load
+    raises: a benchmark scored on a subset of its scenes would not be
+    comparable with MVTracker's figures.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        dataset_root: str,
+        cameras: Sequence[int],
+        seq_len: int,
+        max_depth: float,
+        query_anchor_slots: Sequence[tuple[int, int]],
+        size: int = 512,
+        patch_size: int = 14,
+        input_depth: bool = False,
+        input_camera_vectors: bool = False,
+    ):
+        refusal = benchmark_name_refusal(dataset_name)
+        if refusal is not None:
+            raise ValueError(refusal)
+        opener = next(
+            open_benchmark
+            for prefix, _, open_benchmark in BENCHMARK_DATASETS
+            if dataset_name.startswith(prefix)
+        )
+        self.dataset, self.kwargs = opener(
+            dataset_name, dataset_root, max_depth=max_depth
+        )
+        views = self.kwargs.get("views_to_return")
+        if views is None:
+            raise ValueError(
+                f"--eval_benchmark_dataset {dataset_name!r} fixes no camera set "
+                "(views_to_return is None): the loader would draw the views per "
+                "scene, so the held-out window has no cameras to name"
+            )
+        views = tuple(int(view) for view in views)
+        if views != tuple(int(camera) for camera in cameras):
+            raise ValueError(
+                f"--eval_benchmark_dataset {dataset_name!r} returns cameras "
+                f"{list(views)}, but the held-out window is --val_cameras "
+                f"{list(cameras)}; the window and its anchors are sized by those"
+            )
+        if self.kwargs.get("seq_len") != seq_len:
+            raise ValueError(
+                f"--eval_benchmark_dataset {dataset_name!r} loads "
+                f"{self.kwargs.get('seq_len')}-frame clips, but the held-out window "
+                f"is planned on --val_seq_len {seq_len}"
+            )
+        self.dataset_name = dataset_name
+        self.dataset_root = dataset_root
+        self.data_root = str(self.kwargs["data_root"])
+        self.max_depth = float(max_depth)
+        self.cameras = views
+        self.scene_names = [str(name) for name in self.dataset.seq_names]
+        if not self.scene_names:
+            raise ValueError(
+                f"--eval_benchmark_dataset {dataset_name!r} at {self.data_root!r} "
+                "holds no scenes"
+            )
+        self.query_anchor_slots = tuple(
+            (int(view_slot), int(time_slot))
+            for view_slot, time_slot in query_anchor_slots
+        )
+        self.size = size
+        self.patch_size = patch_size
+        self.input_depth_max = self.max_depth if input_depth else None
+        self.input_camera_vectors = input_camera_vectors
+
+    def identity(self) -> dict:
+        """What the eval records about the set it scored."""
+
+        return {
+            "dataset": self.dataset_name,
+            "root": str(self.dataset_root),
+            "subset": "test",
+            "data_root": self.data_root,
+            "scene_count": len(self.scene_names),
+            "max_depth": self.max_depth,
+        }
+
+    def __call__(self, plan):
+        from arc.training import scene_from_datapoint
+
+        if plan.seq_name not in self.scene_names:
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the benchmark at "
+                f"{self.data_root!r} ({len(self.scene_names)} scenes)"
+            )
+        sample, gotit = self.dataset[self.scene_names.index(plan.seq_name)]
+        if not gotit:
+            raise SceneProviderError(
+                f"benchmark scene {plan.seq_name!r} failed to load"
+            )
+        return scene_from_datapoint(
+            sample,
+            cameras=plan.cameras,
+            times=plan.times,
+            query_anchors=resolve_anchor_slots(
+                self.query_anchor_slots, plan, adaptive=False
+            ),
+            size=self.size,
+            patch_size=self.patch_size,
+            input_depth_max=self.input_depth_max,
             input_camera_vectors=self.input_camera_vectors,
         )

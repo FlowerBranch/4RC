@@ -38,6 +38,7 @@ import math
 import signal
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -75,7 +76,11 @@ from arc.training.runtime import (
     weighted_anchor_total,
 )
 from arc.training.sample_manifest import MANIFEST_VERSION, read_manifest
-from arc.training.scene_provider import SceneProviderError
+from arc.training.scene_provider import (
+    SceneProviderError,
+    benchmark_name_refusal,
+    resolve_anchor_slots,
+)
 from arc.training.schedule import (
     apply_learning_rate,
     capture_base_learning_rates,
@@ -1151,14 +1156,18 @@ def evaluate_held_out(
     visual_scenes: frozenset[str] = frozenset(),
     visual_stride: int = 4,
     run_identity: dict | None = None,
+    eval_query_anchors: list[str] | None = None,
+    benchmark: dict | None = None,
 ) -> dict:
     """Score the held-out scenes without leaving a trace on the training run.
 
     ``query_anchors`` is the spec the held-out window actually seats (the
     canonical ``VIEWSLOT:TIMESLOT`` strings), recorded in the metrics so an eval
     curve is never read against the wrong supervision scheme; the scenes
-    themselves already carry the resolved anchors, because the same provider
-    instance serves training and eval.  What SEATED, not what was asked for:
+    themselves already carry the resolved anchors, because their provider
+    resolves those same seated slots -- the training provider instance for
+    --val_scenes_file's scenes, the benchmark's own for a benchmark's.  What
+    SEATED, not what was asked for:
     under ``--adaptive_query_anchors`` the run's spec is a ceiling sized for the
     training stream's 2-6 views, and the fixed held-out window drops whatever it
     cannot hold -- so recording the full spec here would label the curve with
@@ -1270,6 +1279,36 @@ def evaluate_held_out(
     randomness and feeds nothing back, so every other output is
     byte-identical with it on; empty, the default, it writes nothing. A
     skipped scene has nothing to dump.
+
+    ``eval_query_anchors`` adds anchors behind ``query_anchors``: the
+    canonical ``VIEWSLOT:TIMESLOT`` strings of ``--eval_query_anchors``,
+    resolved against each plan's window, or None -- the default -- for none.
+    They are how a query that starts after the window's first frame is
+    scored, since an anchor admits only the queries starting at its own time.
+    Everything above is computed exactly as without them: forward A is the
+    forward the seated anchors always ran, and every per-scene and pooled
+    figure reads it. :func:`_eval_anchor_rows` does the rest -- a priority
+    tier keeps every seated anchor's rows, an extra anchor that receives no
+    query is dropped before any head pass, and the kept ones run a forward B
+    of their own. Their rows follow the seated anchors' in the bundle, and
+    their readouts and counts go to the scene's ``eval_anchors`` entry. The
+    full spec, seated then extra, is recorded as ``eval_query_anchors``; None
+    when off.
+
+    ``benchmark`` says the plans are a benchmark's test scenes, and is what
+    ``eval_benchmark`` records about it -- its identity and the window -- or
+    None. A benchmark is scored on all of its queries, so each bundle then
+    holds one row per dataset query in the dataset's order: the scored row
+    where an anchor admitted the query, and otherwise the fallback row of
+    :func:`_benchmark_columns`, its query point held still at confidence 0
+    (predicted occluded throughout). A scene no seated anchor reaches is
+    skipped as above but still writes such a bundle, every row the fallback.
+    Each scene's admitted and unanchored queries by start time, and the
+    unanchored ones' rejection split, go to ``eval_benchmark``'s
+    ``per_scene``.
+
+    With either on, one line per scene reports the anchors run, the rows
+    written and the seconds the scene took.
     """
 
     from arc.training import (
@@ -1284,7 +1323,11 @@ def evaluate_held_out(
         write_visual_dump,
     )
     from arc.training.dumped_kubric import CAMERA_VECTOR_KEY, DEPTH_INPUT_KEY
-    from arc.training.predictions import reference_tau, write_scene_predictions
+    from arc.training.predictions import (
+        build_prediction_arrays,
+        reference_tau,
+        write_scene_predictions,
+    )
     from arc.training.runtime import shuffled_index_views
 
     if visual_scenes and run_identity is None:
@@ -1304,10 +1347,21 @@ def evaluate_held_out(
     # inf in BF16, and a non-finite confidence is reported occluded -- so this is
     # what separates "the model called these occluded" from "the channel overflowed".
     confidence_nonfinite = 0
+    # The extra anchors' slots, parsed once; the spec was validated against the
+    # window before the run began.
+    eval_slots = (
+        parse_query_anchor_slots(eval_query_anchors, flag="--eval_query_anchors")
+        if eval_query_anchors
+        else ()
+    )
+    # One counts record per benchmark scene, skipped ones included.
+    benchmark_scenes: list[dict] = []
+    reports_scenes = eval_query_anchors is not None or benchmark is not None
 
     try:
         model.eval()
         for plan in plans:
+            started = time.perf_counter()
             scene = scene_provider(plan)
             correspondences, eligibility = build_anchor_correspondences(scene)
             if correspondences.count == 0:
@@ -1331,6 +1385,42 @@ def evaluate_held_out(
                     f"of {eligibility['total_query_count']} queries, rejected="
                     f"{eligibility['rejected']}"
                 )
+                if benchmark is not None:
+                    # Every benchmark query is written, so a skipped scene still
+                    # writes its bundle, every row the fallback.
+                    if emit_predictions:
+                        write_scene_predictions(
+                            directory / "pred" / f"{plan.seq_name}.npz",
+                            build_prediction_arrays(
+                                **_benchmark_columns(
+                                    scene, None, correspondences.trajectory_indices
+                                ),
+                                confidence_alpha=confidence_alpha,
+                            ),
+                        )
+                    benchmark_scenes.append(
+                        _benchmark_scene_counts(
+                            scene,
+                            plan,
+                            correspondences.trajectory_indices,
+                            eligibility["rejected"],
+                            skipped=True,
+                        )
+                    )
+                if reports_scenes:
+                    print(
+                        _scene_report_line(
+                            step=step,
+                            scene=scene,
+                            plan=plan,
+                            extra_seated=len(eval_slots),
+                            extra_run=0,
+                            seated_rows=0,
+                            extra_rows=0,
+                            benchmark=benchmark is not None,
+                            seconds=time.perf_counter() - started,
+                        )
+                    )
                 del scene
                 continue
             # Conditional so the flag-off call stays verbatim: injected models
@@ -1392,7 +1482,7 @@ def evaluate_held_out(
                 else:
                     # Popped, not read: `raw` is the stack's only holder, and
                     # nothing after this block reads it -- confidence_stats,
-                    # the shuffled arm and _prediction_arrays read track_multi
+                    # the shuffled arm and _prediction_columns read track_multi
                     # and conf_track_multi (L1247, L1255, L1273). The shuffled
                     # forward below returns a stack of its own, so this one
                     # must be gone by then or the two are resident together.
@@ -1512,20 +1602,66 @@ def evaluate_held_out(
                 # exactly the arrays the bundle holds -- what was scored --
                 # built the same way whether or not the bundle is written.
                 dumped = plan.seq_name in visual_scenes
-                arrays = (
-                    _prediction_arrays(
+                columns = (
+                    _prediction_columns(
                         raw,
                         scene,
                         correspondences,
                         alignment,
                         anchors,
-                        confidence_alpha,
                         anchor_frame=anchor_frame,
                         merge_synchronized_slots=merge_synchronized_slots,
                     )
                     if emit_predictions or dumped
                     else None
                 )
+                # The seated anchors' rows alone: the bundle itself without
+                # either flag, and what the two confidence figures below read
+                # with or without other rows beside them.
+                arrays = (
+                    None
+                    if columns is None
+                    else build_prediction_arrays(
+                        **columns, confidence_alpha=confidence_alpha
+                    )
+                )
+                admitted = correspondences.trajectory_indices
+                eval_record = None
+                eval_columns = None
+                if eval_query_anchors is not None:
+                    # Forward A's fields have been scored and read into
+                    # `columns`; only its reconstruction is read past here, so
+                    # the fields go before forward B allocates its own.
+                    raw.pop("track_multi")
+                    raw.pop("conf_track_multi")
+                    eval_record, eval_columns, eval_rows = _eval_anchor_rows(
+                        model=model,
+                        raw=raw,
+                        scene=scene,
+                        plan=plan,
+                        alignment=alignment,
+                        slots=eval_slots,
+                        forward_kwargs=forward_kwargs,
+                        eval_query_anchor_source=eval_query_anchor_source,
+                        merge_synchronized_slots=merge_synchronized_slots,
+                    )
+                    if eval_rows is not None:
+                        admitted = torch.cat([admitted, eval_rows])
+                # The bundle: the seated anchors' rows, then the extra anchors'
+                # when any ran, laid out one row per dataset query on a
+                # benchmark. Without either flag it is `arrays` itself.
+                if columns is not None and (
+                    eval_columns is not None or benchmark is not None
+                ):
+                    if eval_columns is not None:
+                        columns = _concatenate_columns([columns, eval_columns])
+                    if benchmark is not None:
+                        columns = _benchmark_columns(scene, columns, admitted)
+                    written = build_prediction_arrays(
+                        **columns, confidence_alpha=confidence_alpha
+                    )
+                else:
+                    written = arrays
                 if emit_predictions:
                     # None, not 0.0, on a run with no operating point: the bundle
                     # carries no `occ` to take a fraction of, and a zero here would
@@ -1536,7 +1672,7 @@ def evaluate_held_out(
                     )
                     confidence_nonfinite += int((~np.isfinite(arrays["conf"])).sum())
                     write_scene_predictions(
-                        directory / "pred" / f"{plan.seq_name}.npz", arrays
+                        directory / "pred" / f"{plan.seq_name}.npz", written
                     )
                 # Last, so every field above keeps its position in the entry.
                 entry["drift"] = drift
@@ -1544,6 +1680,10 @@ def evaluate_held_out(
                     key: _distance_summary(errors)
                     for key, errors in anchor_errors.items()
                 }
+                if eval_record is not None:
+                    # After every key a run without the flag writes, so each of
+                    # those keeps its position.
+                    entry["eval_anchors"] = eval_record
                 if dumped:
                     # The plain arm's raw, Sim(3) and scene-level
                     # correspondences, the ones the readouts above read; the
@@ -1559,7 +1699,7 @@ def evaluate_held_out(
                                 model_anchors,
                                 stride=visual_stride,
                             ),
-                            tracks=arrays,
+                            tracks=written,
                             metadata={
                                 "scene": plan.seq_name,
                                 "step": step,
@@ -1584,6 +1724,41 @@ def evaluate_held_out(
                     )
             per_scene.append(entry)
             scene_anchor_errors.append(anchor_errors)
+            if benchmark is not None:
+                benchmark_scenes.append(
+                    _benchmark_scene_counts(
+                        scene,
+                        plan,
+                        admitted,
+                        (
+                            compact_eligibility(eligibility)
+                            if eval_record is None
+                            else eval_record["eligibility"]
+                        )["rejected"],
+                        skipped=False,
+                    )
+                )
+            if reports_scenes:
+                print(
+                    _scene_report_line(
+                        step=step,
+                        scene=scene,
+                        plan=plan,
+                        extra_seated=len(eval_slots),
+                        extra_run=(
+                            0
+                            if eval_record is None
+                            else sum(
+                                anchor["head_pass"]
+                                for anchor in eval_record["per_anchor"].values()
+                            )
+                        ),
+                        seated_rows=correspondences.count,
+                        extra_rows=int(admitted.numel()) - correspondences.count,
+                        benchmark=benchmark is not None,
+                        seconds=time.perf_counter() - started,
+                    )
+                )
             del raw, scene
     finally:
         restore_rng_state(rng)
@@ -1689,6 +1864,20 @@ def evaluate_held_out(
         # and the two booleans above name only the eval's reading.
         "query_anchor_source": query_anchor_source,
         "eval_query_anchor_source": eval_query_anchor_source,
+        # After those, for the same reason. The anchors this eval seated --
+        # the spec's seated ones, then the extra ones of --eval_query_anchors
+        # -- or None without that flag; per scene, which extra ones ran and
+        # what they read is the scene's eval_anchors entry.
+        "eval_query_anchors": (
+            None
+            if eval_query_anchors is None
+            else list(query_anchors) + list(eval_query_anchors)
+        ),
+        # The benchmark the plans came from, its window and each scene's
+        # admitted and unanchored counts; None for --val_scenes_file's scenes.
+        "eval_benchmark": (
+            None if benchmark is None else {**benchmark, "per_scene": benchmark_scenes}
+        ),
     }
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
@@ -1815,13 +2004,13 @@ def _readout_aggregates(per_scene: list[dict], scene_anchor_errors: list[dict]) 
     }
 
 
-def _prediction_arrays(
-    raw, scene, correspondences, alignment, anchors, confidence_alpha,
+def _prediction_columns(
+    raw, scene, correspondences, alignment, anchors,
     *,
     anchor_frame: str = "model",
     merge_synchronized_slots: bool = False,
 ):
-    """Assemble one scene's bundle in the scorers' schema.
+    """Assemble one scene's bundle columns in the scorers' schema.
 
     **The axis change is the substance here.** This repo's observation axis ``S``
     is camera-major over ``cameras x times``; the scorers' axis is ``T``
@@ -1848,10 +2037,13 @@ def _prediction_arrays(
     tracked confidently in one camera of four would average down while
     ``gt_vis_any`` still called it visible.
 
-    ``confidence_alpha`` is the run's frozen alpha (``None`` on a run that never
-    resolved one). It sets the reference threshold in ``build_prediction_arrays``;
-    it is not read per sample and nothing about it depends on this eval's ground
-    truth.
+    Returns the inputs of
+    :func:`arc.training.predictions.build_prediction_arrays` less
+    ``confidence_alpha``: the run's frozen alpha, which sets the reference
+    threshold there, is not read per sample, and nothing about it depends on
+    this eval's ground truth. The build is the caller's, so the held-out eval
+    can lay several anchor sets' rows side by side -- and a benchmark's out in
+    dataset order -- before validating and casting them once.
 
     ``anchor_frame`` is the frame half of :func:`gather_query_anchor_points`'s
     return, mirroring the loss's ``query_anchor_frame``; both route through
@@ -1866,7 +2058,6 @@ def _prediction_arrays(
         sparse_targets,
         sparse_targets_per_time,
     )
-    from arc.training.predictions import build_prediction_arrays
 
     if merge_synchronized_slots:
         positions, visible, _finite, _mask = sparse_targets_per_time(
@@ -1969,16 +2160,299 @@ def _prediction_arrays(
         dim=1,
     )
 
-    return build_prediction_arrays(
-        predicted_positions=predicted_tn,
-        ground_truth_positions=target_tn,
-        # The model's own channel. `occ` is derived from it there, at
+    return {
+        "predicted_positions": predicted_tn,
+        "ground_truth_positions": target_tn,
+        # The model's own channel. `occ` is derived from it in the build, at
         # `confidence_alpha / d` -- the scorer wants predicted visibility and
         # inverts what is stored, so what is stored is occlusion.
-        confidence=confidence_tn,
-        confidence_alpha=confidence_alpha,
-        query_points=queries,
-        visible_any_camera=visible_tn,
+        "confidence": confidence_tn,
+        "query_points": queries,
+        "visible_any_camera": visible_tn,
+    }
+
+
+def _concatenate_columns(parts: list[dict]) -> dict:
+    """Bundle columns of several anchor sets side by side, in ``parts`` order.
+
+    On the CPU, in the dtypes the build stores -- float32 and bool, so no value
+    moves: the cast is exact for every dtype the head emits -- with the track
+    axis second for the ``(T, N)`` arrays and first for ``query_points``.
+    """
+
+    def gathered(key, dtype, dim):
+        return torch.cat(
+            [
+                torch.as_tensor(part[key]).detach().cpu().to(dtype)
+                for part in parts
+            ],
+            dim=dim,
+        )
+
+    return {
+        "predicted_positions": gathered("predicted_positions", torch.float32, 1),
+        "ground_truth_positions": gathered("ground_truth_positions", torch.float32, 1),
+        "confidence": gathered("confidence", torch.float32, 1),
+        "query_points": gathered("query_points", torch.float32, 0),
+        "visible_any_camera": gathered("visible_any_camera", torch.bool, 1),
+    }
+
+
+def _benchmark_columns(scene, columns, admitted) -> dict:
+    """A benchmark scene's bundle columns: one row per dataset query, in order.
+
+    ``columns`` are the scored rows (None when the scene scored none) and
+    ``admitted`` the trajectory index each belongs to, so row ``n`` of the
+    result is query ``n`` of the dataset whatever anchor scored it.  Every
+    query no anchor admitted gets the fallback row instead:
+
+    * ``pred`` is its query point -- its trajectory at its own start frame,
+      as a scored row's ``query_points`` writes it -- held still over every
+      covered time, and ``conf`` is 0 throughout, so ``occ`` calls it occluded
+      at every time: no prediction was made, and none is claimed;
+    * ``gt`` and ``gt_vis_any`` are what a scored row carries: its trajectory
+      at the covered times, and visibility reduced with ``any`` over the
+      window's cameras;
+    * ``query_points[:, 0]`` is the last covered time at or before its start.
+      MVTracker's first-mode scorer evaluates AJ, OA and delta strictly after
+      that index (metrics.py:117-127 at 4002795), which is exactly the covered
+      frames after the start, wherever the start falls: on a covered time it
+      is that time's index, as every scored row's is; between two (an odd
+      frame at stride 2) it is the one before, which the track has not reached;
+      past the window's last time it is T-1, and the row drops out of every
+      subset for want of two visible frames from there (metrics.py:345).  The
+      window starts at frame 0, so the index always exists.
+
+    Lifted to metres by the scene's track upscaling factor, as every row is.
+    """
+
+    metric = float(scene.track_upscaling_factor)
+    covered = sorted({int(value) for value in scene.slot_times.tolist()})
+    trajectories = scene.trajectories_world.detach().cpu().to(torch.float32)
+    track_count = int(trajectories.shape[1])
+    # Integral by construction: build_anchor_correspondences refuses anything else.
+    starts = torch.from_numpy(
+        np.rint(scene.query_points[:, 0].detach().cpu().numpy()).astype(np.int64)
+    )
+    query_xyz = trajectories[starts, torch.arange(track_count)] * metric
+    last_covered = (
+        torch.searchsorted(torch.tensor(covered), starts, right=True) - 1
+    ).to(torch.float32)
+    predicted = query_xyz[None].expand(len(covered), -1, -1).clone()
+    ground_truth = trajectories[covered] * metric
+    visible = (
+        scene.visibility.detach().cpu()[list(scene.cameras)][:, covered].any(dim=0)
+    )
+    confidence = torch.zeros((len(covered), track_count), dtype=torch.float32)
+    queries = torch.cat([last_covered[:, None], query_xyz], dim=1)
+    if columns is not None:
+        rows = torch.as_tensor(admitted).detach().cpu().long()
+        predicted[:, rows] = (
+            torch.as_tensor(columns["predicted_positions"]).cpu().float()
+        )
+        ground_truth[:, rows] = (
+            torch.as_tensor(columns["ground_truth_positions"]).cpu().float()
+        )
+        confidence[:, rows] = torch.as_tensor(columns["confidence"]).cpu().float()
+        visible[:, rows] = torch.as_tensor(columns["visible_any_camera"]).cpu().bool()
+        queries[rows] = torch.as_tensor(columns["query_points"]).cpu().float()
+    return {
+        "predicted_positions": predicted,
+        "ground_truth_positions": ground_truth,
+        "confidence": confidence,
+        "query_points": queries,
+        "visible_any_camera": visible,
+    }
+
+
+def _eval_anchor_rows(
+    *,
+    model,
+    raw,
+    scene,
+    plan,
+    alignment,
+    slots,
+    forward_kwargs: dict,
+    eval_query_anchor_source: str,
+    merge_synchronized_slots: bool,
+):
+    """One scene's extra held-out anchors: their record, bundle columns and rows.
+
+    ``scene`` is the window anchored at the training spec's seated slots and
+    ``raw`` its forward A, already scored; ``slots`` are the extra
+    ``--eval_query_anchors`` slots, resolved against this plan behind the
+    seated ones.
+
+    * Correspondences are rebuilt on the window anchored at both, with the
+      seated anchors a priority tier (:func:`build_anchor_correspondences`): an
+      extra anchor receives only the queries no seated one can supervise, so
+      every seated row, count and figure stays exactly what forward A scored.
+    * An extra anchor that receives no query is dropped here, before any head
+      pass, and stays in the record with ``head_pass`` false.
+    * The kept ones run forward B: the same window anchored at them alone, so
+      no seated anchor's field is computed twice. Its fields compose on forward
+      A's pointmaps and Sim(3) -- the scene's one reconstruction and one
+      alignment -- at the eval's anchor source, as the seated rows do.
+
+    Returns ``(record, columns, rows)``. ``record`` is the scene's
+    ``eval_anchors`` entry: the eligibility split of every anchor seated with
+    the tier; per extra anchor, keyed ``camera:time`` like every per-anchor
+    readout, its eligible and assigned counts and whether it ran a head pass;
+    and for the ones that ran, the anchor error and ``base_ratio`` measured
+    exactly as the seated anchors' are, against the same primary. ``columns``
+    are their bundle columns (:func:`_prediction_columns`) and ``rows`` each
+    row's trajectory index, both None when none ran.
+    """
+
+    from arc.training import (
+        SparseCorrespondences,
+        build_anchor_correspondences,
+        gather_query_anchor_points,
+        query_anchor_errors,
+        reconstruction_drift_report,
+        with_query_anchors,
+    )
+    # The one place a per-anchor readout key is formatted.
+    from arc.training.sparse_tracking import _anchor_key
+
+    seated = scene.query_anchors
+    extended = with_query_anchors(
+        scene, seated + resolve_anchor_slots(slots, plan, adaptive=False)
+    )
+    correspondences, eligibility = build_anchor_correspondences(
+        extended, priority_anchor_count=len(seated)
+    )
+    per_anchor = eligibility["per_anchor"]
+    extra = range(len(seated), len(extended.query_anchors))
+    kept = [index for index in extra if per_anchor[index]["assigned"] > 0]
+    record = {
+        "eligibility": compact_eligibility(eligibility),
+        "per_anchor": {
+            _anchor_key(*extended.query_anchors[index]): {
+                "eligible": per_anchor[index]["eligible"],
+                "assigned": per_anchor[index]["assigned"],
+                "head_pass": index in kept,
+            }
+            for index in extra
+        },
+        "anchor_error_m": {},
+        "base_ratio": {},
+    }
+    if not kept:
+        return record, None, None
+
+    # The kept anchors' rows, renumbered onto the window anchored at them
+    # alone. Rows arrive anchor-major and the renumbering is monotone, so
+    # their order is kept.
+    position = {index: renumbered for renumbered, index in enumerate(kept)}
+    taken = correspondences.query_slots >= len(seated)
+    eval_correspondences = SparseCorrespondences(
+        trajectory_indices=correspondences.trajectory_indices[taken],
+        query_slots=torch.tensor(
+            [
+                position[int(slot)]
+                for slot in correspondences.query_slots[taken].tolist()
+            ],
+            dtype=torch.long,
+        ),
+        query_times=correspondences.query_times[taken],
+        rows=correspondences.rows[taken],
+        columns=correspondences.columns[taken],
+    )
+    kept_anchors = tuple(extended.query_anchors[index] for index in kept)
+    eval_scene = with_query_anchors(scene, kept_anchors)
+
+    # The same forward the seated anchors ran, refinement passes included; its
+    # final field is what track_multi holds and what is scored.
+    raw_b = model(eval_scene.views, force_no_output_conversion=True, **forward_kwargs)
+    anchors, anchor_frame = gather_query_anchor_points(
+        raw, eval_scene, eval_correspondences, source=eval_query_anchor_source
+    )
+    model_anchors = (
+        anchors
+        if anchor_frame == "model"
+        else gather_query_anchor_points(raw, eval_scene, eval_correspondences)[0]
+    )
+    anchor_errors = query_anchor_errors(
+        model_anchors, eval_scene, eval_correspondences, alignment
+    )
+    # Against the primary, as the seated anchors' ratios are: the drift report
+    # measures every anchor's offset from the window's first anchor.
+    base_ratio = reconstruction_drift_report(
+        raw, with_query_anchors(scene, seated + kept_anchors), alignment
+    )["base_ratio"]
+    record["anchor_error_m"] = {
+        key: _distance_summary(errors) for key, errors in anchor_errors.items()
+    }
+    record["base_ratio"] = {key: base_ratio[key] for key in anchor_errors}
+    columns = _prediction_columns(
+        raw_b,
+        eval_scene,
+        eval_correspondences,
+        alignment,
+        anchors,
+        anchor_frame=anchor_frame,
+        merge_synchronized_slots=merge_synchronized_slots,
+    )
+    return record, columns, eval_correspondences.trajectory_indices
+
+
+def _count_by_frame(frames) -> dict:
+    """``{"<frame>": count}`` in frame order, for the benchmark's per-scene counts."""
+
+    counts = Counter(int(frame) for frame in frames)
+    return {str(frame): counts[frame] for frame in sorted(counts)}
+
+
+def _benchmark_scene_counts(scene, plan, admitted, rejected, *, skipped: bool) -> dict:
+    """One benchmark scene's query accounting, by original start frame.
+
+    ``admitted`` are the trajectory indices some anchor scored, ``rejected``
+    the eligibility split of the anchor set that ran -- every other query, by
+    the furthest stage it reached -- so admitted and unanchored sum to the
+    scene's query count.  Start frames are original clip frames, not covered
+    indices, so the queries a window cannot hold (odd frames at stride 2,
+    frames past its end) show by name.
+    """
+
+    starts = np.rint(scene.query_points[:, 0].detach().cpu().numpy()).astype(np.int64)
+    taken = np.zeros(starts.shape[0], dtype=bool)
+    taken[torch.as_tensor(admitted).detach().cpu().numpy()] = True
+    return {
+        "scene": plan.seq_name,
+        "query_count": int(starts.shape[0]),
+        "skipped": bool(skipped),
+        "admitted_by_start_time": _count_by_frame(starts[taken]),
+        "unanchored_by_start_time": _count_by_frame(starts[~taken]),
+        "unanchored_rejected": dict(rejected),
+    }
+
+
+def _scene_report_line(
+    *,
+    step,
+    scene,
+    plan,
+    extra_seated: int,
+    extra_run: int,
+    seated_rows: int,
+    extra_rows: int,
+    benchmark: bool,
+    seconds: float,
+) -> str:
+    """The per-scene line --eval_query_anchors and the benchmark print.
+
+    ``anchors=<seated>+<extra run>/<extra seated>`` and ``rows=<seated
+    rows>+<extra rows>``, then ``/<queries>`` on a benchmark, where every query
+    is written: the measured cost of the extra anchors, scene by scene.
+    """
+
+    queries = f"/{int(scene.query_points.shape[0])}" if benchmark else ""
+    return (
+        f"eval step={step} scene={plan.seq_name} "
+        f"anchors={len(scene.query_anchors)}+{extra_run}/{extra_seated} "
+        f"rows={seated_rows}+{extra_rows}{queries} seconds={seconds:.1f}"
     )
 
 
@@ -1999,14 +2473,15 @@ def check_device_headroom(peak_bytes: int, *, step: int, max_fraction: float) ->
         )
 
 
-def parse_query_anchor_slots(values) -> tuple[tuple[int, int], ...]:
+def parse_query_anchor_slots(values, *, flag: str) -> tuple[tuple[int, int], ...]:
     """Parse ``VIEWSLOT:TIMESLOT`` pairs, preserving the caller's order.
 
     Rejected explicitly rather than coerced: a silently mis-parsed anchor would
     supervise the wrong observation and still produce plausible numbers.  Order
     is never normalized away, because it is stream-defining: the first anchor
     owns the scene Sim(3) and best-anchor assignment tiebreaks on anchor index,
-    so ``1:0 0:0`` and ``0:0 1:0`` are different training streams.
+    so ``1:0 0:0`` and ``0:0 1:0`` are different training streams.  ``flag``
+    names the option the values came from, in every refusal.
     """
 
     pairs: list[tuple[int, int]] = []
@@ -2019,18 +2494,18 @@ def parse_query_anchor_slots(values) -> tuple[tuple[int, int], ...]:
             part.isascii() and part.isdigit() for part in parts
         ):
             raise ValueError(
-                "--query_anchors entries must look like VIEWSLOT:TIMESLOT, "
+                f"{flag} entries must look like VIEWSLOT:TIMESLOT, "
                 f"with plain decimal slots, got {value!r}"
             )
         view_slot, time_slot = (int(part) for part in parts)
         if (view_slot, time_slot) in pairs:
             raise ValueError(
-                f"--query_anchors {view_slot}:{time_slot} is listed more than once"
+                f"{flag} {view_slot}:{time_slot} is listed more than once"
             )
         pairs.append((view_slot, time_slot))
     if not pairs:
         raise ValueError(
-            "--query_anchors must contain at least one VIEWSLOT:TIMESLOT pair"
+            f"{flag} must contain at least one VIEWSLOT:TIMESLOT pair"
         )
     return tuple(pairs)
 
@@ -2775,6 +3250,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(default: %(default)s)"
         ),
     )
+    evaluation.add_argument(
+        "--eval_query_anchors",
+        nargs="+",
+        default=None,
+        metavar="VIEWSLOT:TIMESLOT",
+        help=(
+            "Eval-only: extra query anchors for the held-out eval, so the "
+            "queries that start after the window's first frame are scored too. "
+            "'all' adds every (camera slot, time slot) pair of the held-out "
+            "window the training spec does not already seat, time-major; "
+            "VIEWSLOT:TIMESLOT strings add those slots. They sit behind the "
+            "training spec's seated anchors, which keep the primary, the Sim(3) "
+            "and every row and figure they produce: an extra anchor receives "
+            "only the queries no training anchor can supervise, and one that "
+            "receives none runs no head pass. Their rows are appended to each "
+            "bundle and their readouts recorded per scene, while the pooled "
+            "readouts stay on the training anchors. Changes no gradient and is "
+            "not stored in the checkpoint, so a resume may switch it freely. "
+            "Needs a held-out set (--val_scenes_file or "
+            "--eval_benchmark_dataset); a slot must fit the held-out window and "
+            "must not repeat a seated one"
+        ),
+    )
+    evaluation.add_argument(
+        "--eval_benchmark_dataset",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Eval-only: score an MVTracker benchmark's test scenes as the "
+            "held-out set, in place of --val_scenes_file's -- every scene in the "
+            "dataset's own order, with its own cameras (which must be "
+            "--val_cameras) and the held-out window, loaded by the benchmark's "
+            "own protocol (from_name at subset 'test') with depth capped at "
+            "--kubric_max_depth. Every query of the benchmark is written to the "
+            "bundle in dataset order; one no anchor supervises is written as its "
+            "query point held still at confidence 0. kubric-multiview-v3 names "
+            "ending in -cached only, for now. Not stored in the checkpoint. "
+            "Needs --eval_benchmark_root and a nonzero --eval_every"
+        ),
+    )
+    evaluation.add_argument(
+        "--eval_benchmark_root",
+        default=None,
+        metavar="DIR",
+        help=(
+            "The dataset root holding kubric-multiview/test for "
+            "--eval_benchmark_dataset: the dataset_root MVTracker's from_name "
+            "takes. The two flags require each other"
+        ),
+    )
     return parser
 
 
@@ -2953,28 +3478,56 @@ def _validate_args(args: argparse.Namespace) -> None:
             "their own directory, and it cannot be derived from the manifest, "
             "whose rows name the training directory"
         )
+    # The benchmark is the other held-out source, so it is checked before
+    # anything asks whether a held-out set exists. What its name alone decides
+    # is refused here; what needs the dataset opened -- its cameras, clip
+    # length and track cache -- is refused where main() builds it, still
+    # before the model load.
+    if args.eval_benchmark_dataset and not args.eval_benchmark_root:
+        raise ValueError(
+            "--eval_benchmark_dataset needs --eval_benchmark_root: the name says "
+            "which benchmark, the root where its kubric-multiview/test sits"
+        )
+    if args.eval_benchmark_root and not args.eval_benchmark_dataset:
+        raise ValueError(
+            "--eval_benchmark_root needs --eval_benchmark_dataset: a root alone "
+            "names no benchmark, so it would change nothing"
+        )
+    if args.eval_benchmark_dataset:
+        refusal = benchmark_name_refusal(args.eval_benchmark_dataset)
+        if refusal is not None:
+            raise ValueError(refusal)
+        if not args.eval_every:
+            raise ValueError(
+                "--eval_benchmark_dataset needs a nonzero --eval_every: "
+                "--eval_every 0 switches the held-out eval off, so the benchmark "
+                "would load and never be scored"
+            )
     # Same parse-time refusal, same reason, for the eval's anchor flags. The
     # readings can train now, through --query_anchor_source, but these flags
     # touch only the held-out eval, so without a held-out set each is silently
     # inert -- while run_summary.json would still file the run as scored on
     # that reading when nothing was measured.
-    if args.eval_query_anchor_source is not None and not args.val_scenes_file:
+    if args.eval_query_anchor_source is not None and not _has_held_out(args):
         raise ValueError(
-            "--eval_query_anchor_source needs --val_scenes_file: the flag only "
-            "ever reaches the held-out eval, so without a held-out set it "
-            "changes nothing and would label a run it never measured"
+            "--eval_query_anchor_source needs a held-out set (--val_scenes_file "
+            "or --eval_benchmark_dataset): the flag only ever reaches the "
+            "held-out eval, so without one it changes nothing and would label a "
+            "run it never measured"
         )
-    if args.oracle_query_anchor and not args.val_scenes_file:
+    if args.oracle_query_anchor and not _has_held_out(args):
         raise ValueError(
-            "--oracle_query_anchor needs --val_scenes_file: the flag only ever "
-            "reaches the held-out eval, so without a held-out set it changes "
-            "nothing and would label a run it never measured"
+            "--oracle_query_anchor needs a held-out set (--val_scenes_file or "
+            "--eval_benchmark_dataset): the flag only ever reaches the held-out "
+            "eval, so without one it changes nothing and would label a run it "
+            "never measured"
         )
-    if args.ground_truth_query_anchor and not args.val_scenes_file:
+    if args.ground_truth_query_anchor and not _has_held_out(args):
         raise ValueError(
-            "--ground_truth_query_anchor needs --val_scenes_file: the flag only "
-            "ever reaches the held-out eval, so without a held-out set it "
-            "changes nothing and would label a run it never measured"
+            "--ground_truth_query_anchor needs a held-out set (--val_scenes_file "
+            "or --eval_benchmark_dataset): the flag only ever reaches the "
+            "held-out eval, so without one it changes nothing and would label a "
+            "run it never measured"
         )
     # One eval writes one curve, so two spellings naming different readings
     # are refused -- by the resolver itself, which keeps the precedence and the
@@ -2986,11 +3539,11 @@ def _validate_args(args: argparse.Namespace) -> None:
     # are checked against the held-out set itself in run_training's preflight,
     # the first point that set is known.
     if args.eval_visual_scenes:
-        if not args.val_scenes_file:
+        if not _has_held_out(args):
             raise ValueError(
-                "--eval_visual_scenes needs --val_scenes_file: the dump is written "
-                "by the held-out eval, so without a held-out set nothing would "
-                "ever be written"
+                "--eval_visual_scenes needs a held-out set (--val_scenes_file or "
+                "--eval_benchmark_dataset): the dump is written by the held-out "
+                "eval, so without one nothing would ever be written"
             )
         if not args.eval_every:
             raise ValueError(
@@ -3013,7 +3566,7 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"--eval_visual_stride must be at least 1, got {args.eval_visual_stride}"
         )
 
-    anchor_slots = parse_query_anchor_slots(args.query_anchors)
+    anchor_slots = parse_query_anchor_slots(args.query_anchors, flag="--query_anchors")
     if not args.adaptive_query_anchors:
         for view_slot, _time_slot in anchor_slots:
             # --min_views is the only per-step floor on how many views a planned
@@ -3031,7 +3584,7 @@ def _validate_args(args: argparse.Namespace) -> None:
                     f"{view_slot + 1}; min_views is the only per-step guarantee on "
                     "how many views a planned step seats"
                 )
-    if args.val_scenes_file:
+    if _has_held_out(args):
         # The held-out window derives purely from flags, so its seating is
         # checkable here rather than at plan time.
         #
@@ -3080,6 +3633,19 @@ def _validate_args(args: argparse.Namespace) -> None:
                         "--max_time_indices, and the --val_seq_len clip at "
                         "--stride)"
                     )
+    # The eval's extra anchors are checked against the same window, after the
+    # spec's own seating: they sit behind its seated slots and may not repeat
+    # one. Eval-only like the reading above, so without a held-out set the flag
+    # is refused as inert; the resolver raises everything else and is called
+    # here for its refusals, the value derived again where it is used.
+    if args.eval_query_anchors is not None:
+        if not _has_held_out(args):
+            raise ValueError(
+                "--eval_query_anchors needs a held-out set (--val_scenes_file or "
+                "--eval_benchmark_dataset): the anchors only ever reach the "
+                "held-out eval, so without one they change nothing"
+            )
+        _eval_anchor_slots(args)
     # Canonical form, recorded everywhere the spec is recorded: format-only
     # normalization ("01:00" becomes "1:0"), order preserved -- the order is
     # stream-defining (see parse_query_anchor_slots).
@@ -3102,7 +3668,7 @@ def _plan_summary(tally, args) -> dict:
     transformed = sum(1 for plan in tally.planned if plan.scene_transform)
     # The reading the held-out eval scores on, or None when there is no
     # held-out set to score -- the convention realized_val_query_anchors keeps.
-    eval_source = _eval_query_anchor_source(args) if args.val_scenes_file else None
+    eval_source = _eval_query_anchor_source(args) if _has_held_out(args) else None
     return {
         "manifest_version_expected": MANIFEST_VERSION,
         "records_read": len(tally.planned) + len(tally.skipped),
@@ -3164,7 +3730,7 @@ def _plan_summary(tally, args) -> dict:
             # anything" and "a window that seats nothing" are different facts --
             # and the second one cannot reach here, _validate_args refuses it.
             "realized_val_query_anchors": (
-                _val_anchor_spec(args) if args.val_scenes_file else None
+                _val_anchor_spec(args) if _has_held_out(args) else None
             ),
             # Recorded because an unseeded table makes --time_indices inert and
             # the shuffled-index arm identical to the plain one: without this an
@@ -3401,6 +3967,22 @@ def _fork_commit(repo: Path) -> str | None:
     return commit if completed.returncode == 0 and commit else None
 
 
+@dataclass(frozen=True)
+class HeldOut:
+    """The held-out set a run scores: its plans and where they load from.
+
+    ``scene_provider`` serves ``plans`` -- the training provider for
+    --val_scenes_file's scenes, which the replay protocol loads like any step,
+    or a :class:`arc.training.scene_provider.BenchmarkSceneProvider`, which
+    loads a benchmark by its own. ``benchmark`` is what the eval records about
+    a benchmark (see :func:`_benchmark_record`), None for a scene list.
+    """
+
+    plans: list
+    scene_provider: object
+    benchmark: dict | None
+
+
 def run_training(
     *,
     model,
@@ -3412,7 +3994,7 @@ def run_training(
     step_fn=train_step,
     finish_window_fn=finish_window,
     output_dir: Path,
-    val_plans=None,
+    held_out: HeldOut | None = None,
 ) -> dict:
     """The loop: schedule, step, guard, checkpoint, and stop when asked.
 
@@ -3422,7 +4004,8 @@ def run_training(
     source plugs into: main() builds MVTrackerSceneProvider and wraps it.
     ``finish_window_fn`` is the same seam for the one boundary the loop closes
     itself -- a window whose last micro-step lost its scene -- so those tests
-    need no model with a real backbone either.
+    need no model with a real backbone either. ``held_out`` is the set scored at
+    every --eval_every, with its own provider, or None for no held-out eval.
     """
 
     # Captured BEFORE any optimizer.load_state_dict: that call overwrites each
@@ -3497,10 +4080,14 @@ def run_training(
 
     # Wrapped here rather than in main() so the wiring is on the path the CPU
     # tests already drive; main() cannot run without a GPU, so a fix installed
-    # there would be untested by construction. Both consumers are covered, since
-    # evaluate_held_out takes this same callable.
+    # there would be untested by construction. The held-out set's provider is
+    # wrapped the same way, and the preflight and every eval read it.
     scene_provider = cuda_scene_provider(scene_provider)
     cache = SceneCache(scene_provider, size=args.scene_cache)
+    val_plans = held_out.plans if held_out is not None else []
+    val_scene_provider = (
+        cuda_scene_provider(held_out.scene_provider) if held_out is not None else None
+    )
 
     # Prove the held-out set is reachable BEFORE spending training time on it.
     # Without this a wrong --val_data_root surfaces at the first eval, which at
@@ -3528,9 +4115,13 @@ def run_training(
     # The reading the held-out eval scores on, resolved once for the same
     # reason: the training source unless an eval flag overrides it.
     eval_anchor_source = _eval_query_anchor_source(args)
+    # The eval's extra anchors and the benchmark it scores, if any: eval-only,
+    # resolved once like the two above.
+    eval_query_anchors = _eval_anchor_spec(args)
+    benchmark = held_out.benchmark if held_out is not None else None
     unsupervisable: list[dict] = []
-    for plan in val_plans or []:
-        val_scene = scene_provider(plan)
+    for plan in val_plans:
+        val_scene = val_scene_provider(plan)
         val_correspondences, val_eligibility = build_anchor_correspondences(val_scene)
         if val_correspondences.count == 0:
             unsupervisable.append(
@@ -3564,7 +4155,7 @@ def run_training(
     # dump records is read once, and only when something will be dumped.
     visual_scenes = _resolve_visual_scenes(
         args.eval_visual_scenes,
-        [plan.seq_name for plan in val_plans or []],
+        [plan.seq_name for plan in val_plans],
         unsupervisable=[entry["scene"] for entry in unsupervisable],
     )
     run_identity = (
@@ -3866,7 +4457,7 @@ def run_training(
             metrics = evaluate_held_out(
                 model=model,
                 plans=val_plans,
-                scene_provider=scene_provider,
+                scene_provider=val_scene_provider,
                 precision=args.precision,
                 huber_delta_m=args.huber_delta_m,
                 step=completed,
@@ -3890,6 +4481,9 @@ def run_training(
                 visual_scenes=visual_scenes,
                 visual_stride=args.eval_visual_stride,
                 run_identity=run_identity,
+                # Eval-only too, and resolved before the loop like the source.
+                eval_query_anchors=eval_query_anchors,
+                benchmark=benchmark,
             )
             evaluations.append(metrics)
             print(
@@ -4521,7 +5115,7 @@ def main() -> None:
     try:
         check_anchor_slots_seat(
             tally.planned,
-            parse_query_anchor_slots(args.query_anchors),
+            parse_query_anchor_slots(args.query_anchors, flag="--query_anchors"),
             adaptive=args.adaptive_query_anchors,
         )
     except ValueError as exc:
@@ -4533,6 +5127,14 @@ def main() -> None:
 
     if not args.checkpoint_dir or not args.output_dir:
         parser.error("--checkpoint_dir and --output_dir are required to train")
+
+    # A benchmark is opened before the seeding and the model load: a wrong
+    # root, camera set, clip length or track cache is refused at no model
+    # load's cost, and opening it draws no randomness either way.
+    try:
+        benchmark_provider = _open_benchmark(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     import random
 
@@ -4607,19 +5209,21 @@ def main() -> None:
         min_shared_queries=args.min_shared_queries,
         honour_recorded_tracks=args.honour_recorded_tracks,
         max_depth=args.kubric_max_depth,
-        query_anchor_slots=parse_query_anchor_slots(args.query_anchors),
+        query_anchor_slots=parse_query_anchor_slots(
+            args.query_anchors, flag="--query_anchors"
+        ),
         adaptive_query_anchors=args.adaptive_query_anchors,
         input_depth=args.depth_input,
         input_camera_vectors=args.camera_input,
     )
-    val_plans = _val_plans(args)
-    if val_plans:
+    held_out = _held_out_set(args, provider, benchmark_provider)
+    if held_out is not None and held_out.plans:
         # anchors=SEATED/ASKED, so a spec deliberately wider than the held-out
         # window is readable from the log at step 0 rather than from an eval
         # directory that does not exist until the first boundary.
         realized = _val_anchor_spec(args)
         print(
-            f"held_out_scenes={len(val_plans)} "
+            f"held_out_scenes={len(held_out.plans)} "
             f"anchors={len(realized)}/{len(args.query_anchors)} "
             f"at --eval_every {args.eval_every}"
         )
@@ -4633,7 +5237,7 @@ def main() -> None:
         args=args,
         scene_provider=provider,
         output_dir=output_dir,
-        val_plans=val_plans,
+        held_out=held_out,
     )
 
     # train_step resets the CUDA peak counter at every accumulation-window
@@ -4790,7 +5394,9 @@ def _val_anchor_slots(args) -> tuple[tuple[int, int], ...]:
     val_times = _val_time_count(args)
     return tuple(
         (view_slot, time_slot)
-        for view_slot, time_slot in parse_query_anchor_slots(args.query_anchors)
+        for view_slot, time_slot in parse_query_anchor_slots(
+            args.query_anchors, flag="--query_anchors"
+        )
         if view_slot < len(args.val_cameras) and time_slot < val_times
     )
 
@@ -4805,6 +5411,88 @@ def _val_anchor_spec(args) -> list[str]:
 
     return [
         f"{view_slot}:{time_slot}" for view_slot, time_slot in _val_anchor_slots(args)
+    ]
+
+
+def _has_held_out(args) -> bool:
+    """Whether the run has a held-out set to score: a scene list or a benchmark.
+
+    Every eval-only flag and the held-out window's seating check gate on this
+    rather than on --val_scenes_file, so a benchmark-only run is checked
+    exactly like one with a scene list.
+    """
+
+    return bool(args.val_scenes_file or args.eval_benchmark_dataset)
+
+
+def _eval_anchor_slots(args) -> tuple[tuple[int, int], ...]:
+    """The held-out eval's extra anchor slots, purely from flags; empty when off.
+
+    They sit behind the seated training slots (:func:`_val_anchor_slots`):
+    ``all`` is every remaining (camera slot, time slot) pair of the held-out
+    window, time-major -- every camera of one time before the next time --
+    and VIEWSLOT:TIMESLOT strings are those slots, in the order given. Raises
+    for ``all`` beside slots, a malformed or repeated slot, one the window
+    cannot seat, and one the spec already seats, which would anchor one
+    observation twice.
+
+    Pure, like :func:`_eval_query_anchor_source`: _validate_args calls it for
+    its refusals and run_training, through :func:`_eval_anchor_spec`, for the
+    value.
+    """
+
+    values = args.eval_query_anchors
+    if values is None:
+        return ()
+    seated = _val_anchor_slots(args)
+    camera_count = len(args.val_cameras)
+    time_count = _val_time_count(args)
+    if "all" in values:
+        if len(values) > 1:
+            raise ValueError(
+                "--eval_query_anchors takes VIEWSLOT:TIMESLOT strings or 'all' "
+                f"alone, got {values}"
+            )
+        return tuple(
+            (view_slot, time_slot)
+            for time_slot in range(time_count)
+            for view_slot in range(camera_count)
+            if (view_slot, time_slot) not in seated
+        )
+    slots = parse_query_anchor_slots(values, flag="--eval_query_anchors")
+    for view_slot, time_slot in slots:
+        if view_slot >= camera_count:
+            raise ValueError(
+                f"--eval_query_anchors view slot {view_slot} does not fit the "
+                f"held-out window's {camera_count} cameras (--val_cameras)"
+            )
+        if time_slot >= time_count:
+            raise ValueError(
+                f"--eval_query_anchors time slot {time_slot} does not fit the "
+                f"held-out window's {time_count} times (the least of "
+                "--observation_budget // len(--val_cameras), --max_time_indices, "
+                "and the --val_seq_len clip at --stride)"
+            )
+        if (view_slot, time_slot) in seated:
+            raise ValueError(
+                f"--eval_query_anchors {view_slot}:{time_slot} is already a seated "
+                f"training anchor ({' '.join(_val_anchor_spec(args))}); the flag "
+                "adds anchors behind those"
+            )
+    return slots
+
+
+def _eval_anchor_spec(args) -> list[str] | None:
+    """:func:`_eval_anchor_slots` as canonical strings, or None without the flag.
+
+    None and [] say different things: no --eval_query_anchors, against an
+    ``all`` that found every pair of the window seated already.
+    """
+
+    if args.eval_query_anchors is None:
+        return None
+    return [
+        f"{view_slot}:{time_slot}" for view_slot, time_slot in _eval_anchor_slots(args)
     ]
 
 
@@ -4874,33 +5562,123 @@ def _val_plans(args) -> list[StepPlan]:
         return []
     names = json.loads(Path(args.val_scenes_file).read_text())
     cameras = tuple(args.val_cameras)
-    times, bound = _val_window(args)
+    window = _val_window(args)
     return [
-        StepPlan(
-            step=-1,
-            seq_name=str(name),
+        _held_out_plan(
+            args,
+            str(name),
             data_root=args.val_data_root,
             cameras=cameras,
-            times=times,
-            frame_start=0,
-            # The clip's length, as on a training plan, not the window's span:
-            # at budget 24 the span is 12 frames of a 24-frame clip.
-            seq_len=args.val_seq_len,
-            stride=args.stride,
-            # Which of the three terms decided T -- 'window' from budget 52 up,
-            # where the clip is shorter than the budget would allow.
-            time_bound=bound,
-            track_indices=(),
-            scene_transform=None,
-            depth_type="gt",
-            # No recorded pool: these scenes come from a JSON list, not from a
-            # manifest row, so there is no drawn-from count to check the loaded
-            # pool against. Asserting the held-out pool's size here would be
-            # inventing a fact rather than replaying one.
-            real_len=None,
+            window=window,
         )
         for name in names
     ]
+
+
+def _open_benchmark(args):
+    """The --eval_benchmark_dataset provider, or None without the flag.
+
+    Its window is the held-out one: the cameras must be --val_cameras and the
+    clip --val_seq_len, and its scenes are anchored at the training spec's
+    seated held-out slots, exactly as --val_scenes_file's are. Raises
+    ``ValueError`` for what opening the set reveals -- see
+    :class:`arc.training.scene_provider.BenchmarkSceneProvider`.
+    """
+
+    if not args.eval_benchmark_dataset:
+        return None
+    from arc.training.scene_provider import BenchmarkSceneProvider
+
+    return BenchmarkSceneProvider(
+        dataset_name=args.eval_benchmark_dataset,
+        dataset_root=args.eval_benchmark_root,
+        cameras=args.val_cameras,
+        seq_len=args.val_seq_len,
+        max_depth=args.kubric_max_depth,
+        query_anchor_slots=_val_anchor_slots(args),
+        size=args.size,
+        input_depth=args.depth_input,
+        input_camera_vectors=args.camera_input,
+    )
+
+
+def _held_out_set(args, provider, benchmark_provider) -> HeldOut | None:
+    """The held-out set run_training scores, or None without one.
+
+    A benchmark's scenes when one was opened -- they replace --val_scenes_file's
+    when both are given -- else the scene list's, on the training ``provider``,
+    which loads them by the replay protocol like any step.
+    """
+
+    if benchmark_provider is not None:
+        return HeldOut(
+            plans=_benchmark_plans(args, benchmark_provider),
+            scene_provider=benchmark_provider,
+            benchmark=_benchmark_record(args, benchmark_provider),
+        )
+    if args.val_scenes_file:
+        return HeldOut(plans=_val_plans(args), scene_provider=provider, benchmark=None)
+    return None
+
+
+def _benchmark_plans(args, provider) -> list[StepPlan]:
+    """A benchmark's test scenes as held-out plans, every one, in its own order.
+
+    On the dataset's own cameras -- equal to --val_cameras, which the provider
+    checked -- and on the same :func:`_val_window` the scene-list plans get,
+    so both held-out sources are scored on one window.
+    """
+
+    window = _val_window(args)
+    return [
+        _held_out_plan(
+            args,
+            name,
+            data_root=provider.data_root,
+            cameras=provider.cameras,
+            window=window,
+        )
+        for name in provider.scene_names
+    ]
+
+
+def _held_out_plan(args, name: str, *, data_root, cameras, window) -> StepPlan:
+    """One held-out scene's plan, on ``window`` (``_val_window``'s times and bound)."""
+
+    times, bound = window
+    return StepPlan(
+        step=-1,
+        seq_name=name,
+        data_root=data_root,
+        cameras=cameras,
+        times=times,
+        frame_start=0,
+        # The clip's length, as on a training plan, not the window's span:
+        # at budget 24 the span is 12 frames of a 24-frame clip.
+        seq_len=args.val_seq_len,
+        stride=args.stride,
+        # Which of the three terms decided T -- 'window' from budget 52 up,
+        # where the clip is shorter than the budget would allow.
+        time_bound=bound,
+        track_indices=(),
+        scene_transform=None,
+        depth_type="gt",
+        # No recorded pool: a held-out scene comes from a JSON list or a
+        # benchmark, never from a manifest row, so there is no drawn-from count
+        # to check the loaded pool against. Asserting the held-out pool's size
+        # here would be inventing a fact rather than replaying one.
+        real_len=None,
+    )
+
+
+def _benchmark_record(args, provider) -> dict:
+    """What the eval records about a benchmark: its identity and the window."""
+
+    times, _bound = _val_window(args)
+    return {
+        **provider.identity(),
+        "window": {"stride": args.stride, "covered_times": list(times)},
+    }
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from .dumped_kubric import (
     Observation,
     build_scene,
     scene_from_datapoint,
+    with_query_anchors,
 )
 from .schedule import (
     apply_learning_rate,
@@ -69,6 +70,7 @@ from .losses import (
 )
 from .sparse_tracking import (
     ELIGIBILITY_ASSIGNMENT_RULE,
+    ELIGIBILITY_PRIORITY_RULE,
     ELIGIBILITY_REJECTION_STAGES,
     ELIGIBILITY_ROLLUP_RULE,
     QUERY_ANCHOR_SOURCES,
@@ -105,6 +107,7 @@ __all__ = [
     "DEFAULT_CONFIDENCE_TAUS",
     "DEFAULT_CONFIDENCE_TAU_MULTIPLES",
     "ELIGIBILITY_ASSIGNMENT_RULE",
+    "ELIGIBILITY_PRIORITY_RULE",
     "ELIGIBILITY_REJECTION_STAGES",
     "ELIGIBILITY_ROLLUP_RULE",
     "QUERY_ANCHOR_SOURCES",
@@ -164,6 +167,7 @@ __all__ = [
     "require_cameras",
     "scene_from_datapoint",
     "select_times",
+    "with_query_anchors",
     "read_temporal_patch_metadata",
     "reconstruction_drift_report",
     "reconstruction_point_loss",
