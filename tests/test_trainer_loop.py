@@ -342,6 +342,15 @@ def _loop_args(tmp_path, **overrides):
         eval_query_anchors=None,
         eval_benchmark_dataset=None,
         eval_benchmark_root=None,
+        # Where the stream came from, read by _plan_summary's scene_source
+        # block and by nothing in the loop: a manifest, the mode every existing
+        # test assumes.
+        manifest="manifest.jsonl",
+        # The sampled stream's identity (REFUSED tier, absent default None),
+        # read by _checkpoint_settings and _plan_summary, so every loop test
+        # needs it present. None is manifest mode, the behaviour every existing
+        # test assumes; main() fills it in only under --scene_pool.
+        scene_sampler=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -5089,6 +5098,15 @@ def _validator_args(tmp_path, **overrides):
         # _validate_args parses this one in place, so unlike _loop_args it starts
         # as the parser's raw string.
         "confidence_alpha": "auto",
+        # The scene-source flags _validate_args settles first: a manifest (from
+        # _loop_args) and no pool, with every sampler flag at the parser's None
+        # default and neither action requested.
+        "scene_pool": None,
+        "sampler_from_manifest": None,
+        "build_pool_index": False,
+        "sampler_seed": None,
+        "view_count_weights": None,
+        "transform_probability": None,
     }
     merged.update(overrides)
     return _loop_args(tmp_path, **merged)

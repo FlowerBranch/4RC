@@ -7,6 +7,15 @@ all here, so ``--manifest`` trains end to end.  Scenes arrive through
 :class:`arc.training.scene_provider.MVTrackerSceneProvider`, which replays each
 record against MVTracker's own loader rather than a reimplementation.
 
+``--scene_pool`` trains WITHOUT a manifest: a seeded sampler
+(:mod:`arc.training.scene_sampler`) draws scenes, view sets and world transforms
+from a packed pool the way MVTracker's own loader would, as in-memory records of
+the manifest schema, and hands them to the same planner with the same arguments.
+Nothing past the plan differs between the two modes; the records are never
+written, and ``plan.json`` / ``run_summary.json`` say which source the run had
+(``scene_source``).  The pool is read through ``<pool>/pool_index.json``, built
+once on CPU by ``--build_pool_index``, so ``--plan_only`` still opens no scene.
+
 ``--query_anchors`` supervises several query anchors per step, as relative
 slots into each step's own window; the memory mechanism is the per-anchor
 track-head pass behind the encoder/head boundary in ``arc.training.runtime``
@@ -28,6 +37,7 @@ a manifest whose rows this trainer cannot replay shows up at submit time instead
 of twelve hours in.
 
   python train_temporal_tracking.py --manifest run/manifest.jsonl --plan_only
+  python train_temporal_tracking.py --scene_pool /data/pool --num_steps 20000 --plan_only
 """
 
 from __future__ import annotations
@@ -76,6 +86,20 @@ from arc.training.runtime import (
     weighted_anchor_total,
 )
 from arc.training.sample_manifest import MANIFEST_VERSION, read_manifest
+from arc.training.scene_sampler import (
+    DEFAULT_VIEW_COUNT_WEIGHTS,
+    LOADER_CLIP_FRAMES,
+    ScenePoolError,
+    build_pool_index,
+    check_view_count_weights,
+    compare_sampler_against_manifest,
+    format_view_count_weights,
+    parse_view_count_weights,
+    plan_pool,
+    read_pool_index,
+    sampler_identity,
+    write_pool_index,
+)
 from arc.training.scene_provider import (
     SceneProviderError,
     benchmark_name_refusal,
@@ -112,13 +136,10 @@ DEFAULT_MAX_TIME_INDICES = 32
 # How many frames every held-out clip carries, so the held-out window can be
 # clamped to it at parse time, with no scene load, exactly as select_times clamps
 # a training step to its row's seq_len. Loader configuration rather than scene
-# data: KubricMultiViewDataset.from_name emits "seq_len": 24 on the evaluation
-# path (kubric_multiview_dataset.py:133), the constructor defaults to the same
-# (:209), and __getitem__ crops every longer clip to exactly seq_len (:826-841).
-# MVTrackerSceneProvider.dataset_overrides deliberately leaves seq_len alone; if
-# a seq_len override is ever added there, this default must move with it, or the
-# parse-time window and the loaded clip desync silently.
-DEFAULT_VAL_SEQ_LEN = 24
+# data, and the same fact that bounds every sampled training window, so it is
+# imported from the sampler module that cites the loader for it (and says what
+# must move with a seq_len override) rather than written here a second time.
+DEFAULT_VAL_SEQ_LEN = LOADER_CLIP_FRAMES
 # Above this share of unreplayable rows the manifest is damaged rather than
 # merely untidy, and training on the remainder would be training on a fraction of
 # the recorded stream while every other number looked healthy.
@@ -406,11 +427,12 @@ class SceneCache:
     Keying on the scene *name* alone would be wrong: cameras, times and anchors
     all vary per step, and the correspondences are derived from them, so two
     steps on the same scene with different windows need different objects. The
-    key is therefore everything ``build_scene`` consumed.  The anchor *spec* is
-    deliberately absent from it: the slots are run-constant (validated and
-    canonicalized before the loop starts), so each step's absolute anchors are
-    a pure function of the spec and the keyed window, and adding them would
-    only re-encode the key.
+    key is therefore everything ``build_scene`` consumed, plus the world
+    transform the provider applies to the sample before ``build_scene`` sees it.
+    The anchor *spec* is deliberately absent from it: the slots are
+    run-constant (validated and canonicalized before the loop starts), so each
+    step's absolute anchors are a pure function of the spec and the keyed
+    window, and adding them would only re-encode the key.
 
     Size one, and the previous entry is dropped *before* the next load starts —
     with the caller's own reference cleared first, or the loop's local keeps the
@@ -438,7 +460,20 @@ class SceneCache:
 
     @staticmethod
     def key(plan: StepPlan) -> tuple:
-        return (plan.data_root, plan.seq_name, plan.cameras, plan.times)
+        # The transform is in the key because the provider applies it to the
+        # sample before the window is built: two steps on the same scene,
+        # cameras and times under different transforms are different scenes,
+        # and without it the second step trained on the first step's geometry.
+        # Falsy (None or {}) reads as "no transform", exactly as
+        # apply_recorded_scene_transform reads it.
+        transform = plan.scene_transform
+        return (
+            plan.data_root,
+            plan.seq_name,
+            plan.cameras,
+            plan.times,
+            None if not transform else tuple(sorted(transform.items())),
+        )
 
     @staticmethod
     def fingerprint(scene) -> tuple:
@@ -2586,12 +2621,18 @@ def check_anchor_slots_seat(planned, anchor_slots, *, adaptive: bool) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Replay an MVTracker sample manifest to train 4RC temporal tracking"
+        description=(
+            "Train 4RC temporal tracking by replaying an MVTracker sample manifest "
+            "(--manifest) or by sampling a packed scene pool (--scene_pool)"
+        )
     )
     parser.add_argument(
         "--manifest",
-        required=True,
-        help="MVTracker manifest.jsonl to replay, in file order",
+        default=None,
+        help=(
+            "MVTracker manifest.jsonl to replay, in file order. Exactly one of "
+            "--manifest and --scene_pool is required"
+        ),
     )
     parser.add_argument(
         "--observation_budget",
@@ -2701,14 +2742,106 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--max_records",
         type=int,
         default=None,
-        help="Plan only the first N records; for eyeballing a long manifest",
+        help=(
+            "Plan only the first N records; for eyeballing a long manifest "
+            "(manifest mode only: a sampled plan is exactly --num_steps long)"
+        ),
     )
     parser.add_argument("--json_out", help="Write the plan report as JSON")
+
+    pool = parser.add_argument_group(
+        "scene pool",
+        "Train WITHOUT a manifest: sample scenes, view sets and world transforms "
+        "from a packed pool the way MVTracker's loader draws them, and plan them "
+        "with the same planner. The pool is read through <pool>/pool_index.json",
+    )
+    pool.add_argument(
+        "--scene_pool",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Packed scene pool to sample from: the directory a manifest row names "
+            "as data_root, holding <scene>.zip archives or scene directories. "
+            "Needs DIR/pool_index.json (see --build_pool_index). Exactly one of "
+            "--manifest and --scene_pool is required"
+        ),
+    )
+    pool.add_argument(
+        "--sampler_seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed of the sampler's own RandomState, which decides the whole "
+            "stream: epoch order, view counts, view sets and transforms. Part of "
+            "the checkpoint's refused resume identity (default: --seed)"
+        ),
+    )
+    pool.add_argument(
+        "--view_count_weights",
+        metavar="COUNT:WEIGHT,...",
+        default=None,
+        help=(
+            "Per-step view-count distribution. Per scene, the counts above the "
+            "scene's own view count are dropped and the rest renormalised, so the "
+            "weights need not sum to one, and a scene no listed count fits is "
+            "skipped that epoch. A listed count below --min_views is refused, "
+            "because the planner would skip every step drawn at it. '1:1.0' with "
+            "--min_views 1 is the single-view control; "
+            "'1:0.20,2:0.10,3:0.10,4:0.25,5:0.10,6:0.25' with --min_views 1 is "
+            "MVTracker's own draw, monocular mass included "
+            f"(default: {DEFAULT_VIEW_COUNT_WEIGHTS}, that draw at --min_views 2)"
+        ),
+    )
+    pool.add_argument(
+        "--transform_probability",
+        type=float,
+        default=None,
+        help=(
+            "Share of sampled steps carrying a world transform, drawn as "
+            "MVTracker draws it: scale U(0.8, 1.5), rotation about x then y, each "
+            "U(-15, 15) degrees. The values are drawn for every step and this "
+            "only decides whether a step carries them, so two runs differing in "
+            "it see the same scenes and views (default: 1.0, as every replayed "
+            "manifest row carries one)"
+        ),
+    )
+    pool.add_argument(
+        "--build_pool_index",
+        action="store_true",
+        help=(
+            "Action: scan --scene_pool once on CPU, write DIR/pool_index.json "
+            "(scene names in MVTracker's order, view count per scene, a content "
+            "hash) and exit. Sampling refuses a pool without it, which is what "
+            "keeps --plan_only reading no scene data"
+        ),
+    )
+    pool.add_argument(
+        "--sampler_from_manifest",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Diagnostic, not a training mode: feed every planned row of this "
+            "manifest -- its scene, views, frame_start and transform -- through "
+            "the sampler's record builder and check that the result plans field "
+            "for field as the manifest replay does. Takes neither --manifest nor "
+            "--scene_pool; exits 1 on any difference"
+        ),
+    )
 
     training = parser.add_argument_group("training")
     training.add_argument("--checkpoint_dir", help="Released 4RC weights to start from")
     training.add_argument("--output_dir", help="Checkpoints, logs and run_summary.json")
-    training.add_argument("--num_steps", type=int, default=20000)
+    training.add_argument(
+        "--num_steps",
+        type=int,
+        default=20000,
+        help=(
+            "Micro-steps to train. With --manifest the loop replays "
+            "plans[step %% len(plans)]; with --scene_pool the sampled plan is "
+            "exactly this long, so give the --plan_only pass the training value "
+            "(default: %(default)s)"
+        ),
+    )
     training.add_argument(
         "--warmup_steps",
         type=int,
@@ -3363,6 +3496,79 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"--observation_budget {args.observation_budget} cannot seat even one "
             f"time at --min_views {args.min_views}"
         )
+    # Which scene source the run has, settled before the sampler flags are read:
+    # every one of them is refused or resolved against it.
+    if args.sampler_from_manifest is not None:
+        if args.manifest is not None or args.scene_pool is not None:
+            raise ValueError(
+                "--sampler_from_manifest is a diagnostic over one manifest and "
+                "takes neither --manifest nor --scene_pool"
+            )
+    elif (args.manifest is None) == (args.scene_pool is None):
+        raise ValueError(
+            "exactly one of --manifest and --scene_pool is required: a manifest "
+            "replays MVTracker's recorded stream, a pool samples one"
+        )
+    pool_mode = args.scene_pool is not None
+    if args.build_pool_index and not pool_mode:
+        raise ValueError("--build_pool_index needs --scene_pool: it indexes that pool")
+    if not pool_mode:
+        # Refused rather than ignored: a submit script that passed one beside
+        # --manifest would otherwise believe it took effect.
+        for flag in ("sampler_seed", "view_count_weights", "transform_probability"):
+            if getattr(args, flag) is not None:
+                raise ValueError(
+                    f"--{flag} needs --scene_pool: it configures the scene "
+                    "sampler, and a replayed manifest already fixes every draw"
+                )
+    else:
+        if args.max_records is not None:
+            raise ValueError(
+                "--max_records needs --manifest: a sampled plan is exactly "
+                "--num_steps long, so there is no record list to truncate"
+            )
+        if str(args.scene_pool) in {str(root) for root in args.exclude_data_root}:
+            raise ValueError(
+                f"--exclude_data_root {str(args.scene_pool)!r} names --scene_pool "
+                "itself; every sampled record carries the pool as its data_root, "
+                "so the run would plan nothing"
+            )
+    # The sampler's own settings, resolved only when a stream will be drawn:
+    # --build_pool_index reads none of them, so a --min_views the weights
+    # cannot meet must not refuse building the index it would need anyway.
+    if pool_mode and not args.build_pool_index:
+        if args.sampler_seed is None:
+            args.sampler_seed = args.seed
+        # RandomState's own range, refused here by flag name rather than as
+        # numpy's ValueError from inside the first draw.
+        if not 0 <= args.sampler_seed <= 2**32 - 1:
+            raise ValueError(
+                f"--sampler_seed {args.sampler_seed} is outside [0, 2**32 - 1], "
+                "the range numpy's RandomState accepts (it defaults to --seed)"
+            )
+        if args.transform_probability is None:
+            args.transform_probability = 1.0
+        if not (
+            math.isfinite(args.transform_probability)
+            and 0 <= args.transform_probability <= 1
+        ):
+            raise ValueError("--transform_probability must be in [0, 1]")
+        args.transform_probability = float(args.transform_probability)
+        weights = parse_view_count_weights(
+            DEFAULT_VIEW_COUNT_WEIGHTS
+            if args.view_count_weights is None
+            else args.view_count_weights
+        )
+        check_view_count_weights(
+            weights, min_views=args.min_views, budget=args.observation_budget
+        )
+        # Canonical form, recorded everywhere the weights are recorded: the
+        # checkpoint compares settings, not spellings ("2:0.10" is "2:0.1").
+        args.view_count_weights = format_view_count_weights(weights)
+    # Derived, like resolved_confidence_alpha: None here, and main() fills in
+    # the sampler's identity once the pool index is read -- before any
+    # checkpoint or summary reads it. None IS the answer in manifest mode.
+    args.scene_sampler = None
     if (
         not math.isfinite(args.time_embedding_init_scale)
         or args.time_embedding_init_scale <= 0
@@ -3654,6 +3860,26 @@ def _validate_args(args: argparse.Namespace) -> None:
     ]
 
 
+def _scene_source(tally, args) -> dict:
+    """What the plan was built from: the manifest's path, or the pool and its draw.
+
+    The pool block is the checkpoint's refused ``scene_sampler`` identity plus
+    the tally's coverage -- how many scenes the index lists, how many of them
+    seat a listed view count, and how many epochs the draw ran to reach
+    --num_steps.  The one key a sampled run adds to plan.json.
+    """
+
+    if args.scene_sampler is None:
+        return {"kind": "manifest", "manifest": str(args.manifest)}
+    return {
+        "kind": "pool",
+        **args.scene_sampler,
+        "scene_count": tally.scene_count,
+        "admissible_scenes": tally.admissible_scenes,
+        "epochs_drawn": tally.epochs_drawn,
+    }
+
+
 def _plan_summary(tally, args) -> dict:
     strides = Counter(plan.stride for plan in tally.planned)
     bounds = Counter(plan.time_bound for plan in tally.planned)
@@ -3671,6 +3897,7 @@ def _plan_summary(tally, args) -> dict:
     eval_source = _eval_query_anchor_source(args) if _has_held_out(args) else None
     return {
         "manifest_version_expected": MANIFEST_VERSION,
+        "scene_source": _scene_source(tally, args),
         "records_read": len(tally.planned) + len(tally.skipped),
         "planned_steps": len(tally.planned),
         "skipped": tally.skip_counts,
@@ -3832,6 +4059,7 @@ def _print_plan(tally, summary, *, limit: int = 20) -> None:
 
     print()
     for key in (
+        "scene_source",
         "records_read",
         "planned_steps",
         "distinct_scenes",
@@ -4601,6 +4829,13 @@ def _checkpoint_settings(args) -> dict:
         # The plan summary's name for --exclude_data_root, so the checkpoint
         # and run_summary.json read alike.
         "excluded_data_roots": list(args.exclude_data_root),
+        # Which scene source the stream was drawn from. None for a replayed
+        # manifest, whose rows fix every draw; for a sampled pool the sampler's
+        # identity -- pool path, index content hash, seed, canonical weights
+        # and transform probability -- which with the plan keys above decides
+        # every drawn step. A plain dict of str/int/float, so it round-trips
+        # through weights_only=True and compares with == like any other value.
+        "scene_sampler": args.scene_sampler,
         # The canonical order-preserving strings, as a list: torch.load with
         # weights_only=True hands back a list, and ['0:0'] != ('0:0',) would
         # spuriously refuse every legitimate resume if a tuple were stored.
@@ -4716,7 +4951,8 @@ def _write_checkpoint(
 
 # The two tiers mirror _checkpoint_settings, split by consequence. The refused
 # keys decide which plans main() builds (budget, stride, min_views,
-# max_time_indices, the excluded roots), what the loader hands those plans
+# max_time_indices, the excluded roots, and scene_sampler -- the sampled
+# stream's identity when there is no manifest), what the loader hands those plans
 # (kubric_max_depth moves geometry and labels), which observations each step
 # supervises and how the loss reduces over them (query_anchors, plus
 # adaptive_query_anchors, which decides whether those slots bind on every step
@@ -4786,6 +5022,7 @@ _RESUME_SETTINGS_REFUSED = (
     "min_views",
     "max_time_indices",
     "excluded_data_roots",
+    "scene_sampler",
     "query_anchors",
     "adaptive_query_anchors",
     "val_cameras",
@@ -4894,6 +5131,11 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # there. The clamp at 24 reproduces the surviving windows bit for bit, so
     # absence resolves to the default and any other value is refused.
     "val_seq_len": DEFAULT_VAL_SEQ_LEN,
+    # A checkpoint from before --scene_pool could only have been written by a
+    # manifest replay: no sampler existed. So absence resolves to None, every
+    # earlier checkpoint resumes silently in manifest mode, and resuming one
+    # under a sampled pool is refused like any changed value.
+    "scene_sampler": None,
 }
 
 
@@ -5025,6 +5267,70 @@ def _gate_verdicts(summary: dict) -> dict:
     }
 
 
+def _build_pool_index_action(args, parser) -> None:
+    """``--build_pool_index``: scan the pool once, write its index, report."""
+
+    try:
+        document, zero_view = build_pool_index(args.scene_pool)
+    except ScenePoolError as exc:
+        parser.error(str(exc))
+    path = write_pool_index(args.scene_pool, document)
+    for name in zero_view:
+        print(
+            f"WARNING scene {name!r} has no views and is left out of the index, "
+            "as MVTracker's loader leaves it out of the pool",
+            file=sys.stderr,
+        )
+    print(
+        f"pool_index={path} scenes={document['scene_count']} "
+        f"content_hash={document['content_hash']}"
+    )
+
+
+def _sampler_from_manifest_action(args, parser, plan_kwargs) -> bool:
+    """``--sampler_from_manifest``: the like-for-like check; True on PASS."""
+
+    manifest_path = Path(args.sampler_from_manifest)
+    if not manifest_path.is_file():
+        parser.error(f"manifest not found: {manifest_path}")
+    records = read_manifest(manifest_path)
+    if args.max_records is not None:
+        records = records[: args.max_records]
+    if not records:
+        parser.error(f"{manifest_path} holds no records")
+    result = compare_sampler_against_manifest(records, **plan_kwargs)
+    limit = 20
+    for step, seq_name, differences in result["mismatched"][:limit]:
+        shown = " ".join(
+            f"{name}: manifest={reference!r} sampler={sampled!r}"
+            for name, (reference, sampled) in differences.items()
+        )
+        print(f"MISMATCH step={step} scene={seq_name} {shown}")
+    if len(result["mismatched"]) > limit:
+        print(f"... {len(result['mismatched']) - limit} more mismatches")
+    print(
+        f"compared={result['compared']} mismatched={len(result['mismatched'])} "
+        f"inexpressible={result['inexpressible']}"
+    )
+    sys.stdout.flush()
+    if result["mismatched"]:
+        print(
+            f"FAIL the sampler's record builder does not reproduce "
+            f"{len(result['mismatched'])} of {result['compared']} planned rows of "
+            f"{manifest_path}",
+            file=sys.stderr,
+        )
+        return False
+    if result["compared"] == 0:
+        print(f"FAIL no row of {manifest_path} planned, so nothing was compared", file=sys.stderr)
+        return False
+    print(
+        f"PASS the sampler's record builder reproduces all {result['compared']} "
+        f"planned rows of {manifest_path} field for field"
+    )
+    return True
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -5033,37 +5339,82 @@ def main() -> None:
     except ValueError as exc:
         parser.error(str(exc))
 
-    manifest_path = Path(args.manifest)
-    if not manifest_path.is_file():
-        parser.error(f"manifest not found: {manifest_path}")
-    records = read_manifest(manifest_path)
-    if args.max_records is not None:
-        records = records[: args.max_records]
-    if not records:
-        parser.error(f"{manifest_path} holds no records")
+    if args.build_pool_index:
+        _build_pool_index_action(args, parser)
+        return
 
-    versions = {record.get("manifest_version") for record in records}
-    if versions != {MANIFEST_VERSION}:
-        print(
-            f"WARNING manifest_version {sorted(versions, key=str)} against the "
-            f"vendored schema's {MANIFEST_VERSION}; a key may have changed "
-            "meaning. Re-vendor arc/training/sample_manifest.py from mvtracker "
-            "rather than reading the difference by hand.",
-            file=sys.stderr,
-        )
+    # One kwargs dict for every route into the planner -- the manifest replay,
+    # the sampled pool and the sampler diagnostic -- so the three cannot drift.
+    plan_kwargs = dict(
+        available_cameras=None,
+        budget=args.observation_budget,
+        stride=args.stride,
+        max_time_indices=args.max_time_indices,
+        min_views=args.min_views,
+        excluded_data_roots=args.exclude_data_root,
+    )
 
-    try:
-        tally = plan_manifest(
-            records,
-            available_cameras=None,
-            budget=args.observation_budget,
-            stride=args.stride,
-            max_time_indices=args.max_time_indices,
-            min_views=args.min_views,
-            excluded_data_roots=args.exclude_data_root,
+    if args.sampler_from_manifest is not None:
+        if not _sampler_from_manifest_action(args, parser, plan_kwargs):
+            raise SystemExit(1)
+        return
+
+    if args.manifest is not None:
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_file():
+            parser.error(f"manifest not found: {manifest_path}")
+        records = read_manifest(manifest_path)
+        if args.max_records is not None:
+            records = records[: args.max_records]
+        if not records:
+            parser.error(f"{manifest_path} holds no records")
+
+        versions = {record.get("manifest_version") for record in records}
+        if versions != {MANIFEST_VERSION}:
+            print(
+                f"WARNING manifest_version {sorted(versions, key=str)} against the "
+                f"vendored schema's {MANIFEST_VERSION}; a key may have changed "
+                "meaning. Re-vendor arc/training/sample_manifest.py from mvtracker "
+                "rather than reading the difference by hand.",
+                file=sys.stderr,
+            )
+
+        try:
+            tally = plan_manifest(records, **plan_kwargs)
+        except ManifestPlanError as exc:
+            parser.error(str(exc))
+        source_label = str(manifest_path)
+    else:
+        # The index, never the archives: --plan_only keeps its "no scene data"
+        # promise, and a stale or missing index is refused by name here.
+        try:
+            index = read_pool_index(args.scene_pool)
+        except ScenePoolError as exc:
+            parser.error(str(exc))
+        args.scene_sampler = sampler_identity(
+            pool=args.scene_pool,
+            index=index,
+            sampler_seed=args.sampler_seed,
+            view_count_weights=args.view_count_weights,
+            transform_probability=args.transform_probability,
         )
-    except ManifestPlanError as exc:
-        parser.error(str(exc))
+        try:
+            tally = plan_pool(
+                index,
+                data_root=str(args.scene_pool),
+                num_steps=args.num_steps,
+                seed=args.sampler_seed,
+                weights=parse_view_count_weights(args.view_count_weights),
+                transform_probability=args.transform_probability,
+                **plan_kwargs,
+            )
+        except ScenePoolError as exc:
+            parser.error(str(exc))
+        source_label = (
+            f"pool {args.scene_pool} (seed {args.sampler_seed}, "
+            f"{tally.epochs_drawn} epoch(s) over {tally.admissible_scenes} of "
+            f"{tally.scene_count} scenes)"
+        )
 
     summary = _plan_summary(tally, args)
     _print_plan(tally, summary)
@@ -5122,7 +5473,7 @@ def main() -> None:
         parser.error(str(exc))
 
     if args.plan_only:
-        print(f"PASS planned {len(tally.planned)} steps from {manifest_path}")
+        print(f"PASS planned {len(tally.planned)} steps from {source_label}")
         return
 
     if not args.checkpoint_dir or not args.output_dir:
@@ -5297,7 +5648,8 @@ def main() -> None:
         # held-out set, under which loss and clip. Every one of these had to be
         # recovered from the sbatch script to read an archived summary, which is
         # in the other repo and moves independently of this one.
-        "manifest": str(args.manifest),
+        # None for a sampled run; scene_source above says what it was instead.
+        "manifest": None if args.manifest is None else str(args.manifest),
         "checkpoint_dir": str(args.checkpoint_dir),
         "dataset_name": args.dataset_name,
         "size": args.size,

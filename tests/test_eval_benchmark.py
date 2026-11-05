@@ -27,7 +27,14 @@ from arc.training.scene_provider import SceneProviderError, benchmark_name_refus
 from scene_fixtures import fixture_datapoint
 from test_eval_query_anchors import _SlotRecordingArc, _without_new_keys
 from test_manifest_plan import _record, _write_manifest
-from test_trainer_loop import _EVAL_ALPHA, _FakeArc, _loop_args, _plan_only, _plans
+from test_trainer_loop import (
+    _EVAL_ALPHA,
+    _FakeArc,
+    _loop_args,
+    _plan_only,
+    _plans,
+    _validator_args,
+)
 
 _NAME = "kubric-multiview-v3-views01-cached"
 _CACHE = "cachedtracks--stub"
@@ -371,7 +378,7 @@ def test_a_benchmark_is_opened_before_the_model_loads(tmp_path, benchmark, monke
     ids=["no_root", "no_name", "other_family", "not_cached", "eval_off"],
 )
 def test_the_benchmark_flags_are_refused_at_parse_time(tmp_path, overrides, message):
-    args = _loop_args(
+    args = _validator_args(
         tmp_path,
         **{
             "max_unreplayable_fraction": 0.02,
@@ -415,7 +422,7 @@ def test_the_benchmark_is_a_held_out_set_of_its_own(tmp_path):
         eval_benchmark_dataset="kubric-multiview-v3-views0123-cached",
         eval_benchmark_root="/bench",
     )
-    args = _loop_args(
+    args = _validator_args(
         tmp_path,
         **base,
         eval_query_anchors=["all"],
@@ -428,10 +435,10 @@ def test_the_benchmark_is_a_held_out_set_of_its_own(tmp_path):
     # The two aliases of the eval source, one at a time: they gate on the same
     # held-out set.
     for alias in ("oracle_query_anchor", "ground_truth_query_anchor"):
-        train_cli._validate_args(_loop_args(tmp_path, **base, **{alias: True}))
+        train_cli._validate_args(_validator_args(tmp_path, **base, **{alias: True}))
 
     with pytest.raises(ValueError, match="time slot 12 does not fit the held-out window"):
-        train_cli._validate_args(_loop_args(tmp_path, **base, query_anchors=["0:12"]))
+        train_cli._validate_args(_validator_args(tmp_path, **base, query_anchors=["0:12"]))
 
 
 def test_the_plan_summary_names_the_benchmark_eval(tmp_path, monkeypatch):
