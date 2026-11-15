@@ -32,7 +32,7 @@ from arc.training.diagnostics import (
     confidence_occlusion_diagnostics,
     temporal_velocity_stats,
 )
-from arc.training.dumped_kubric import DumpedKubricScene
+from arc.training.dumped_kubric import DumpedKubricScene, validate_query_points
 from arc.training.losses import (
     adjacent_pair_indices,
     compose_tracking_loss,
@@ -1529,29 +1529,8 @@ def build_anchor_correspondences(
         scene.trajectories_world.detach().cpu().numpy().astype(np.float64)
     )
     visibility = scene.visibility.detach().cpu().numpy().astype(bool)
-    query_times_float = query_points[:, 0]
-    if not np.isfinite(query_times_float).all():
-        raise ValueError("query_points[:,0] contains NaN or Inf")
-    rounded_query_times = np.rint(query_times_float).astype(np.int64)
-    if not np.allclose(query_times_float, rounded_query_times, atol=1e-6):
-        raise ValueError("query_points[:,0] must contain integer frame indices")
-    if np.any(rounded_query_times < 0) or np.any(
-        rounded_query_times >= trajectories.shape[0]
-    ):
-        raise ValueError("query_points contains an out-of-range query time")
-
+    rounded_query_times = validate_query_points(query_points, trajectories)
     track_indices = np.arange(query_points.shape[0])
-    expected_query_xyz = trajectories[rounded_query_times, track_indices]
-    if not np.allclose(
-        query_points[:, 1:],
-        expected_query_xyz,
-        atol=1e-5,
-        rtol=1e-5,
-        equal_nan=False,
-    ):
-        raise ValueError(
-            "query_points XYZ does not match traj3d_world at its query time"
-        )
 
     total_query_count = int(query_points.shape[0])
     slot_cameras = scene.slot_cameras.detach().cpu().numpy()

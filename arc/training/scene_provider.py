@@ -45,6 +45,14 @@ every MVTracker sample more than rgb jitter would, and is already accepted as
 unreplayable.  What the pairing controls is which samples arrive in which order,
 never the training recipe.
 
+**The extra pool is the one exception, because no MVTracker loader reads it.**
+``--extra_pool`` clips are 4I4's Syn4D conversion in the dump format, already
+assembled by the converter; :class:`DumpClipSceneProvider` reads their arrays and
+frames, and shares everything after that with the Kubric path -- MVTracker's
+``transform_scene`` through :func:`apply_recorded_scene_transform`, the anchor
+slots, the track-pool guard, the label-depth cap and ``build_scene``.
+:class:`SceneProviderByRoot` sends each plan to the provider of its pool.
+
 Importing MVTracker is deferred to the first load: this module is imported by the
 trainer's tests, which run in an environment where ``mvtracker`` is deliberately
 absent.
@@ -54,8 +62,9 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
+from typing import Mapping, Sequence
 
 import numpy as np
 import torch
@@ -178,6 +187,42 @@ def apply_recorded_scene_transform(sample, scene_transform: dict | None):
     return sample
 
 
+def checked_anchor_slots(query_anchor_slots) -> tuple[tuple[int, int], ...]:
+    """Relative ``(view_slot, time_slot)`` pairs as ints, negatives refused.
+
+    :func:`resolve_anchor_slots` checks only the upper bound, so a -1 would
+    otherwise wrap via Python indexing to the LAST camera and anchor a
+    different observation than any documented slot meaning, silently.
+    """
+
+    slots = []
+    for view_slot, time_slot in query_anchor_slots:
+        view_slot, time_slot = int(view_slot), int(time_slot)
+        if view_slot < 0 or time_slot < 0:
+            raise ValueError(
+                f"query anchor slot {view_slot}:{time_slot} is negative; "
+                "slots index the step's own window and never wrap"
+            )
+        slots.append((view_slot, time_slot))
+    return tuple(slots)
+
+
+def require_track_pool(seq_name: str, count: int, minimum: int) -> None:
+    """Refuse a scene whose own eligible pool is too small to be worth a step.
+
+    The message keeps "eligible tracks", which is how the trainer's
+    ``scene_skip_cause`` files it under ``pool_too_small``.
+    """
+
+    if count < minimum:
+        raise SceneProviderError(
+            f"scene {seq_name!r}: only {count} eligible tracks, below "
+            f"--min_shared_queries {minimum}. This is a scene "
+            "whose own pool is too small to be worth a step, not a failure to "
+            "match a recorded draw"
+        )
+
+
 def resolve_anchor_slots(slots, plan, *, adaptive: bool) -> tuple[tuple[int, int], ...]:
     """A plan's absolute ``(camera id, original time)`` anchors, from relative slots.
 
@@ -276,20 +321,8 @@ class MVTrackerSceneProvider:
         # plan's own ordered cameras and times, in priority order -- the first
         # is primary and owns the Sim(3). The default resolves to
         # (plan.cameras[0], plan.times[0]), which is build_scene's own default
-        # anchor, so it changes nothing. Negatives are refused at construction:
-        # resolve_query_anchors checks only the upper bound, so a -1 would
-        # otherwise wrap via Python indexing to the LAST camera and anchor a
-        # different observation than any documented slot meaning, silently.
-        slots = []
-        for view_slot, time_slot in query_anchor_slots:
-            view_slot, time_slot = int(view_slot), int(time_slot)
-            if view_slot < 0 or time_slot < 0:
-                raise ValueError(
-                    f"query anchor slot {view_slot}:{time_slot} is negative; "
-                    "slots index the step's own window and never wrap"
-                )
-            slots.append((view_slot, time_slot))
-        self.query_anchor_slots = tuple(slots)
+        # anchor, so it changes nothing. Negatives are refused at construction.
+        self.query_anchor_slots = checked_anchor_slots(query_anchor_slots)
         # Whether the spec is a per-step ceiling or a per-run contract; see
         # resolve_query_anchors. Off is the contract every archived run trained
         # under.
@@ -465,13 +498,7 @@ class MVTrackerSceneProvider:
         # The guard is on the pool, on both routes. Applying it to the matched
         # count instead would re-impose what the inversion removed -- a small
         # intersection is the *expected* case under V6(c), not a broken scene.
-        if len(pool) < self.min_shared_queries:
-            raise SceneProviderError(
-                f"scene {plan.seq_name!r}: only {len(pool)} eligible tracks, below "
-                f"--min_shared_queries {self.min_shared_queries}. This is a scene "
-                "whose own pool is too small to be worth a step, not a failure to "
-                "match a recorded draw"
-            )
+        require_track_pool(plan.seq_name, len(pool), self.min_shared_queries)
 
         if not (self.honour_recorded_tracks and plan.track_indices):
             return TrackSelection(
@@ -559,6 +586,189 @@ class MVTrackerSceneProvider:
             input_depth_max=self.max_depth if self.input_depth else None,
             input_camera_vectors=self.input_camera_vectors,
         )
+
+
+class DumpClipSceneProvider:
+    """``StepPlan -> DumpedKubricScene`` for a pool of dump-format clips (``--extra_pool``).
+
+    The clips are 4I4's Syn4D conversion: arrays and frames already at the
+    trainer's working resolution, read through ``arc.training.dump_clip`` and
+    checked by ``dumped_kubric.read_clip`` against the format contract at every
+    load.  Every malformed clip -- a missing member or key, a shape or dtype
+    that breaks the contract, a non-finite camera, a query off its trajectory,
+    a frames.zip that does not hold exactly V x T frames, a frame that is not
+    RGB at the depth grid -- raises :class:`SceneProviderError` naming the clip,
+    so the step loop's skip policy absorbs it as one skipped scene.  A
+    mis-sized anchor spec stays a ``ValueError`` and still ends the run, as on
+    the Kubric path.
+
+    What it shares with :class:`MVTrackerSceneProvider`, by the same code: the
+    anchor slots and their resolution, the ``--min_shared_queries`` guard over
+    the clip's own tracks (every track is supervised, as for an empty
+    ``track_indices``), the world transform (``apply_recorded_scene_transform``,
+    so ``track_upscaling_factor`` absorbs the scale), ``build_scene``, and the
+    one depth cap: label depth beyond ``max_depth`` is zeroed before the
+    transform, as MVTracker's loader zeroes Kubric's (kubric_multiview_dataset.py
+    :882, strict ``>``), and under --depth_input the same number is the input's
+    invalidity threshold.
+
+    **Views are positions.**  The sampler draws a clip's views from
+    ``range(view_count)``, the index's count of its ``view_ids``, so
+    ``plan.cameras`` are positions on the clip's view axis.  They become camera
+    ids through ``view_ids`` before ``build_scene`` resolves them back, which is
+    the identity for a clip whose ids are 0..V-1 and the right camera for one
+    whose converter dropped a view (``[0, 1, 3, 5, 6, 7]``).
+
+    Each pool is listed once, on its first plan, and the listing's size is
+    checked against ``plan.real_len`` -- the index's count -- on every plan, as
+    the Kubric provider checks its loader's.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int = 512,
+        patch_size: int = 14,
+        min_shared_queries: int = 64,
+        max_depth: float = 24.0,
+        query_anchor_slots: Sequence[tuple[int, int]] = ((0, 0),),
+        adaptive_query_anchors: bool = False,
+        input_depth: bool = False,
+        input_camera_vectors: bool = False,
+    ):
+        self.size = size
+        self.patch_size = patch_size
+        self.min_shared_queries = min_shared_queries
+        self.max_depth = float(max_depth)
+        self.query_anchor_slots = checked_anchor_slots(query_anchor_slots)
+        self.adaptive_query_anchors = bool(adaptive_query_anchors)
+        self.input_depth = input_depth
+        self.input_camera_vectors = input_camera_vectors
+        self._listings: dict[str, dict[str, str]] = {}
+
+    def clip_path(self, plan) -> str:
+        """Where ``plan``'s clip is, from the pool's listing, checked against ``real_len``."""
+
+        from arc.training.dump_clip import CLIP_POOL_KIND
+        from arc.training.scene_sampler import ScenePoolError, list_pool
+
+        root = plan.data_root
+        listing = self._listings.get(root)
+        if listing is None:
+            try:
+                listing = list_pool(root, kind=CLIP_POOL_KIND)
+            except ScenePoolError as error:
+                raise SceneProviderError(f"the clip pool at {root!r} cannot be listed: {error}") from error
+            self._listings[root] = listing
+        if plan.real_len is not None and len(listing) != plan.real_len:
+            raise SceneProviderError(
+                f"the clip pool at {root!r} holds {len(listing)} clips but the plan "
+                f"recorded real_len={plan.real_len}: it was drawn from an index of a "
+                "different pool. Rebuild the index with --build_pool_index"
+            )
+        path = listing.get(plan.seq_name)
+        if path is None:
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the pool at {root!r} "
+                f"({len(listing)} clips)"
+            )
+        return path
+
+    def __call__(self, plan):
+        from arc.training.dump_clip import ClipFormatError, open_clip
+        from arc.training.dumped_kubric import build_scene, clip_frames, read_clip
+
+        # Before any read: a slot this step cannot seat is a configuration error
+        # in strict mode (see MVTrackerSceneProvider.resolve_query_anchors).
+        resolve_anchor_slots(
+            self.query_anchor_slots, plan, adaptive=self.adaptive_query_anchors
+        )
+        path = self.clip_path(plan)
+        label = f"clip {plan.seq_name!r} at {path}"
+        try:
+            with open_clip(path) as clip:
+                arrays = read_clip(clip, name=plan.seq_name)
+                outside = [view for view in plan.cameras if view >= arrays.view_count]
+                if outside:
+                    raise SceneProviderError(
+                        f"{label} has {arrays.view_count} views, but the plan draws "
+                        f"view position(s) {outside}: the pool index is stale"
+                    )
+                late = [time for time in plan.times if time >= arrays.time_count]
+                if late:
+                    raise SceneProviderError(
+                        f"{label} has {arrays.time_count} frames, but the step's "
+                        f"window reaches frame(s) {late}"
+                    )
+                require_track_pool(
+                    plan.seq_name, arrays.track_count, self.min_shared_queries
+                )
+                camera_ids = tuple(int(arrays.view_ids[view]) for view in plan.cameras)
+                anchors = resolve_anchor_slots(
+                    self.query_anchor_slots,
+                    replace(plan, cameras=camera_ids),
+                    adaptive=self.adaptive_query_anchors,
+                )
+                depth = arrays.depth
+                depth[depth > self.max_depth] = 0.0
+                # The Kubric path's own transform, on the four fields it moves and
+                # the factor it divides; both are read back from the namespace.
+                sample = SimpleNamespace(
+                    videodepth=torch.from_numpy(depth),
+                    extrs=torch.from_numpy(arrays.extrinsics),
+                    query_points_3d=torch.from_numpy(arrays.query_points),
+                    trajectory_3d=torch.from_numpy(arrays.trajectories),
+                    track_upscaling_factor=arrays.track_upscaling_factor,
+                )
+                apply_recorded_scene_transform(sample, plan.scene_transform)
+                archive = clip.frames()
+                return build_scene(
+                    name=plan.seq_name,
+                    open_frames=lambda positions, times: clip_frames(
+                        archive, positions, times, grid=arrays.grid, label=str(path)
+                    ),
+                    query_points=sample.query_points_3d,
+                    trajectories=sample.trajectory_3d,
+                    visibility=arrays.visibility,
+                    intrinsics=arrays.intrinsics,
+                    extrinsics=sample.extrs,
+                    depth0=sample.videodepth[:, 0],
+                    depth=sample.videodepth,
+                    view_ids=arrays.view_ids,
+                    track_upscaling_factor=float(sample.track_upscaling_factor),
+                    cameras=camera_ids,
+                    times=plan.times,
+                    query_anchors=anchors,
+                    size=self.size,
+                    patch_size=self.patch_size,
+                    input_depth_max=self.max_depth if self.input_depth else None,
+                    input_camera_vectors=self.input_camera_vectors,
+                    source=str(path),
+                )
+        except ClipFormatError as error:
+            raise SceneProviderError(f"{label} is malformed: {error}") from error
+
+
+class SceneProviderByRoot:
+    """Route each plan to the provider of the pool it was drawn from.
+
+    Keyed on ``plan.data_root``, which the sampler sets to the pool's own flag
+    value.  A root no provider serves is a wiring bug, not a bad scene, so it
+    raises ``RuntimeError`` -- never the ``SceneProviderError`` the step loop
+    would absorb as a skip.
+    """
+
+    def __init__(self, providers: Mapping[str, object]):
+        self.providers = dict(providers)
+
+    def __call__(self, plan):
+        provider = self.providers.get(plan.data_root)
+        if provider is None:
+            raise RuntimeError(
+                f"no scene provider serves data_root {plan.data_root!r}; this run's "
+                f"pools are {sorted(self.providers)}"
+            )
+        return provider(plan)
 
 
 # --- Held-out benchmarks. The eval can score an MVTracker benchmark in place of

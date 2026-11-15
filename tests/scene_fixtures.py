@@ -264,3 +264,90 @@ def fixture_datapoint(**scene_parameters) -> SimpleNamespace:
         track_upscaling_factor=float(arrays["track_upscaling_factor"]),
         sample_views=list(arrays["view_ids"]),
     )
+
+
+def dump_clip_members(datapoint, *, name: str) -> dict:
+    """A Datapoint written in the dump-format clip layout, as editable parts.
+
+    ``{"meta": {key: array}, "depth": (V,T,1,H,W) array, "frames": {member:
+    PNG bytes}}`` -- what 4I4's clip writer puts in meta.npz, depth_full.npz and
+    frames.zip, with ``seq_name`` the clip's name and ``view_ids`` the
+    Datapoint's ``sample_views``.  A test corrupts one part and writes the rest
+    with :func:`write_dump_clip`.
+    """
+
+    depth = datapoint.videodepth.numpy().astype(np.float32)
+    video = datapoint.video.numpy()
+    frames = {}
+    for view in range(video.shape[0]):
+        for time_index in range(video.shape[1]):
+            buffer = io.BytesIO()
+            Image.fromarray(video[view, time_index].transpose(1, 2, 0)).save(
+                buffer, format="PNG"
+            )
+            frames[f"view_{view}/{time_index:04d}.png"] = buffer.getvalue()
+    meta = {
+        "seq_name": np.array(name),
+        "query_points": datapoint.query_points_3d.numpy().astype(np.float32),
+        "traj3d_world": datapoint.trajectory_3d.numpy().astype(np.float32),
+        "visibility": datapoint.visibility.numpy().astype(bool),
+        "intrs": datapoint.intrs.numpy().astype(np.float32),
+        "extrs": datapoint.extrs.numpy().astype(np.float32),
+        "depth0": depth[:, 0].copy(),
+        "view_ids": np.array(datapoint.sample_views, dtype=np.int64),
+        "track_upscaling_factor": np.float64(datapoint.track_upscaling_factor),
+    }
+    return {"meta": meta, "depth": depth, "frames": frames}
+
+
+def write_dump_clip(pool, name: str, members: dict, *, as_zip: bool = False):
+    """Write :func:`dump_clip_members`' parts as ``<pool>/<name>/`` or ``<pool>/<name>.zip``.
+
+    The three members sit side by side, at the zip's root for a zip clip, and
+    every archive is stored, as the converter writes them.  A part set to None
+    is left out, a part given as ``bytes`` is written verbatim, and ``depth``
+    given as a dict is written as depth_full.npz's whole key set.  Returns the
+    clip's path.
+    """
+
+    import zipfile
+    from pathlib import Path
+
+    def npz_bytes(arrays):
+        buffer = io.BytesIO()
+        np.savez_compressed(buffer, **arrays)
+        return buffer.getvalue()
+
+    def frames_bytes(frames):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+            for member, payload in frames.items():
+                archive.writestr(member, payload)
+        return buffer.getvalue()
+
+    def encoded(part, encode):
+        return part if isinstance(part, bytes) else encode(part)
+
+    files = {}
+    if members.get("meta") is not None:
+        files["meta.npz"] = encoded(members["meta"], npz_bytes)
+    if members.get("depth") is not None:
+        depth = members["depth"]
+        files["depth_full.npz"] = encoded(
+            depth, lambda d: npz_bytes(d if isinstance(d, dict) else {"depth": d})
+        )
+    if members.get("frames") is not None:
+        files["frames.zip"] = encoded(members["frames"], frames_bytes)
+    pool = Path(pool)
+    pool.mkdir(parents=True, exist_ok=True)
+    if as_zip:
+        path = pool / f"{name}.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
+            for member, payload in files.items():
+                archive.writestr(member, payload)
+        return path
+    path = pool / name
+    path.mkdir()
+    for member, payload in files.items():
+        (path / member).write_bytes(payload)
+    return path

@@ -7,12 +7,18 @@ to synchronized observations.
 :func:`build_scene` owns every derivation that turns arrays plus frames into a
 scene; :func:`scene_from_datapoint` is its front-end for a live MVTracker
 ``Datapoint``.  A live sample always carries per-frame depth, so an anchor may
-sit at any original time.  (The ``dumped_kubric`` and ``DumpedKubricScene``
-names predate the live path; nothing here reads a dump.)
+sit at any original time.
+
+The extra training pool's dump-format clips are the other source: :func:`read_clip`
+checks one clip's arrays against the format contract and :func:`clip_frames` decodes
+its frames for ``build_scene``, the way the retired disk loader fed the same core.
+``arc.training.dump_clip`` finds the members; ``DumpClipSceneProvider`` puts the two
+together.
 """
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
@@ -20,6 +26,18 @@ from typing import Sequence
 import numpy as np
 import torch
 from PIL import Image
+
+from arc.training.dump_clip import (
+    DEPTH_KEY,
+    DEPTH_NAME,
+    FRAMES_NAME,
+    META_KEYS,
+    META_NAME,
+    ClipFormatError,
+    checked_view_ids,
+    open_clip,
+    reading,
+)
 
 # The optional geometry-input view keys --depth_input / --camera_input attach.
 # Spelled to match Arc.DEPTH_KEY / Arc.CAMERA_VECTOR_KEY; duplicated rather
@@ -500,6 +518,41 @@ def _validate_scene_arrays(
         raise ValueError(
             f"depth0 must have shape (V,1,H,W), got {depth0.shape}"
         )
+
+
+def validate_query_points(query_points: np.ndarray, trajectories: np.ndarray) -> np.ndarray:
+    """Every query names an integer frame of the clip and sits on its trajectory there.
+
+    ``query_points`` is ``(N, 4)`` ``[t, x, y, z]`` and ``trajectories`` ``(T, N, 3)``;
+    returns the query times as int64.  ``build_anchor_correspondences`` holds every
+    scene to this at every step, and the clip provider checks a clip against it
+    before caching one, where a failure is one skipped scene rather than a dead run.
+    """
+
+    query_times_float = query_points[:, 0]
+    if not np.isfinite(query_times_float).all():
+        raise ValueError("query_points[:,0] contains NaN or Inf")
+    rounded_query_times = np.rint(query_times_float).astype(np.int64)
+    if not np.allclose(query_times_float, rounded_query_times, atol=1e-6):
+        raise ValueError("query_points[:,0] must contain integer frame indices")
+    if np.any(rounded_query_times < 0) or np.any(
+        rounded_query_times >= trajectories.shape[0]
+    ):
+        raise ValueError("query_points contains an out-of-range query time")
+
+    track_indices = np.arange(query_points.shape[0])
+    expected_query_xyz = trajectories[rounded_query_times, track_indices]
+    if not np.allclose(
+        query_points[:, 1:],
+        expected_query_xyz,
+        atol=1e-5,
+        rtol=1e-5,
+        equal_nan=False,
+    ):
+        raise ValueError(
+            "query_points XYZ does not match traj3d_world at its query time"
+        )
+    return rounded_query_times
 
 
 def _as_numpy(value, dtype):
@@ -1002,5 +1055,291 @@ def scene_from_datapoint(
         verbose=verbose,
         source=f"<live sample {sample.seq_name}>",
     )
+
+
+# --- Dump-format clips (the extra training pool). One contract, checked here at
+# every load and by --check_clips at index time, and mirrored on the writing side
+# by 4I4's triton/syn4d/check_clip.py. Every violation is a ClipFormatError naming
+# the clip and the member, which the provider turns into a skipped scene.
+
+# meta.npz's floating arrays, by their names in the file.
+_CLIP_FLOAT_KEYS = ("query_points", "traj3d_world", "intrs", "extrs", "depth0")
+
+
+@dataclass(frozen=True)
+class ClipArrays:
+    """One clip's arrays as stored, checked against the dump-format contract.
+
+    Fresh arrays the caller owns.  ``depth`` is the full per-frame depth, as
+    stored; ``depth0`` is not kept, because the contract makes it ``depth[:, 0]``
+    exactly and the provider takes it after the world transform.
+    """
+
+    seq_name: str
+    query_points: np.ndarray
+    trajectories: np.ndarray
+    visibility: np.ndarray
+    intrinsics: np.ndarray
+    extrinsics: np.ndarray
+    depth: np.ndarray
+    view_ids: np.ndarray
+    track_upscaling_factor: float
+
+    @property
+    def view_count(self) -> int:
+        return int(self.visibility.shape[0])
+
+    @property
+    def time_count(self) -> int:
+        return int(self.trajectories.shape[0])
+
+    @property
+    def track_count(self) -> int:
+        return int(self.trajectories.shape[1])
+
+    @property
+    def grid(self) -> tuple[int, int]:
+        return int(self.depth.shape[-2]), int(self.depth.shape[-1])
+
+
+def _read_clip_meta(clip, *, name: str) -> dict:
+    """meta.npz, every key present and checked; the float arrays as float32 copies."""
+
+    label = clip.label
+    with reading(label, META_NAME):
+        with clip.load_npz(META_NAME) as meta:
+            missing = [key for key in META_KEYS if key not in meta.files]
+            if missing:
+                raise ClipFormatError(f"{label}: {META_NAME} lacks {missing}")
+            stored = {key: meta[key] for key in META_KEYS}
+        seq_name = stored["seq_name"]
+        if (
+            seq_name.shape != ()
+            or seq_name.dtype.kind not in "US"
+            or str(seq_name) != name
+        ):
+            raise ClipFormatError(
+                f"{label}: {META_NAME} seq_name {seq_name!r} is not a string equal "
+                f"to the clip's listed name {name!r}"
+            )
+        for key in _CLIP_FLOAT_KEYS:
+            if not np.issubdtype(stored[key].dtype, np.floating):
+                raise ClipFormatError(
+                    f"{label}: {META_NAME} {key} must be floating, got {stored[key].dtype}"
+                )
+        if stored["visibility"].dtype != np.bool_:
+            raise ClipFormatError(
+                f"{label}: {META_NAME} visibility must be bool, got "
+                f"{stored['visibility'].dtype}"
+            )
+        arrays = {
+            key: np.array(stored[key], dtype=np.float32, copy=True)
+            for key in _CLIP_FLOAT_KEYS
+        }
+        visibility = np.array(stored["visibility"], dtype=bool, copy=True)
+        _validate_scene_arrays(
+            query_points=arrays["query_points"],
+            trajectories=arrays["traj3d_world"],
+            visibility=visibility,
+            intrinsics=arrays["intrs"],
+            extrinsics=arrays["extrs"],
+            depth0=arrays["depth0"],
+        )
+        for key in _CLIP_FLOAT_KEYS:
+            if not np.isfinite(arrays[key]).all():
+                raise ClipFormatError(f"{label}: {META_NAME} {key} is not finite")
+        view_ids = checked_view_ids(stored["view_ids"], label)
+        if view_ids.shape[0] != visibility.shape[0]:
+            raise ClipFormatError(
+                f"{label}: {META_NAME} view_ids names {view_ids.shape[0]} views, "
+                f"but the arrays carry {visibility.shape[0]}"
+            )
+        factor = np.asarray(stored["track_upscaling_factor"])
+        if factor.size != 1 or factor.dtype.kind not in "iuf":
+            raise ClipFormatError(
+                f"{label}: {META_NAME} track_upscaling_factor must be one number, "
+                f"got {factor!r}"
+            )
+        factor = float(factor.reshape(()))
+        if not np.isfinite(factor) or factor <= 0:
+            raise ClipFormatError(
+                f"{label}: {META_NAME} track_upscaling_factor must be finite and "
+                f"positive, got {factor}"
+            )
+        # The check build_anchor_correspondences makes at every step, on the
+        # float32 values the scene will carry.
+        validate_query_points(
+            arrays["query_points"].astype(np.float64),
+            arrays["traj3d_world"].astype(np.float64),
+        )
+    return {
+        "seq_name": name,
+        "query_points": arrays["query_points"],
+        "trajectories": arrays["traj3d_world"],
+        "visibility": visibility,
+        "intrinsics": arrays["intrs"],
+        "extrinsics": arrays["extrs"],
+        "depth0": arrays["depth0"],
+        "view_ids": view_ids,
+        "track_upscaling_factor": factor,
+    }
+
+
+def _check_frame_members(archive, *, view_count: int, time_count: int, label: str) -> None:
+    """frames.zip holds exactly one PNG per (view position, frame); directory entries aside."""
+
+    names = {name for name in archive.namelist() if not name.endswith("/")}
+    expected = {
+        _frame_member_name(view, time_index)
+        for view in range(view_count)
+        for time_index in range(time_count)
+    }
+    if names != expected:
+        missing = sorted(expected - names)
+        unexpected = sorted(names - expected)
+        raise ClipFormatError(
+            f"{label}: {FRAMES_NAME} must hold exactly view_<v>/<t:04d>.png for "
+            f"{view_count} views x {time_count} frames; {len(missing)} missing "
+            f"(first {missing[:3]}), {len(unexpected)} unexpected (first {unexpected[:3]})"
+        )
+
+
+def read_clip(clip, *, name: str) -> ClipArrays:
+    """One open clip's arrays, checked against the dump-format contract.
+
+    meta.npz in full (``_read_clip_meta``), depth_full.npz's ``depth`` --
+    ``(V,T,1,H,W)``, floating, finite, non-negative, its first frame exactly
+    ``depth0`` -- and the frames.zip member set.  The frames themselves are
+    decoded later by :func:`clip_frames`, only those a step selects.
+    """
+
+    label = clip.label
+    meta = _read_clip_meta(clip, name=name)
+    view_count, time_count = meta["visibility"].shape[:2]
+    with reading(label, DEPTH_NAME):
+        with clip.load_npz(DEPTH_NAME) as sidecar:
+            if DEPTH_KEY not in sidecar.files:
+                raise ClipFormatError(
+                    f"{label}: {DEPTH_NAME} lacks {DEPTH_KEY!r}; found {sorted(sidecar.files)}"
+                )
+            depth = sidecar[DEPTH_KEY]
+        if not np.issubdtype(depth.dtype, np.floating):
+            raise ClipFormatError(
+                f"{label}: {DEPTH_NAME} {DEPTH_KEY} must be floating, got {depth.dtype}"
+            )
+        depth = np.asarray(depth, dtype=np.float32)
+        _validate_depth(
+            depth,
+            source=f"{label} {DEPTH_NAME}",
+            view_count=view_count,
+            time_count=time_count,
+            depth0=meta["depth0"],
+        )
+        if not np.isfinite(depth).all() or np.any(depth < 0):
+            raise ClipFormatError(
+                f"{label}: {DEPTH_NAME} {DEPTH_KEY} must be finite and non-negative "
+                "(0 marks an invalid pixel)"
+            )
+    with reading(label, FRAMES_NAME):
+        _check_frame_members(
+            clip.frames(), view_count=view_count, time_count=time_count, label=label
+        )
+    return ClipArrays(
+        seq_name=meta["seq_name"],
+        query_points=meta["query_points"],
+        trajectories=meta["trajectories"],
+        visibility=meta["visibility"],
+        intrinsics=meta["intrinsics"],
+        extrinsics=meta["extrinsics"],
+        depth=depth,
+        view_ids=meta["view_ids"],
+        track_upscaling_factor=meta["track_upscaling_factor"],
+    )
+
+
+def clip_frames(archive, view_positions, times, *, grid, label: str):
+    """``build_scene``'s frame source over an open frames.zip, camera-major.
+
+    ``view_positions`` are positions on the clip's view axis -- what
+    ``build_scene`` hands its source after resolving camera ids -- so the member
+    is ``view_<position>/<t:04d>.png``.  Each frame is decoded here, and refused
+    unless it is RGB at the depth grid ``(H, W)``.
+    """
+
+    for view in view_positions:
+        for time_index in times:
+            member = _frame_member_name(view, time_index)
+            with reading(label, f"{FRAMES_NAME}/{member}"):
+                image = Image.open(io.BytesIO(archive.read(member)))
+                image.load()
+            if image.mode != "RGB":
+                raise ClipFormatError(
+                    f"{label}: {FRAMES_NAME}/{member} is mode {image.mode}, not RGB"
+                )
+            if (image.height, image.width) != tuple(grid):
+                raise ClipFormatError(
+                    f"{label}: {FRAMES_NAME}/{member} is {(image.height, image.width)} "
+                    f"(H, W), but the clip's depth grid is {tuple(grid)}"
+                )
+            yield view, time_index, f"{label}/{FRAMES_NAME}/{member}", image
+
+
+def _npy_header(npz, key: str) -> tuple[tuple[int, ...], np.dtype]:
+    """Shape and dtype of one npz array from its ``.npy`` header, without reading the data."""
+
+    with npz.zip.open(f"{key}.npy") as handle:
+        version = np.lib.format.read_magic(handle)
+        if version == (1, 0):
+            shape, _, dtype = np.lib.format.read_array_header_1_0(handle)
+        elif version == (2, 0):
+            shape, _, dtype = np.lib.format.read_array_header_2_0(handle)
+        else:
+            raise ClipFormatError(f"{key}.npy has unsupported npy format version {version}")
+    return tuple(int(size) for size in shape), dtype
+
+
+def check_clip(path, *, name: str, min_frames: int) -> list[str]:
+    """``--check_clips``: one clip against the contract, at index time; ``[]`` when it passes.
+
+    meta.npz in full through the load path's own checks, depth_full.npz's shape
+    and dtype from its ``.npy`` header (the array is not decompressed), the
+    frames.zip member set, and at least ``min_frames`` frames -- the window every
+    step is planned on.  Frames are not decoded.
+    """
+
+    problems = []
+    try:
+        with open_clip(path) as clip:
+            meta = _read_clip_meta(clip, name=name)
+            view_count, time_count = meta["visibility"].shape[:2]
+            height, width = meta["depth0"].shape[-2:]
+            if time_count < min_frames:
+                problems.append(
+                    f"{clip.label}: {time_count} frames, fewer than the "
+                    f"{min_frames}-frame window every step is planned on"
+                )
+            with reading(clip.label, DEPTH_NAME):
+                with clip.load_npz(DEPTH_NAME) as sidecar:
+                    if DEPTH_KEY not in sidecar.files:
+                        raise ClipFormatError(
+                            f"{clip.label}: {DEPTH_NAME} lacks {DEPTH_KEY!r}"
+                        )
+                    shape, dtype = _npy_header(sidecar, DEPTH_KEY)
+                expected = (view_count, time_count, 1, height, width)
+                if shape != expected or not np.issubdtype(dtype, np.floating):
+                    raise ClipFormatError(
+                        f"{clip.label}: {DEPTH_NAME} {DEPTH_KEY} is {shape} {dtype}, "
+                        f"expected floating {expected}"
+                    )
+            with reading(clip.label, FRAMES_NAME):
+                _check_frame_members(
+                    clip.frames(),
+                    view_count=view_count,
+                    time_count=time_count,
+                    label=clip.label,
+                )
+    except ClipFormatError as error:
+        problems.append(str(error))
+    return problems
 
 

@@ -15,6 +15,10 @@ Nothing past the plan differs between the two modes; the records are never
 written, and ``plan.json`` / ``run_summary.json`` say which source the run had
 (``scene_source``).  The pool is read through ``<pool>/pool_index.json``, built
 once on CPU by ``--build_pool_index``, so ``--plan_only`` still opens no scene.
+``--extra_pool`` mixes a second pool into that stream -- dump-format clips (4I4's
+Syn4D conversion), drawn on ``--extra_pool_weight`` of the steps and served by
+:class:`arc.training.scene_provider.DumpClipSceneProvider`; each plan goes to the
+provider of the pool it came from.  Without the flag nothing here changes.
 
 ``--query_anchors`` supervises several query anchors per step, as relative
 slots into each step's own window; the memory mechanism is the per-anchor
@@ -38,6 +42,8 @@ of twelve hours in.
 
   python train_temporal_tracking.py --manifest run/manifest.jsonl --plan_only
   python train_temporal_tracking.py --scene_pool /data/pool --num_steps 20000 --plan_only
+  python train_temporal_tracking.py --scene_pool /data/pool --extra_pool /data/clips \
+      --extra_pool_weight 0.3 --num_steps 20000 --plan_only
 """
 
 from __future__ import annotations
@@ -85,17 +91,25 @@ from arc.training.runtime import (
     tracking_only,
     weighted_anchor_total,
 )
+from arc.training.dump_clip import CLIP_POOL_KIND
+from arc.training.dumped_kubric import check_clip
 from arc.training.sample_manifest import MANIFEST_VERSION, read_manifest
 from arc.training.scene_sampler import (
     DEFAULT_VIEW_COUNT_WEIGHTS,
+    EXTRA_POOL,
     LOADER_CLIP_FRAMES,
+    SCENE_POOL,
+    ExtraPool,
     ScenePoolError,
+    build_clip_pool_index,
     build_pool_index,
     check_view_count_weights,
     compare_sampler_against_manifest,
     format_view_count_weights,
     parse_view_count_weights,
+    list_pool,
     plan_pool,
+    read_clip_pool_index,
     read_pool_index,
     sampler_identity,
     write_pool_index,
@@ -323,6 +337,7 @@ def check_scene_skip_rate(
     max_fraction: float,
     max_consecutive: int,
     min_attempts: int = 50,
+    pool: str | None = None,
 ) -> None:
     """Abort when scene loads fail systematically, with the tally.
 
@@ -337,13 +352,19 @@ def check_scene_skip_rate(
     applies once ``min_attempts`` steps have been tried. A run of *consecutive*
     failures needs no denominator and is what a broken root actually looks like,
     so it catches the same fault within a few steps instead of fifty.
+
+    ``pool`` names the pool when the counts are one pool's of a mixed run: the
+    loop applies both rules to each pool's own draws as well as to the run, so
+    a broken pool drawn on a small share of the steps cannot hide under the
+    other's successes.
     """
 
     total = sum(skips.values())
     causes = dict(sorted(skips.items()))
+    where = "" if pool is None else f"{pool}: "
     if consecutive >= max_consecutive:
         raise RuntimeError(
-            f"{consecutive} consecutive steps could not load their scene "
+            f"{where}{consecutive} consecutive steps could not load their scene "
             f"(--max_consecutive_scene_skips {max_consecutive}); causes: {causes}. "
             "A run of failures back to back is a broken data root, not bad luck"
         )
@@ -353,7 +374,7 @@ def check_scene_skip_rate(
     if fraction <= max_fraction:
         return
     raise RuntimeError(
-        f"{total} of {attempted} steps could not load their scene "
+        f"{where}{total} of {attempted} steps could not load their scene "
         f"({fraction:.1%} > --max_scene_skip_fraction {max_fraction:.1%}); "
         f"causes: {causes}. This is a broken data root or an over-restricted "
         "pool, not a few bad scenes"
@@ -366,6 +387,7 @@ def check_unsupervisable_rate(
     attempted: int,
     max_fraction: float,
     min_attempts: int = 50,
+    pool: str | None = None,
 ) -> None:
     """Abort when too many attempted steps loaded a scene nothing could supervise.
 
@@ -376,7 +398,8 @@ def check_unsupervisable_rate(
     Over steps ATTEMPTED in this invocation, not planned, so a resumed segment
     reads its own rate. No consecutive rule: that rule is what a broken data
     root looks like, and a broken root cannot produce this error, because every
-    scene counted here loaded.
+    scene counted here loaded.  ``pool`` names the pool when the counts are one
+    pool's of a mixed run, as for :func:`check_scene_skip_rate`.
     """
 
     if attempted < min_attempts or not skipped:
@@ -384,8 +407,9 @@ def check_unsupervisable_rate(
     fraction = skipped / attempted
     if fraction <= max_fraction:
         return
+    where = "" if pool is None else f"{pool}: "
     raise RuntimeError(
-        f"{skipped} of {attempted} steps loaded a scene no anchor could supervise "
+        f"{where}{skipped} of {attempted} steps loaded a scene no anchor could supervise "
         f"({fraction:.1%} > --max_unsupervisable_fraction {max_fraction:.1%}). "
         "This is an anchor spec that does not fit the stream, not a few bad "
         "scenes: anchoring at another time reaches queries that do not start at "
@@ -2806,13 +2830,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     pool.add_argument(
+        "--extra_pool",
+        metavar="DIR",
+        default=None,
+        help=(
+            "A second pool mixed into the --scene_pool stream: dump-format clips "
+            "(meta.npz, depth_full.npz and frames.zip in <clip>/ or at the root of "
+            "<clip>.zip), listed by name. Each step draws from it with probability "
+            "--extra_pool_weight, from its own epoch shuffle; needs "
+            "DIR/pool_index.json (see --build_pool_index). Refused beside --manifest"
+        ),
+    )
+    pool.add_argument(
+        "--extra_pool_weight",
+        type=float,
+        metavar="P",
+        default=None,
+        help=(
+            "Per-step probability of drawing from --extra_pool, in (0, 1]; "
+            "required with it. Part of the checkpoint's refused resume identity"
+        ),
+    )
+    pool.add_argument(
         "--build_pool_index",
         action="store_true",
         help=(
-            "Action: scan --scene_pool once on CPU, write DIR/pool_index.json "
-            "(scene names in MVTracker's order, view count per scene, a content "
-            "hash) and exit. Sampling refuses a pool without it, which is what "
-            "keeps --plan_only reading no scene data"
+            "Action: scan each pool given -- --scene_pool and/or --extra_pool -- "
+            "once on CPU, write DIR/pool_index.json (names in the pool's order, view "
+            "count per scene, a content hash) and exit. Sampling refuses a pool "
+            "without it, which is what keeps --plan_only reading no scene data. An "
+            "extra-pool clip that seats none of --view_count_weights' counts (the "
+            "default if not given) is refused, naming it"
+        ),
+    )
+    pool.add_argument(
+        "--check_clips",
+        action="store_true",
+        help=(
+            "With --extra_pool --build_pool_index: also check every clip against "
+            "the format contract while indexing -- meta.npz in full, "
+            "depth_full.npz's shape from its header, the frames.zip member list, at "
+            "least the 24-frame planned window -- and write no index if one fails. "
+            "Off by default: the converter checks every clip as it writes it"
         ),
     )
     pool.add_argument(
@@ -3497,41 +3556,86 @@ def _validate_args(args: argparse.Namespace) -> None:
             f"time at --min_views {args.min_views}"
         )
     # Which scene source the run has, settled before the sampler flags are read:
-    # every one of them is refused or resolved against it.
+    # every one of them is refused or resolved against it. The one shape with
+    # neither --manifest nor --scene_pool is indexing the extra pool on its own.
+    index_only = (
+        args.build_pool_index
+        and args.extra_pool is not None
+        and args.manifest is None
+        and args.scene_pool is None
+    )
     if args.sampler_from_manifest is not None:
-        if args.manifest is not None or args.scene_pool is not None:
+        if (
+            args.manifest is not None
+            or args.scene_pool is not None
+            or args.extra_pool is not None
+        ):
             raise ValueError(
                 "--sampler_from_manifest is a diagnostic over one manifest and "
-                "takes neither --manifest nor --scene_pool"
+                "takes neither --manifest nor --scene_pool nor --extra_pool"
             )
-    elif (args.manifest is None) == (args.scene_pool is None):
+    elif not index_only and (args.manifest is None) == (args.scene_pool is None):
         raise ValueError(
             "exactly one of --manifest and --scene_pool is required: a manifest "
             "replays MVTracker's recorded stream, a pool samples one"
         )
     pool_mode = args.scene_pool is not None
-    if args.build_pool_index and not pool_mode:
-        raise ValueError("--build_pool_index needs --scene_pool: it indexes that pool")
-    if not pool_mode:
+    if args.build_pool_index and not pool_mode and args.extra_pool is None:
+        raise ValueError(
+            "--build_pool_index needs --scene_pool or --extra_pool: it indexes each "
+            "pool given"
+        )
+    if args.check_clips and not (args.build_pool_index and args.extra_pool is not None):
+        raise ValueError(
+            "--check_clips needs --extra_pool --build_pool_index: it checks the "
+            "extra pool's clips while indexing them"
+        )
+    if not pool_mode and not index_only:
         # Refused rather than ignored: a submit script that passed one beside
         # --manifest would otherwise believe it took effect.
-        for flag in ("sampler_seed", "view_count_weights", "transform_probability"):
+        for flag in (
+            "sampler_seed",
+            "view_count_weights",
+            "transform_probability",
+            "extra_pool",
+            "extra_pool_weight",
+        ):
             if getattr(args, flag) is not None:
                 raise ValueError(
                     f"--{flag} needs --scene_pool: it configures the scene "
                     "sampler, and a replayed manifest already fixes every draw"
                 )
-    else:
+    elif pool_mode:
         if args.max_records is not None:
             raise ValueError(
                 "--max_records needs --manifest: a sampled plan is exactly "
                 "--num_steps long, so there is no record list to truncate"
             )
-        if str(args.scene_pool) in {str(root) for root in args.exclude_data_root}:
+        excluded = {str(root) for root in args.exclude_data_root}
+        if str(args.scene_pool) in excluded:
             raise ValueError(
                 f"--exclude_data_root {str(args.scene_pool)!r} names --scene_pool "
                 "itself; every sampled record carries the pool as its data_root, "
                 "so the run would plan nothing"
+            )
+        if args.extra_pool is not None:
+            if str(args.extra_pool) in excluded:
+                raise ValueError(
+                    f"--exclude_data_root {str(args.extra_pool)!r} names --extra_pool "
+                    "itself; every record drawn from it carries it as its data_root, "
+                    "so that pool would plan nothing"
+                )
+            # Two flags, one directory: both indexes would be one pool_index.json.
+            if Path(args.extra_pool).resolve() == Path(args.scene_pool).resolve():
+                raise ValueError(
+                    f"--extra_pool {str(args.extra_pool)!r} is the --scene_pool "
+                    "directory; each pool keeps its own pool_index.json, so the two "
+                    "must be different directories"
+                )
+        elif args.extra_pool_weight is not None:
+            raise ValueError(
+                "--extra_pool_weight needs --extra_pool: it is the share of steps "
+                "drawn from that pool"
             )
     # The sampler's own settings, resolved only when a stream will be drawn:
     # --build_pool_index reads none of them, so a --min_views the weights
@@ -3565,6 +3669,18 @@ def _validate_args(args: argparse.Namespace) -> None:
         # Canonical form, recorded everywhere the weights are recorded: the
         # checkpoint compares settings, not spellings ("2:0.10" is "2:0.1").
         args.view_count_weights = format_view_count_weights(weights)
+        if args.extra_pool is not None:
+            if args.extra_pool_weight is None:
+                raise ValueError(
+                    "--extra_pool needs --extra_pool_weight P in (0, 1]: the share "
+                    "of steps drawn from it has no default"
+                )
+            if not (
+                math.isfinite(args.extra_pool_weight)
+                and 0 < args.extra_pool_weight <= 1
+            ):
+                raise ValueError("--extra_pool_weight must be in (0, 1]")
+            args.extra_pool_weight = float(args.extra_pool_weight)
     # Derived, like resolved_confidence_alpha: None here, and main() fills in
     # the sampler's identity once the pool index is read -- before any
     # checkpoint or summary reads it. None IS the answer in manifest mode.
@@ -3871,13 +3987,37 @@ def _scene_source(tally, args) -> dict:
 
     if args.scene_sampler is None:
         return {"kind": "manifest", "manifest": str(args.manifest)}
-    return {
+    source = {
         "kind": "pool",
         **args.scene_sampler,
         "scene_count": tally.scene_count,
         "admissible_scenes": tally.admissible_scenes,
         "epochs_drawn": tally.epochs_drawn,
     }
+    # Only with a second pool, so a single-pool plan.json is the one it was: each
+    # pool's path, how many scenes its index lists and seats, the epochs of its
+    # own shuffle, the draws it actually got and the steps they planned (the
+    # realised share against --extra_pool_weight), and its view-count histogram.
+    if args.extra_pool is not None:
+        source["pools"] = {
+            label: pool_tally.summary() for label, pool_tally in tally.pools.items()
+        }
+    return source
+
+
+def _pool_labels(args) -> dict[str, str] | None:
+    """``{data_root: label}`` in a run with an extra pool, else None.
+
+    The labels are the pools' flags, ``scene_pool`` and ``extra_pool``, the keys
+    of scene_source's per-pool block.  They name the pool on every ``step=`` log
+    line, on each history row and unsupervisable-step record, and key the
+    per-pool skip guards -- all only when there are two pools, so a
+    single-source run's lines and records are the ones it always wrote.
+    """
+
+    if args.extra_pool is None:
+        return None
+    return {str(args.scene_pool): SCENE_POOL, str(args.extra_pool): EXTRA_POOL}
 
 
 def _plan_summary(tally, args) -> dict:
@@ -3903,7 +4043,14 @@ def _plan_summary(tally, args) -> dict:
         "skipped": tally.skip_counts,
         "unreplayable_fraction": tally.threshold_skip_fraction,
         "considered_for_threshold": tally.considered,
-        "distinct_scenes": len({plan.seq_name for plan in tally.planned}),
+        # By (pool, name) with a second pool, whose clip names could repeat a
+        # Kubric scene's; by name otherwise, as it always was -- a manifest mixes
+        # rows from several datasets, and its plan.json must not move.
+        "distinct_scenes": (
+            len({(plan.data_root, plan.seq_name) for plan in tally.planned})
+            if args.extra_pool is not None
+            else len({plan.seq_name for plan in tally.planned})
+        ),
         "views_per_step": dict(sorted(views.items())),
         "observations_per_step": dict(sorted(observations.items())),
         # What --velocity_weight can exercise, answerable without a GPU: the term
@@ -4033,12 +4180,13 @@ def _plan_summary(tally, args) -> dict:
     }
 
 
-def _print_plan(tally, summary, *, limit: int = 20) -> None:
+def _print_plan(tally, summary, *, labels=None, limit: int = 20) -> None:
     for plan in tally.planned[:limit]:
         times = list(plan.times)
         shown = times if len(times) <= 6 else times[:5] + ["..."] + times[-1:]
+        pool = "" if labels is None else f" pool={labels[plan.data_root]}"
         print(
-            f"step={plan.step} scene={plan.seq_name} "
+            f"step={plan.step} scene={plan.seq_name}{pool} "
             f"views={list(plan.cameras)} "
             f"window=[{plan.frame_start},{plan.frame_start + plan.seq_len}) "
             f"times={shown} stride={plan.stride} bound={plan.time_bound} "
@@ -4110,7 +4258,7 @@ def open_step_history(output_dir, *, start_step: int) -> Path:
     return path
 
 
-def append_step_history(path: Path, outcome: StepOutcome) -> None:
+def append_step_history(path: Path, outcome: StepOutcome, *, pool: str | None = None) -> None:
     """Flush one step's record, as its own line, before the next step begins.
 
     Opened and closed per step deliberately: the point of the file is that it
@@ -4125,6 +4273,11 @@ def append_step_history(path: Path, outcome: StepOutcome) -> None:
     `test_every_step_is_flushed_to_the_history_file` once no unfinished run has
     rows from before this landed -- "will append again", not "running now": a
     run stopped on SIGUSR1 still has thousands of steps to write.
+
+    `pool` is the step's pool label in a run with an extra pool, written as a
+    `pool` key; without one no key is written, so a single-source run's rows
+    keep their shape.  A run cannot switch between the two -- the sampler
+    identity is a refused resume key -- so one file never mixes them.
     """
 
     record = asdict(outcome)
@@ -4133,6 +4286,8 @@ def append_step_history(path: Path, outcome: StepOutcome) -> None:
     record["active_anchor_count"] = (
         None if counts is None else sum(1 for count in counts if count > 0)
     )
+    if pool is not None:
+        record["pool"] = pool
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
 
@@ -4436,6 +4591,17 @@ def run_training(
     last_saved_step = None
     scene_load_skips: Counter = Counter()
     consecutive_skips = 0
+    # With an extra pool, both skip guards also run per pool, on that pool's own
+    # attempts: a pool drawn on a small share of the steps would otherwise fail
+    # under the global fraction and never put enough failures back to back to
+    # trip the consecutive rule, and the run would train on the other pool alone.
+    pool_labels = _pool_labels(args)
+    pool_attempted: Counter = Counter()
+    pool_scene_skips: dict[str, Counter] = {
+        label: Counter() for label in (pool_labels or {}).values()
+    }
+    pool_consecutive_skips: Counter = Counter()
+    pool_unsupervisable: Counter = Counter()
     # Steps whose scene loaded but no seated anchor could supervise, one record
     # each with the split that says why. Kept apart from scene_load_skips: the
     # remedy for those is the data root, for these the anchor spec.
@@ -4484,6 +4650,10 @@ def run_training(
 
         plan = plans[step % len(plans)]
         attempted = step - start_step + 1
+        pool = None if pool_labels is None else pool_labels[plan.data_root]
+        pool_log = "" if pool is None else f" pool={pool}"
+        if pool is not None:
+            pool_attempted[pool] += 1
         # Drop this loop's own reference before the cache loads the next scene, or
         # the old one stays alive across the load and two are resident at the peak.
         scene = None
@@ -4494,9 +4664,10 @@ def run_training(
             # overlays MVTracker's step for step: retrying with the next plan would
             # put a different scene at this step and desynchronise the two runs for
             # the rest of the run. Losing one sample in thousands does not.
-            scene_load_skips[scene_skip_cause(error)] += 1
+            cause = scene_skip_cause(error)
+            scene_load_skips[cause] += 1
             consecutive_skips += 1
-            print(f"step={step} scene={plan.seq_name} skipped: {error}")
+            print(f"step={step} scene={plan.seq_name}{pool_log} skipped: {error}")
             check_scene_skip_rate(
                 scene_load_skips,
                 attempted=attempted,
@@ -4504,6 +4675,17 @@ def run_training(
                 max_fraction=args.max_scene_skip_fraction,
                 max_consecutive=args.max_consecutive_scene_skips,
             )
+            if pool is not None:
+                pool_scene_skips[pool][cause] += 1
+                pool_consecutive_skips[pool] += 1
+                check_scene_skip_rate(
+                    pool_scene_skips[pool],
+                    attempted=pool_attempted[pool],
+                    consecutive=pool_consecutive_skips[pool],
+                    max_fraction=args.max_scene_skip_fraction,
+                    max_consecutive=args.max_consecutive_scene_skips,
+                    pool=pool,
+                )
 
         # A window closes on its Nth micro-step or on the run's last one -- the
         # partial final window of a num_steps not divisible by accum still
@@ -4523,6 +4705,8 @@ def run_training(
             # The scene LOADED, whatever happens next: the consecutive-load
             # streak ends here even if the step below turns out unsupervisable.
             consecutive_skips = 0
+            if pool is not None:
+                pool_consecutive_skips[pool] = 0
             try:
                 outcome = step_fn(
                     model=model,
@@ -4555,20 +4739,29 @@ def run_training(
                 # broken root nor a run of load failures. Raised before any
                 # forward, so the window's accumulated gradient is untouched and
                 # window_executed stays put.
-                unsupervisable_steps.append(
-                    {
-                        "step": step,
-                        "scene": error.scene,
-                        "reason": "no_supervised_sample",
-                        "eligibility": error.eligibility,
-                    }
-                )
-                print(f"step={step} scene={plan.seq_name} skipped: {error}")
+                unsupervisable = {
+                    "step": step,
+                    "scene": error.scene,
+                    "reason": "no_supervised_sample",
+                    "eligibility": error.eligibility,
+                }
+                if pool is not None:
+                    unsupervisable["pool"] = pool
+                unsupervisable_steps.append(unsupervisable)
+                print(f"step={step} scene={plan.seq_name}{pool_log} skipped: {error}")
                 check_unsupervisable_rate(
                     len(unsupervisable_steps),
                     attempted=attempted,
                     max_fraction=args.max_unsupervisable_fraction,
                 )
+                if pool is not None:
+                    pool_unsupervisable[pool] += 1
+                    check_unsupervisable_rate(
+                        pool_unsupervisable[pool],
+                        attempted=pool_attempted[pool],
+                        max_fraction=args.max_unsupervisable_fraction,
+                        pool=pool,
+                    )
         if outcome is not None:
             window_executed += 1
             # Pin what the first executed step resolved, so every later step
@@ -4583,7 +4776,7 @@ def run_training(
             history.append(outcome)
             # Before the eval and checkpoint boundaries below, so the step's
             # record is on disk even if one of them is what kills the run.
-            append_step_history(history_path, outcome)
+            append_step_history(history_path, outcome, pool=pool)
             if outcome.eligibility is not None:
                 eligibility_totals["steps_counted"] += 1
                 eligibility_totals["total_query_count"] += int(
@@ -4648,7 +4841,7 @@ def run_training(
                 else f" iters={[round(value, 8) for value in outcome.iteration_losses]}"
             )
             print(
-                f"step={step}/{args.num_steps} scene={outcome.seq_name} "
+                f"step={step}/{args.num_steps} scene={outcome.seq_name}{pool_log} "
                 f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
                 f"lr={learning_rates[0]:.3g} align_scale={outcome.alignment_scale:.6f} "
                 f"align_residual_m={outcome.alignment_residual_m:.6f} "
@@ -4784,7 +4977,7 @@ def run_training(
     # is a positive statement: every attempted step had something to train on.
     print(f"unsupervisable_steps={len(unsupervisable_steps)}/{attempted}")
 
-    return {
+    result = {
         "start_step": start_step,
         "completed_steps": completed_steps,
         "resumed_from": resumed_from,
@@ -4812,6 +5005,14 @@ def run_training(
         "history": history,
         "evaluations": evaluations,
     }
+    # This invocation's load failures split by pool, by cause, with an extra pool
+    # only -- the same scope as scene_load_skips, which totals them.
+    if pool_labels is not None:
+        result["scene_load_skips_by_pool"] = {
+            label: dict(sorted(pool_scene_skips[label].items()))
+            for label in sorted(pool_scene_skips)
+        }
+    return result
 
 
 def _checkpoint_settings(args) -> dict:
@@ -4832,7 +5033,8 @@ def _checkpoint_settings(args) -> dict:
         # Which scene source the stream was drawn from. None for a replayed
         # manifest, whose rows fix every draw; for a sampled pool the sampler's
         # identity -- pool path, index content hash, seed, canonical weights
-        # and transform probability -- which with the plan keys above decides
+        # and transform probability, plus the extra pool's path, index hash and
+        # weight when there is one -- which with the plan keys above decides
         # every drawn step. A plain dict of str/int/float, so it round-trips
         # through weights_only=True and compares with == like any other value.
         "scene_sampler": args.scene_sampler,
@@ -5268,23 +5470,63 @@ def _gate_verdicts(summary: dict) -> dict:
 
 
 def _build_pool_index_action(args, parser) -> None:
-    """``--build_pool_index``: scan the pool once, write its index, report."""
+    """``--build_pool_index``: scan each pool given, then write their indexes, report.
 
-    try:
-        document, zero_view = build_pool_index(args.scene_pool)
-    except ScenePoolError as exc:
-        parser.error(str(exc))
-    path = write_pool_index(args.scene_pool, document)
-    for name in zero_view:
+    Every document is built -- and under --check_clips every extra-pool clip
+    checked -- before any is written, so a refusal leaves both indexes as they
+    were.  The extra pool's build reads --view_count_weights (the default when
+    not given) for its one refusal, a clip that seats none of the counts; it
+    is parsed for format only and never stored on ``args``, so no --min_views
+    gates the build.
+    """
+
+    # (pool, document, scenes the loader leaves out for having no views)
+    built: list[tuple[str, dict, list[str]]] = []
+    if args.scene_pool is not None:
+        try:
+            document, zero_view = build_pool_index(args.scene_pool)
+        except ScenePoolError as exc:
+            parser.error(str(exc))
+        built.append((args.scene_pool, document, zero_view))
+    if args.extra_pool is not None:
+        try:
+            weights = parse_view_count_weights(
+                DEFAULT_VIEW_COUNT_WEIGHTS
+                if args.view_count_weights is None
+                else args.view_count_weights
+            )
+            document = build_clip_pool_index(args.extra_pool, weights=weights)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.check_clips:
+            clips = list_pool(args.extra_pool, kind=CLIP_POOL_KIND)
+            problems = [
+                problem
+                for name, clip in clips.items()
+                for problem in check_clip(clip, name=name, min_frames=LOADER_CLIP_FRAMES)
+            ]
+            if problems:
+                shown = "\n  ".join(problems[:20])
+                more = f"\n  ... {len(problems) - 20} more" if len(problems) > 20 else ""
+                parser.error(
+                    f"--check_clips: {len(problems)} problem(s) among the "
+                    f"{len(clips)} clips under {args.extra_pool}; no index was "
+                    f"written:\n  {shown}{more}"
+                )
+            print(f"check_clips={len(clips)} clips pass")
+        built.append((args.extra_pool, document, []))
+    for pool, document, zero_view in built:
+        path = write_pool_index(pool, document)
+        for name in zero_view:
+            print(
+                f"WARNING scene {name!r} has no views and is left out of the index, "
+                "as MVTracker's loader leaves it out of the pool",
+                file=sys.stderr,
+            )
         print(
-            f"WARNING scene {name!r} has no views and is left out of the index, "
-            "as MVTracker's loader leaves it out of the pool",
-            file=sys.stderr,
+            f"pool_index={path} scenes={document['scene_count']} "
+            f"content_hash={document['content_hash']}"
         )
-    print(
-        f"pool_index={path} scenes={document['scene_count']} "
-        f"content_hash={document['content_hash']}"
-    )
 
 
 def _sampler_from_manifest_action(args, parser, plan_kwargs) -> bool:
@@ -5389,6 +5631,15 @@ def main() -> None:
         # promise, and a stale or missing index is refused by name here.
         try:
             index = read_pool_index(args.scene_pool)
+            extra = (
+                None
+                if args.extra_pool is None
+                else ExtraPool(
+                    index=read_clip_pool_index(args.extra_pool),
+                    data_root=str(args.extra_pool),
+                    weight=args.extra_pool_weight,
+                )
+            )
         except ScenePoolError as exc:
             parser.error(str(exc))
         args.scene_sampler = sampler_identity(
@@ -5397,6 +5648,7 @@ def main() -> None:
             sampler_seed=args.sampler_seed,
             view_count_weights=args.view_count_weights,
             transform_probability=args.transform_probability,
+            extra=extra,
         )
         try:
             tally = plan_pool(
@@ -5406,6 +5658,7 @@ def main() -> None:
                 seed=args.sampler_seed,
                 weights=parse_view_count_weights(args.view_count_weights),
                 transform_probability=args.transform_probability,
+                extra=extra,
                 **plan_kwargs,
             )
         except ScenePoolError as exc:
@@ -5415,9 +5668,17 @@ def main() -> None:
             f"{tally.epochs_drawn} epoch(s) over {tally.admissible_scenes} of "
             f"{tally.scene_count} scenes)"
         )
+        if extra is not None:
+            drawn = tally.pools[EXTRA_POOL]
+            source_label += (
+                f" + extra pool {args.extra_pool} at weight {args.extra_pool_weight} "
+                f"({drawn.planned_steps} of {len(tally.planned)} steps, "
+                f"{drawn.epochs_drawn} epoch(s) over {drawn.admissible_scenes} of "
+                f"{drawn.scene_count} clips)"
+            )
 
     summary = _plan_summary(tally, args)
-    _print_plan(tally, summary)
+    _print_plan(tally, summary, labels=_pool_labels(args))
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(summary, indent=2) + "\n")
@@ -5567,6 +5828,35 @@ def main() -> None:
         input_depth=args.depth_input,
         input_camera_vectors=args.camera_input,
     )
+    # Each plan goes to the provider of the pool it was drawn from. The clips
+    # are built with the Kubric provider's settings, flag for flag -- the
+    # working size, the track-pool guard, the depth cap (Kubric's applied by its
+    # loader, the clips' by the provider), the anchor spec and the geometry
+    # inputs. The held-out set, the benchmark and the track-id summary below
+    # keep the Kubric provider.
+    training_provider = provider
+    if args.extra_pool is not None:
+        from arc.training.scene_provider import (
+            DumpClipSceneProvider,
+            SceneProviderByRoot,
+        )
+
+        training_provider = SceneProviderByRoot(
+            {
+                str(args.scene_pool): provider,
+                str(args.extra_pool): DumpClipSceneProvider(
+                    size=args.size,
+                    min_shared_queries=args.min_shared_queries,
+                    max_depth=args.kubric_max_depth,
+                    query_anchor_slots=parse_query_anchor_slots(
+                        args.query_anchors, flag="--query_anchors"
+                    ),
+                    adaptive_query_anchors=args.adaptive_query_anchors,
+                    input_depth=args.depth_input,
+                    input_camera_vectors=args.camera_input,
+                ),
+            }
+        )
     held_out = _held_out_set(args, provider, benchmark_provider)
     if held_out is not None and held_out.plans:
         # anchors=SEATED/ASKED, so a spec deliberately wider than the held-out
@@ -5586,7 +5876,7 @@ def main() -> None:
         scaler=scaler,
         plans=tally.planned,
         args=args,
-        scene_provider=provider,
+        scene_provider=training_provider,
         output_dir=output_dir,
         held_out=held_out,
     )
@@ -5612,6 +5902,12 @@ def main() -> None:
         "interrupted_by": result["interrupted_by"],
         "scene_cache": result["scene_cache"],
         "scene_load_skips": result["scene_load_skips"],
+        # Split by pool, with an extra pool only.
+        **(
+            {"scene_load_skips_by_pool": result["scene_load_skips_by_pool"]}
+            if "scene_load_skips_by_pool" in result
+            else {}
+        ),
         "unsupervisable_steps": result["unsupervisable_steps"],
         # This invocation's executed steps, like history and evaluations: a
         # resumed run's totals restart with it.
@@ -5642,7 +5938,8 @@ def main() -> None:
         # In the run's own artifacts because it mirrors a value from another
         # repo's config: when the two curves are compared, the depth clip each
         # was trained under should be readable from the run rather than inferred
-        # from whichever version of train.yaml happens to be checked out.
+        # from whichever version of train.yaml happens to be checked out. With
+        # --extra_pool it is the clips' label-depth cap too.
         "kubric_max_depth": float(args.kubric_max_depth),
         # Run identity: what this run replayed, from where, against which
         # held-out set, under which loss and clip. Every one of these had to be

@@ -351,6 +351,10 @@ def _loop_args(tmp_path, **overrides):
         # needs it present. None is manifest mode, the behaviour every existing
         # test assumes; main() fills it in only under --scene_pool.
         scene_sampler=None,
+        # The second pool, read by _plan_summary, _scene_source and the loop's
+        # pool labels, guards and history rows. None is a single-source run, the
+        # behaviour every existing test assumes.
+        extra_pool=None,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -895,11 +899,12 @@ def test_the_trainer_wires_the_geometry_flags_to_freeze_assert_and_loader():
         ("input_depth", "depth_input"),
         ("input_camera_vectors", "camera_input"),
     }
-    assert found.get("MVTrackerSceneProvider"), (
-        "trainer has no MVTrackerSceneProvider call"
-    )
-    for call in found["MVTrackerSceneProvider"]:
-        assert loader_pairs <= flag_reads(call)
+    # Both training loaders: the extra pool's clips must be built with the
+    # same geometry inputs as the Kubric scenes they are mixed with.
+    for loader in ("MVTrackerSceneProvider", "DumpClipSceneProvider"):
+        assert found.get(loader), f"trainer has no {loader} call"
+        for call in found[loader]:
+            assert loader_pairs <= flag_reads(call), loader
 
 
 def test_the_trainer_wires_the_refinement_flags_to_freeze_assert_step_and_eval():
@@ -5107,6 +5112,8 @@ def _validator_args(tmp_path, **overrides):
         "sampler_seed": None,
         "view_count_weights": None,
         "transform_probability": None,
+        "extra_pool_weight": None,
+        "check_clips": False,
     }
     merged.update(overrides)
     return _loop_args(tmp_path, **merged)
