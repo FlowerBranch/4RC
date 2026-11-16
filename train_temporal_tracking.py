@@ -20,6 +20,16 @@ Syn4D conversion), drawn on ``--extra_pool_weight`` of the steps and served by
 :class:`arc.training.scene_provider.DumpClipSceneProvider`; each plan goes to the
 provider of the pool it came from.  Without the flag nothing here changes.
 
+``WORLD_SIZE > 1`` (pool mode only) trains one process per GPU under srun, without
+a DistributedDataParallel wrapper (:mod:`arc.training.data_parallel` says why).
+Every rank draws the same ``WORLD_SIZE``-fold stream and trains every
+``WORLD_SIZE``-th plan of it; at every accumulation window's close every rank
+averages its gradient with the ranks that executed (:func:`close_window_across_ranks`)
+and steps on the same average, so the replicas stay identical -- which a digest
+check at the start, at every checkpoint boundary and at the end confirms.  Rank 0
+owns every file and every run-level line.  ``WORLD_SIZE`` absent or 1 is the
+single-process run, unchanged.
+
 ``--query_anchors`` supervises several query anchors per step, as relative
 slots into each step's own window; the memory mechanism is the per-anchor
 track-head pass behind the encoder/head boundary in ``arc.training.runtime``
@@ -51,6 +61,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import signal
 import subprocess
 import sys
@@ -61,8 +72,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
+from arc.croco.utils.misc import get_rank, get_world_size, is_main_process
 from arc.models.arc.arc import Arc
+from arc.training.data_parallel import (
+    DEFAULT_COLLECTIVE_TIMEOUT_MINUTES,
+    agree_on_stop,
+    average_gradients,
+    check_replicas,
+    gather_objects,
+    join_process_group,
+    read_launch_environment,
+    reduce_window_totals,
+    wait_for_every_rank,
+    world_size_from_environment,
+)
 from arc.training.manifest_plan import (
     SKIP_EXCLUDED_DATA_ROOT,
     ManifestPlanError,
@@ -112,6 +137,7 @@ from arc.training.scene_sampler import (
     read_clip_pool_index,
     read_pool_index,
     sampler_identity,
+    shard_plans,
     write_pool_index,
 )
 from arc.training.scene_provider import (
@@ -194,6 +220,10 @@ def install_signal_handlers() -> None:
     At --grad_accum N the flag can wait up to N-1 micro-steps for that window
     top; at ~19s a micro-step that fits 300s through N=8, but N>=16 needs the
     sbatch's signal lead raised to match.
+
+    Under ``WORLD_SIZE > 1`` every rank installs these, and the flag is agreed
+    across ranks at each window top (:func:`agree_on_stop`): one rank receiving
+    the signal stops every rank at the same step.
     """
 
     for number in (signal.SIGUSR1, signal.SIGTERM):
@@ -563,7 +593,10 @@ def finish_window(*, model, optimizer, scaler, grad_clip: float) -> dict:
     The zero-norm guards judge the same summed gradient, so they run here too:
     mid-window there is nothing final to judge. Called by train_step on its
     window_end micro-step, and by run_training directly when a window's closing
-    micro-step lost its scene to a skip.
+    micro-step lost its scene to a skip. Under ``WORLD_SIZE > 1`` it is called by
+    :func:`close_window_across_ranks` instead, on every rank, on the gradient
+    averaged across ranks -- so the guards, the clip and the step see the same
+    numbers everywhere and the replicas stay identical.
     """
 
     scaler.unscale_(optimizer)
@@ -606,6 +639,74 @@ def finish_window(*, model, optimizer, scaler, grad_clip: float) -> dict:
     return norms
 
 
+@dataclass(frozen=True)
+class WindowClose:
+    """What one window's close across ranks did, the same on every rank."""
+
+    # Ranks that executed at least one micro-step of the window: the average's
+    # divisor, and 0 when no rank stepped.
+    executed_ranks: int
+    # The window's `loss` mean over every executed micro-step on every rank, for
+    # rank 0's step= line. None when no rank executed.
+    loss_mean: float | None
+    # finish_window's report on the averaged gradient. None when no rank stepped.
+    norms: dict | None
+
+
+def close_window_across_ranks(
+    *,
+    model,
+    optimizer,
+    scaler,
+    grad_clip: float,
+    executed_steps: int,
+    loss_sum: float,
+    finish_window_fn,
+) -> WindowClose:
+    """Close an accumulation window on every rank: one average, one step.
+
+    Entered by EVERY rank at every window end -- also by a rank that executed
+    nothing in the window, which today's single-process loop would close with no
+    call at all and which would here leave the others waiting in the all-reduce.
+    In order:
+
+    1. A rank that executed checks its LOCAL gradients for a missing or
+       non-finite entry. This has to come first: the zero fill below gives every
+       parameter a gradient, so after it a disconnected parameter would pass
+       finish_window's own check unseen.
+    2. One SUM over [executed at all, loss sum, executed micro-steps].
+    3. No rank executed: nothing steps, anywhere -- the all-skipped window of a
+       single-process run, run-sized.
+    4. Otherwise the gradient average (zero fill on a rank that contributed
+       nothing, bucketed SUM, divide by the executing ranks), then
+       ``finish_window_fn`` on it -- unscale, guards, norms, the one clip, the
+       step -- the same arithmetic on the same numbers on every rank.
+
+    A rank that skipped only some micro-steps of the window still divides by the
+    window's ``accum_steps`` on its own side, exactly as a single-process window
+    with a skip does; only a rank with nothing at all drops out of the divisor.
+    """
+
+    if executed_steps:
+        assert_trainable_gradients_finite(model)
+    totals = reduce_window_totals(executed_steps=executed_steps, loss_sum=loss_sum)
+    if not totals.executed_ranks:
+        return WindowClose(executed_ranks=0, loss_mean=None, norms=None)
+    average_gradients(
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        contributed=bool(executed_steps),
+        executed_ranks=totals.executed_ranks,
+    )
+    norms = finish_window_fn(
+        model=model, optimizer=optimizer, scaler=scaler, grad_clip=grad_clip
+    )
+    return WindowClose(
+        executed_ranks=totals.executed_ranks,
+        loss_mean=totals.loss_sum / totals.executed_steps,
+        norms=norms,
+    )
+
+
 def train_step(
     *,
     model,
@@ -646,7 +747,10 @@ def train_step(
     the optimizer step. Clipping must not run per micro-step: clipping each draw
     before the average silently optimizes a different objective than the flags
     claim. At ``accum_steps=1`` every call is a whole window and the step is
-    bit-identical to the pre-accumulation one.
+    bit-identical to the pre-accumulation one. Under ``WORLD_SIZE > 1`` the loop
+    passes ``window_end=False`` on every call and closes each window itself
+    (:func:`close_window_across_ranks`), because a step on this rank's local
+    gradient alone would be a different update on every rank.
 
     Several anchors are supervised one track-head pass at a time: the encoder and
     the reconstruction run once, each anchor's track-head pass backwards
@@ -2520,7 +2624,9 @@ def check_device_headroom(peak_bytes: int, *, step: int, max_fraction: float) ->
 
     if not torch.cuda.is_available() or peak_bytes <= 0:
         return
-    total = torch.cuda.get_device_properties(0).total_memory
+    # The current device, not device 0: under WORLD_SIZE > 1 each rank's peak is
+    # its own GPU's, and the device was chosen by LOCAL_RANK before anything moved.
+    total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
     fraction = peak_bytes / total
     if fraction > max_fraction:
         raise RuntimeError(
@@ -2897,8 +3003,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Micro-steps to train. With --manifest the loop replays "
             "plans[step %% len(plans)]; with --scene_pool the sampled plan is "
-            "exactly this long, so give the --plan_only pass the training value "
-            "(default: %(default)s)"
+            "exactly this long, so give the --plan_only pass the training value. "
+            "Under WORLD_SIZE > 1 each step trains WORLD_SIZE scenes, one per "
+            "rank, from a WORLD_SIZE-fold draw -- give the --plan_only pass the "
+            "same WORLD_SIZE (default: %(default)s)"
         ),
     )
     training.add_argument(
@@ -3241,6 +3349,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     training.add_argument("--scene_cache", type=int, default=1)
     training.add_argument(
+        "--collective_timeout_minutes",
+        type=int,
+        default=DEFAULT_COLLECTIVE_TIMEOUT_MINUTES,
+        help=(
+            "Under WORLD_SIZE > 1: how long a rank may wait inside one collective "
+            "before the process group aborts. Rank 0 runs the held-out eval, its "
+            "visual dump and every checkpoint write alone while the other ranks "
+            "wait at their next collective, so this bounds those too; NCCL's own "
+            "default of 10 minutes does not. Inert at one rank "
+            "(default: %(default)s)"
+        ),
+    )
+    training.add_argument(
         "--max_scene_skip_fraction",
         type=float,
         default=0.02,
@@ -3521,6 +3642,16 @@ def _parse_confidence_alpha(value) -> float | None:
 
 
 def _validate_args(args: argparse.Namespace) -> None:
+    # Derived, like scene_sampler below: how many processes train this run, one
+    # per GPU, read from the launch environment rather than a flag -- srun's
+    # tasks are what the run is, and a flag could disagree with them. Absent or
+    # 1 is the single-process run, unchanged.
+    args.world_size = world_size_from_environment(os.environ)
+    if args.collective_timeout_minutes < 1:
+        raise ValueError(
+            "--collective_timeout_minutes must be at least 1, got "
+            f"{args.collective_timeout_minutes}"
+        )
     if args.observation_budget < 1:
         raise ValueError("--observation_budget must be positive")
     if args.grad_accum < 1:
@@ -3737,6 +3868,43 @@ def _validate_args(args: argparse.Namespace) -> None:
     # already pinned; under 'auto' it stays None until the first executed step
     # resolves it, and a resume restores it before that step runs.
     args.resolved_confidence_alpha = args.confidence_alpha
+    # What one process per GPU cannot train identically on every rank, refused
+    # before any rank touches a GPU -- every rank parses the same flags, so every
+    # rank refuses alike.
+    if args.world_size > 1:
+        if args.manifest is not None:
+            raise ValueError(
+                f"--manifest cannot train under WORLD_SIZE {args.world_size}: the "
+                "replay pairs its step k with MVTracker's step k, and sharding the "
+                "stream across ranks breaks that pairing. Data parallelism trains "
+                "--scene_pool"
+            )
+        if args.precision == "16-mixed":
+            raise ValueError(
+                f"--precision 16-mixed cannot train under WORLD_SIZE "
+                f"{args.world_size}: its GradScaler seats its scale on a rank's "
+                "first scaled backward, so a rank that has executed nothing since "
+                "the start or a resume dies in the window close every rank shares. "
+                "Use bf16-mixed (the default) or 32"
+            )
+        # Only with the term on: at weight 0 alpha never resolves, so 'auto' --
+        # the default -- pins nothing and every rank agrees on None. A resume
+        # restores the pinned value from the checkpoint, the same file on every
+        # rank.
+        if (
+            args.confidence_weight > 0
+            and args.confidence_alpha is None
+            and not args.resume
+        ):
+            raise ValueError(
+                f"--confidence_alpha auto cannot start a run under WORLD_SIZE "
+                f"{args.world_size} with --confidence_weight "
+                f"{args.confidence_weight}: auto resolves from the first executed "
+                "step's own scene, so every rank would pin a different alpha and "
+                f"the averaged gradient would mix {args.world_size} objectives. "
+                "Pass the value a single-GPU run resolved (resolved_confidence_alpha "
+                "in its run_summary.json)"
+            )
     # A window whose slots share no time index has no synchronized pair, and
     # synchronized_differences raises rather than returning an empty mean. That
     # would kill the run mid-step, and not as a SceneProviderError the loop's
@@ -4035,7 +4203,7 @@ def _plan_summary(tally, args) -> dict:
     # The reading the held-out eval scores on, or None when there is no
     # held-out set to score -- the convention realized_val_query_anchors keeps.
     eval_source = _eval_query_anchor_source(args) if _has_held_out(args) else None
-    return {
+    summary = {
         "manifest_version_expected": MANIFEST_VERSION,
         "scene_source": _scene_source(tally, args),
         "records_read": len(tally.planned) + len(tally.skipped),
@@ -4178,6 +4346,16 @@ def _plan_summary(tally, args) -> dict:
             "warmup_optimizer_steps": -(-args.warmup_steps // args.grad_accum),
         },
     }
+    # Only above one rank, so a single-process plan.json is the one it was. The
+    # histograms above are already the whole WORLD_SIZE-fold draw every rank
+    # shares; these say how it is spent: one optimizer step averages
+    # grad_accum micro-steps on each of world_size ranks.
+    if args.world_size > 1:
+        summary["settings"]["world_size"] = int(args.world_size)
+        summary["settings"]["scenes_per_optimizer_step"] = int(
+            args.world_size * args.grad_accum
+        )
+    return summary
 
 
 def _print_plan(tally, summary, *, labels=None, limit: int = 20) -> None:
@@ -4389,6 +4567,18 @@ def run_training(
     itself -- a window whose last micro-step lost its scene -- so those tests
     need no model with a real backbone either. ``held_out`` is the set scored at
     every --eval_every, with its own provider, or None for no held-out eval.
+
+    Under ``WORLD_SIZE > 1`` (``args.world_size``; main() joined the process
+    group, a test joins a gloo one) ``plans`` is this rank's shard, and the loop
+    changes in four places, each entered by every rank alike: the stop flag is
+    agreed at every window top, every window closes through
+    :func:`close_window_across_ranks` -- ``finish_window_fn`` then runs on the
+    average -- the replicas are compared before the first step, at every
+    checkpoint boundary and at the end, and the run totals are gathered once
+    after the loop. Rank 0 alone writes history.jsonl and train_state.pt, runs
+    the held-out eval and prints the run's lines; every rank still runs the
+    held-out preflight, so a bad set is refused on every rank alike. The skip
+    guards and the headroom check stay per rank, on its own counts.
     """
 
     # Captured BEFORE any optimizer.load_state_dict: that call overwrites each
@@ -4398,6 +4588,23 @@ def run_training(
     base_learning_rates = capture_base_learning_rates(optimizer)
     start_step = 0
     resumed_from = None
+    # One process per GPU or one process: which rank this is, and whether it owns
+    # the run's files and lines. At one rank nothing below touches
+    # torch.distributed, so the single-process run is the one it always was.
+    distributed = args.world_size > 1
+    if distributed and get_world_size() != args.world_size:
+        raise RuntimeError(
+            f"WORLD_SIZE is {args.world_size} but the process group holds "
+            f"{get_world_size()} rank(s); the group must be joined before training"
+        )
+    rank = get_rank()
+    owner = rank == 0
+    # Every rank prints its own skip lines, and loop step numbers repeat across
+    # ranks, so those lines name the rank -- only above one, so a
+    # single-process run's lines are the ones it always printed.
+    rank_log = f" rank={rank}" if distributed else ""
+    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    replica_checks = 0
 
     if args.resume:
         from arc.training.checkpoint import load_temporal_tracking_checkpoint
@@ -4446,7 +4653,7 @@ def run_training(
         load_temporal_tracking_checkpoint(model, args.resume)
         optimizer.load_state_dict(payload["optimizer"])
         stored = [float(value) for value in payload["base_learning_rates"]]
-        if stored != base_learning_rates:
+        if stored != base_learning_rates and owner:
             print(
                 f"WARNING --resume carries base rates {stored} but this "
                 f"invocation's flags give {base_learning_rates}; the checkpoint's "
@@ -4459,7 +4666,19 @@ def run_training(
         if payload.get("scaler") is not None:
             scaler.load_state_dict(payload["scaler"])
         resumed_from = str(args.resume)
-        print(f"resumed from {resumed_from} at step {start_step}")
+        if owner:
+            print(f"resumed from {resumed_from} at step {start_step}")
+
+    # Every rank must enter the loop on the same weights at the same step. A
+    # fresh run builds them alike from --seed; a resume reads train_state.pt on
+    # every rank, and a requeue overlap can republish that file between two
+    # ranks' reads (see arc.training.trainer_state), which would leave the ranks
+    # training different weights while every number looked healthy.
+    if distributed:
+        check_replicas(
+            trainable, where="before the first step", extra={"start_step": start_step}
+        )
+        replica_checks += 1
 
     # Wrapped here rather than in main() so the wiring is on the path the CPU
     # tests already drive; main() cannot run without a GPU, so a fix installed
@@ -4524,15 +4743,16 @@ def run_training(
                 f"{unsupervisable[0]['eligibility']['total_query_count']} queries, "
                 f"rejected={unsupervisable[0]['eligibility']['rejected']}"
             )
-        for entry in unsupervisable:
+        if owner:
+            for entry in unsupervisable:
+                print(
+                    f"held_out_preflight scene={entry['scene']} unsupervisable: "
+                    f"rejected={entry['eligibility']['rejected']}; it will be skipped "
+                    "at every eval"
+                )
             print(
-                f"held_out_preflight scene={entry['scene']} unsupervisable: "
-                f"rejected={entry['eligibility']['rejected']}; it will be skipped "
-                "at every eval"
+                f"held_out_preflight_ok={len(val_plans) - len(unsupervisable)}/{len(val_plans)}"
             )
-        print(
-            f"held_out_preflight_ok={len(val_plans) - len(unsupervisable)}/{len(val_plans)}"
-        )
     # The visual dump's scenes, resolved and checked here, before any step:
     # this is the first point the held-out set is known. The run identity the
     # dump records is read once, and only when something will be dumped.
@@ -4550,7 +4770,9 @@ def run_training(
         else None
     )
     history: list[StepOutcome] = []
-    history_path = open_step_history(output_dir, start_step=start_step)
+    # Rank 0's own rows only: the file is the run's, and a resume rewrites it
+    # through a fixed .tmp name that two writers would interleave.
+    history_path = open_step_history(output_dir, start_step=start_step) if owner else None
     evaluations: list[dict] = []
     # Per-stage eligibility, summed over this invocation's executed steps, so
     # whether an anchor set saturates eligibility on the real stream is read
@@ -4620,6 +4842,9 @@ def run_training(
     # whose first plans lost their scenes still zero_grads on the first
     # micro-step that actually runs, and an all-skipped window takes no step.
     window_executed = 0
+    # The open window's summed `loss` over this rank's executed micro-steps:
+    # what the cross-rank mean on rank 0's step= line is built from.
+    window_loss_sum = 0.0
     checkpoint_due = False
 
     for step in range(start_step, args.num_steps):
@@ -4628,12 +4853,17 @@ def run_training(
             # half-accumulated gradients no checkpoint records, so stopping
             # there would silently drop part of a window on resume.
             signal_name = stop_requested()
+            if distributed:
+                # Every rank reaches every window top, so this is where a stop
+                # one rank received becomes every rank's stop, at this step.
+                signal_name = agree_on_stop(signal_name)
             if signal_name is not None:
                 interrupted = signal_name
-                print(
-                    f"{signal_name} received; checkpointing at step {step} "
-                    "and exiting 0"
-                )
+                if owner:
+                    print(
+                        f"{signal_name} received; checkpointing at step {step} "
+                        "and exiting 0"
+                    )
                 break
 
         # A pure function of the WINDOW index against the derived horizons, so
@@ -4667,7 +4897,7 @@ def run_training(
             cause = scene_skip_cause(error)
             scene_load_skips[cause] += 1
             consecutive_skips += 1
-            print(f"step={step} scene={plan.seq_name}{pool_log} skipped: {error}")
+            print(f"step={step} scene={plan.seq_name}{pool_log}{rank_log} skipped: {error}")
             check_scene_skip_rate(
                 scene_load_skips,
                 attempted=attempted,
@@ -4726,7 +4956,10 @@ def run_training(
                     step=step,
                     accum_steps=accum,
                     window_start=(window_executed == 0),
-                    window_end=window_end,
+                    # Above one rank the loop closes every window itself, on
+                    # the cross-rank average; a step on this rank's own
+                    # gradient would be a different update on every rank.
+                    window_end=window_end and not distributed,
                     merge_synchronized_slots=args.merge_synchronized_slots,
                     refine_iters=args.refine_iters,
                     refine_gamma=args.refine_gamma,
@@ -4747,8 +4980,12 @@ def run_training(
                 }
                 if pool is not None:
                     unsupervisable["pool"] = pool
+                # The step number repeats on every rank, so the record names
+                # the rank -- only above one, like the line below.
+                if distributed:
+                    unsupervisable["rank"] = rank
                 unsupervisable_steps.append(unsupervisable)
-                print(f"step={step} scene={plan.seq_name}{pool_log} skipped: {error}")
+                print(f"step={step} scene={plan.seq_name}{pool_log}{rank_log} skipped: {error}")
                 check_unsupervisable_rate(
                     len(unsupervisable_steps),
                     attempted=attempted,
@@ -4764,6 +5001,31 @@ def run_training(
                     )
         if outcome is not None:
             window_executed += 1
+            window_loss_sum += outcome.loss
+        # Above one rank every window closes here, on EVERY rank -- one that
+        # executed nothing in it included, or the others would wait in the
+        # all-reduce for it -- and before the step's record below, which carries
+        # the close's norms and a peak that covers it.
+        closing = None
+        if distributed and window_end:
+            closing = close_window_across_ranks(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                grad_clip=args.grad_clip,
+                executed_steps=window_executed,
+                loss_sum=window_loss_sum,
+                finish_window_fn=finish_window_fn,
+            )
+            if outcome is not None:
+                # What a single-process closing row carries: the averaged
+                # gradient's norms, and a peak that includes the all-reduce and
+                # the optimizer step -- train_step read its own before this
+                # close ran, and the counter has not been reset since.
+                outcome.gradient_norms = closing.norms
+                if torch.cuda.is_available():
+                    outcome.peak_bytes = int(torch.cuda.max_memory_allocated())
+        if outcome is not None:
             # Pin what the first executed step resolved, so every later step
             # descends toward the same optimum. Written back onto args because
             # that is what _checkpoint_settings reads, which is how the value
@@ -4776,7 +5038,8 @@ def run_training(
             history.append(outcome)
             # Before the eval and checkpoint boundaries below, so the step's
             # record is on disk even if one of them is what kills the run.
-            append_step_history(history_path, outcome, pool=pool)
+            if history_path is not None:
+                append_step_history(history_path, outcome, pool=pool)
             if outcome.eligibility is not None:
                 eligibility_totals["steps_counted"] += 1
                 eligibility_totals["total_query_count"] += int(
@@ -4800,7 +5063,7 @@ def run_training(
                     warned_about_dropped_confidence = True
                     dropped = outcome.confidence_dropped
                     print(
-                        f"WARNING step={step}: {dropped['total']} sparse sample(s) "
+                        f"WARNING step={step}{rank_log}: {dropped['total']} sparse sample(s) "
                         "were dropped from the confidence term as non-finite "
                         f"(target={dropped['target_nonfinite']}, "
                         f"prediction={dropped['prediction_nonfinite']}, "
@@ -4840,31 +5103,41 @@ def run_training(
                 if outcome.iteration_losses is None
                 else f" iters={[round(value, 8) for value in outcome.iteration_losses]}"
             )
-            print(
-                f"step={step}/{args.num_steps} scene={outcome.seq_name}{pool_log} "
-                f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
-                f"lr={learning_rates[0]:.3g} align_scale={outcome.alignment_scale:.6f} "
-                f"align_residual_m={outcome.alignment_residual_m:.6f} "
-                f"samples={outcome.sample_count} "
-                f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
-                f"{breakdown_log}"
-                f"{iterations_log}"
-            )
-        elif window_end and window_executed > 0:
+            # Rank 0's line only; on a window-closing step above one rank it
+            # also carries the window's cross-rank mean (_window_log).
+            if owner:
+                print(
+                    f"step={step}/{args.num_steps} scene={outcome.seq_name}{pool_log} "
+                    f"loss={outcome.loss:.8f} metric_error_m={outcome.metric_error_m:.8f} "
+                    f"lr={learning_rates[0]:.3g} align_scale={outcome.alignment_scale:.6f} "
+                    f"align_residual_m={outcome.alignment_residual_m:.6f} "
+                    f"samples={outcome.sample_count} "
+                    f"peak_gib={outcome.peak_bytes / 2**30:.1f}"
+                    f"{breakdown_log}"
+                    f"{iterations_log}"
+                    f"{_window_log(closing, args.world_size)}"
+                )
+        elif not distributed and window_end and window_executed > 0:
             # The window's closing micro-step was skipped -- its scene lost, or
             # loaded but unsupervisable -- but earlier micro-steps already
             # accumulated gradient: close the window now or it leaks into the
             # next one. The norms have no history row to live on -- a skipped
             # step writes none -- so they are dropped. Unreachable at accum=1,
-            # where a skipped step leaves window_executed at 0.
+            # where a skipped step leaves window_executed at 0. Above one rank
+            # the close above already ran.
             finish_window_fn(
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
                 grad_clip=args.grad_clip,
             )
+        if closing is not None and outcome is None and owner:
+            # Rank 0 skipped the closing micro-step, so its own line above was
+            # not printed; the window's cross-rank figures still get one.
+            print(f"step={step}/{args.num_steps}{_window_log(closing, args.world_size)}")
         if window_end:
             window_executed = 0
+            window_loss_sum = 0.0
 
         completed = step + 1
         # The eval cadence stays in micro-steps -- RCMV_EVAL_EVERY is pinned to
@@ -4873,8 +5146,10 @@ def run_training(
         # modes restored, .grad untouched), but its allocations fold into the
         # window's peak_bytes reading, since the counter resets only at the
         # next window start; keep --eval_every divisible by --grad_accum to
-        # keep the figure clean.
-        if val_plans and args.eval_every and completed % args.eval_every == 0:
+        # keep the figure clean. Rank 0's alone above one rank: the replicas are
+        # identical, so one score is the run's, and the others wait for it at
+        # their next collective (--collective_timeout_minutes bounds the wait).
+        if owner and val_plans and args.eval_every and completed % args.eval_every == 0:
             metrics = evaluate_held_out(
                 model=model,
                 plans=val_plans,
@@ -4926,22 +5201,69 @@ def run_training(
         if args.save_every and completed % args.save_every == 0:
             checkpoint_due = True
         if checkpoint_due and completed % accum == 0:
-            _write_checkpoint(
-                model,
-                optimizer,
-                scaler,
-                base_learning_rates,
-                step=completed,
-                output_dir=output_dir,
-                args=args,
-            )
+            # A property of the step number, so every rank reaches it alike:
+            # the replicas are compared here, before rank 0 writes its own out
+            # as the run's -- a diverged state is never written.
+            if distributed:
+                check_replicas(trainable, where=f"at the step {completed} checkpoint")
+                replica_checks += 1
+            if owner:
+                _write_checkpoint(
+                    model,
+                    optimizer,
+                    scaler,
+                    base_learning_rates,
+                    step=completed,
+                    output_dir=output_dir,
+                    args=args,
+                )
             last_saved_step = completed
             checkpoint_due = False
 
+    # This rank's totals, then the run's: one gather that every rank reaches,
+    # here after the loop, summed or concatenated or maxed by
+    # _combine_run_totals -- which hands a single rank's own back unchanged.
+    # The peak is this rank's run-wide one: the max over its per-step readings
+    # (train_step resets the counter at every window start, so each covers its
+    # window) with the tail since the last reset folded in -- the final eval's
+    # allocations; the tail checkpoint write below moves nothing to the device.
+    local_peak = max((outcome.peak_bytes for outcome in history), default=0)
+    if torch.cuda.is_available():
+        local_peak = max(local_peak, int(torch.cuda.max_memory_allocated()))
+    local_totals = {
+        "attempted": attempted,
+        "last_executed": history[-1].step + 1 if history else None,
+        "scene_load_skips": scene_load_skips,
+        "pool_scene_skips": pool_scene_skips,
+        "unsupervisable_steps": unsupervisable_steps,
+        "eligibility_totals": eligibility_totals,
+        "anchor_count_steps": anchor_count_steps,
+        "seated_anchor_counts": seated_anchor_counts,
+        "confidence_dropped_totals": confidence_dropped_totals,
+        "velocity_steps_supervised": velocity_steps_supervised,
+        "velocity_steps_without_a_pair": velocity_steps_without_a_pair,
+        "scene_cache": {"hits": cache.hits, "misses": cache.misses},
+        "peak_bytes": local_peak,
+    }
+    totals = _combine_run_totals(
+        gather_objects(local_totals) if distributed else [local_totals]
+    )
+    # The last comparison, before the tail write below -- so a run whose
+    # replicas drifted after its last boundary leaves that verified checkpoint
+    # as the resume point rather than writing over it.
+    if distributed:
+        check_replicas(trainable, where="at the end of the run")
+        replica_checks += 1
+    # The global record, not rank 0's history: above one rank a window can step
+    # on the other ranks' draws alone, and a count or checkpoint step read off
+    # rank 0's rows would record a stepped window as never trained -- and a
+    # resume would replay it on top of the weights it already moved. At one rank
+    # the record IS this rank's history.
+    last_executed = totals["last_executed"]
     completed_steps = (
         (step + 1)
-        if history and interrupted is None
-        else (history[-1].step + 1 if history else start_step)
+        if last_executed is not None and interrupted is None
+        else (last_executed if last_executed is not None else start_step)
     )
     # completed_steps stays the truthful micro-step count for run_summary and
     # the gate. The checkpoint's step is ceiled to its window boundary on an
@@ -4962,7 +5284,7 @@ def run_training(
     # written exactly this state. The rename is atomic and the content identical,
     # so repeating it is harmless -- but it is a multi-GB write to shared storage
     # at the end of every aligned run, for nothing.
-    if last_saved_step != checkpoint_step:
+    if owner and last_saved_step != checkpoint_step:
         _write_checkpoint(
             model,
             optimizer,
@@ -4975,44 +5297,141 @@ def run_training(
 
     # Once, at the end, the way the held-out preflight reports its count. A zero
     # is a positive statement: every attempted step had something to train on.
-    print(f"unsupervisable_steps={len(unsupervisable_steps)}/{attempted}")
+    # The run's counts, over every rank's attempts.
+    if owner:
+        print(
+            f"unsupervisable_steps={len(totals['unsupervisable_steps'])}"
+            f"/{totals['attempted']}"
+        )
 
     result = {
         "start_step": start_step,
         "completed_steps": completed_steps,
         "resumed_from": resumed_from,
         "interrupted_by": interrupted,
-        "scene_cache": {"hits": cache.hits, "misses": cache.misses},
-        "scene_load_skips": dict(sorted(scene_load_skips.items())),
+        "scene_cache": totals["scene_cache"],
+        "scene_load_skips": dict(sorted(totals["scene_load_skips"].items())),
         # Steps whose scene loaded but no seated anchor could supervise, each
         # with the split that says why -- the eval's skipped_scenes shape plus
         # the step. A list rather than a count beside one: the count is its
         # length, and two facts cannot disagree.
-        "unsupervisable_steps": unsupervisable_steps,
-        "eligibility_totals": eligibility_totals,
+        "unsupervisable_steps": totals["unsupervisable_steps"],
+        "eligibility_totals": totals["eligibility_totals"],
         "realized_anchor_counts": {
-            "steps_counted": anchor_count_steps,
-            "seated": dict(sorted(seated_anchor_counts.items())),
+            "steps_counted": totals["anchor_count_steps"],
+            "seated": dict(sorted(totals["seated_anchor_counts"].items())),
         },
         # Empty dict rather than None when the term ran and dropped nothing: that
         # is a measurement ("the shares matched the mask all run"), and it reads
         # differently from a position-only run that never looked.
-        "confidence_dropped_totals": dict(sorted(confidence_dropped_totals.items())),
+        "confidence_dropped_totals": dict(
+            sorted(totals["confidence_dropped_totals"].items())
+        ),
         "velocity_term_totals": {
-            "steps_supervised": velocity_steps_supervised,
-            "steps_without_a_pair": velocity_steps_without_a_pair,
+            "steps_supervised": totals["velocity_steps_supervised"],
+            "steps_without_a_pair": totals["velocity_steps_without_a_pair"],
         },
+        # This rank's own rows, which on rank 0 are history.jsonl's.
         "history": history,
         "evaluations": evaluations,
+        # The run-wide peak: above one rank the largest any rank's GPU reached.
+        "peak_gpu_memory_bytes": totals["peak_bytes"],
     }
+    # How many times the replicas were compared and matched -- every mismatch
+    # raises -- above one rank only.
+    if distributed:
+        result["replica_checks"] = replica_checks
     # This invocation's load failures split by pool, by cause, with an extra pool
     # only -- the same scope as scene_load_skips, which totals them.
     if pool_labels is not None:
         result["scene_load_skips_by_pool"] = {
-            label: dict(sorted(pool_scene_skips[label].items()))
-            for label in sorted(pool_scene_skips)
+            label: dict(sorted(totals["pool_scene_skips"][label].items()))
+            for label in sorted(totals["pool_scene_skips"])
         }
     return result
+
+
+def _window_log(closing: WindowClose | None, world_size: int) -> str:
+    """The cross-rank fields a window close adds to rank 0's step= line.
+
+    Empty when no cross-rank close ran -- one rank, or a mid-window step -- so
+    those lines are the ones they always were. ``world_loss`` is absent when no
+    rank executed, where there is no mean to give; ``ranks`` is how many of the
+    world executed, and so how many draws the step averaged over.
+    """
+
+    if closing is None:
+        return ""
+    ranks = f" ranks={closing.executed_ranks}/{world_size}"
+    if closing.loss_mean is None:
+        return ranks
+    return f" world_loss={closing.loss_mean:.8f}{ranks}"
+
+
+def _sum_counts(counts_by_rank) -> dict:
+    """Key-wise sums in first-seen key order, zeros kept -- so one rank's
+    counts come back exactly as they went in, unlike ``Counter`` addition,
+    which drops every zero entry."""
+
+    total: dict = {}
+    for counts in counts_by_rank:
+        for key, value in counts.items():
+            total[key] = total.get(key, 0) + value
+    return total
+
+
+def _combine_run_totals(entries: list[dict]) -> dict:
+    """The run's totals from every rank's own, given in rank order.
+
+    Counts sum, lists concatenate in rank order, the last executed micro-step
+    and the peak take the maximum. A single rank's entry comes back unchanged
+    in every reported value, which is what keeps the single-process
+    run_summary.json the one it always was.
+    """
+
+    eligibility = [entry["eligibility_totals"] for entry in entries]
+    executed = [
+        entry["last_executed"] for entry in entries if entry["last_executed"] is not None
+    ]
+    labels = list(entries[0]["pool_scene_skips"])
+    return {
+        "attempted": sum(entry["attempted"] for entry in entries),
+        "last_executed": max(executed, default=None),
+        "scene_load_skips": _sum_counts(entry["scene_load_skips"] for entry in entries),
+        "pool_scene_skips": {
+            label: _sum_counts(entry["pool_scene_skips"][label] for entry in entries)
+            for label in labels
+        },
+        "unsupervisable_steps": [
+            record for entry in entries for record in entry["unsupervisable_steps"]
+        ],
+        "eligibility_totals": {
+            "steps_counted": sum(item["steps_counted"] for item in eligibility),
+            "total_query_count": sum(item["total_query_count"] for item in eligibility),
+            "eligible_query_count": sum(
+                item["eligible_query_count"] for item in eligibility
+            ),
+            "rejected": _sum_counts(item["rejected"] for item in eligibility),
+        },
+        "anchor_count_steps": sum(entry["anchor_count_steps"] for entry in entries),
+        "seated_anchor_counts": _sum_counts(
+            entry["seated_anchor_counts"] for entry in entries
+        ),
+        "confidence_dropped_totals": _sum_counts(
+            entry["confidence_dropped_totals"] for entry in entries
+        ),
+        "velocity_steps_supervised": sum(
+            entry["velocity_steps_supervised"] for entry in entries
+        ),
+        "velocity_steps_without_a_pair": sum(
+            entry["velocity_steps_without_a_pair"] for entry in entries
+        ),
+        "scene_cache": {
+            "hits": sum(entry["scene_cache"]["hits"] for entry in entries),
+            "misses": sum(entry["scene_cache"]["misses"] for entry in entries),
+        },
+        "peak_bytes": max(entry["peak_bytes"] for entry in entries),
+    }
 
 
 def _checkpoint_settings(args) -> dict:
@@ -5113,6 +5532,13 @@ def _checkpoint_settings(args) -> dict:
         # counter over a different optimisation. Coerced like kubric_max_depth
         # for the weights_only round trip.
         "grad_accum": int(args.grad_accum),
+        # How many ranks each step's draws are shared across. Refused like
+        # grad_accum, and for two reasons: each rank trains every world_size-th
+        # plan of a world_size-fold draw, so a different count re-shards the
+        # stream under a continued step counter, and it changes how many draws
+        # average into each update. Stored at every size, 1 included, because
+        # the comparison needs both sides.
+        "world_size": int(args.world_size),
         "precision": args.precision,
         "encoder_local_checkpointing": bool(args.encoder_local_checkpointing),
     }
@@ -5187,6 +5613,10 @@ def _write_checkpoint(
 # what every step's position term is computed against -- the model's own query
 # anchor or a ground-truth one -- so a segment that switched it would report
 # one curve over two objectives while `loss` kept its name.
+# world_size is refused on the stream ground: each rank trains every
+# world_size-th plan of a world_size-fold draw, so a segment on a different
+# count would re-shard the stream -- and average a different number of draws
+# into every update -- while the step counter continued.
 # num_steps, warmup_steps and min_lr_scale only reshape the remaining schedule,
 # and extending a finished run by raising num_steps is legitimate, so those
 # warn.
@@ -5245,6 +5675,7 @@ _RESUME_SETTINGS_REFUSED = (
     "confidence_alpha",
     "precision",
     "grad_accum",
+    "world_size",
 )
 _RESUME_SETTINGS_WARNED = (
     "num_steps",
@@ -5302,6 +5733,12 @@ _RESUME_SETTINGS_ABSENT_DEFAULTS = {
     # absence resolves, pre-flag runs resume silently on the per-slot path, and
     # resuming one with the merge on is refused like any changed value.
     "merge_synchronized_slots": False,
+    # A checkpoint from before WORLD_SIZE was read could only have been written
+    # by one process: no other launch existed. So absence resolves to 1, every
+    # earlier checkpoint resumes silently on one GPU, and resuming one across
+    # several ranks is refused like any changed value -- its stream was never
+    # sharded.
+    "world_size": 1,
     # A checkpoint from before --depth_input / --camera_input could only have
     # been written with the geometry inputs off: the injection parameters did
     # not exist. So absence resolves, pre-flag runs resume silently with the
@@ -5601,6 +6038,21 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+    # One process per GPU: bind this task to its GPU and join the group first --
+    # before any device work, so the model lands on this rank's GPU, and before
+    # the plan, so every later decision about who prints and who writes reads the
+    # group's rank. --plan_only stays one process and needs WORLD_SIZE alone, so
+    # it plans the WORLD_SIZE-fold draw the run will train.
+    if args.world_size > 1 and not args.plan_only:
+        try:
+            join_process_group(
+                read_launch_environment(os.environ, world_size=args.world_size),
+                timeout_minutes=args.collective_timeout_minutes,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    owner = is_main_process()
+
     if args.manifest is not None:
         manifest_path = Path(args.manifest)
         if not manifest_path.is_file():
@@ -5654,7 +6106,10 @@ def main() -> None:
             tally = plan_pool(
                 index,
                 data_root=str(args.scene_pool),
-                num_steps=args.num_steps,
+                # One draw for the whole world, identical on every rank, which
+                # trains every world_size-th plan of it (shard_plans below). At
+                # one rank this is num_steps itself.
+                num_steps=args.num_steps * args.world_size,
                 seed=args.sampler_seed,
                 weights=parse_view_count_weights(args.view_count_weights),
                 transform_probability=args.transform_probability,
@@ -5678,9 +6133,12 @@ def main() -> None:
             )
 
     summary = _plan_summary(tally, args)
-    _print_plan(tally, summary, labels=_pool_labels(args))
+    # Every rank planned the same draw; rank 0 reports it and writes plan.json,
+    # whose plain write_text several writers would interleave.
+    if owner:
+        _print_plan(tally, summary, labels=_pool_labels(args))
 
-    if args.json_out:
+    if args.json_out and owner:
         Path(args.json_out).write_text(json.dumps(summary, indent=2) + "\n")
         print(f"summary={args.json_out}")
 
@@ -5789,21 +6247,24 @@ def main() -> None:
         camera_input=args.camera_input,
         refine=args.refine_iters > 1,
     )
-    print(
-        f"trainable={report['tensor_count']} tensors / "
-        f"{report['parameter_count']} parameters ({args.freeze_mode}) "
-        f"encoder_local_checkpointing={args.encoder_local_checkpointing}"
-    )
+    # The run's configuration lines, once: every rank built the same model.
+    if owner:
+        print(
+            f"trainable={report['tensor_count']} tensors / "
+            f"{report['parameter_count']} parameters ({args.freeze_mode}) "
+            f"encoder_local_checkpointing={args.encoder_local_checkpointing}"
+        )
 
     # Before build_optimizer, which splits the embedding into its own
     # --embedding_lr group by module identity. Printed because "the table was
     # never seeded" is otherwise invisible until an eval shows the shuffled arm
     # matching the plain one, which is days in.
     seeded = seed_time_index_embedding(model, args)
-    print(
-        f"time_embedding_init={args.time_embedding_init} "
-        f"scale={args.time_embedding_init_scale} applied={seeded}"
-    )
+    if owner:
+        print(
+            f"time_embedding_init={args.time_embedding_init} "
+            f"scale={args.time_embedding_init_scale} applied={seeded}"
+        )
 
     optimizer, learning_rates, _encoder = build_optimizer(
         model,
@@ -5812,7 +6273,8 @@ def main() -> None:
         encoder_lr=args.encoder_lr,
         geometry_lr=args.geometry_lr,
     )
-    print(f"learning_rates={learning_rates}")
+    if owner:
+        print(f"learning_rates={learning_rates}")
     scaler = torch.cuda.amp.GradScaler(enabled=args.precision == "16-mixed")
 
     provider = MVTrackerSceneProvider(
@@ -5857,8 +6319,10 @@ def main() -> None:
                 ),
             }
         )
+    # Built on every rank -- the preflight in run_training refuses a bad held-out
+    # set on every rank alike -- though only rank 0 scores it.
     held_out = _held_out_set(args, provider, benchmark_provider)
-    if held_out is not None and held_out.plans:
+    if held_out is not None and held_out.plans and owner:
         # anchors=SEATED/ASKED, so a spec deliberately wider than the held-out
         # window is readable from the log at step 0 rather than from an eval
         # directory that does not exist until the first boundary.
@@ -5869,30 +6333,38 @@ def main() -> None:
             f"at --eval_every {args.eval_every}"
         )
 
+    # This rank's share of the draw. At one rank the plan is the tally itself --
+    # a manifest's included, whose length is not num_steps.
+    plans = tally.planned
+    if args.world_size > 1:
+        plans = shard_plans(
+            tally.planned,
+            rank=get_rank(),
+            world_size=args.world_size,
+            num_steps=args.num_steps,
+        )
+
     output_dir = Path(args.output_dir)
     result = run_training(
         model=model,
         optimizer=optimizer,
         scaler=scaler,
-        plans=tally.planned,
+        plans=plans,
         args=args,
         scene_provider=training_provider,
         output_dir=output_dir,
         held_out=held_out,
     )
-
-    # train_step resets the CUDA peak counter at every accumulation-window
-    # start, so the reading here covers only the tail since the last reset; the
-    # run-wide peak is the max over the per-step readings, with the tail folded
-    # in for whatever the final eval and checkpoint write allocated after the
-    # last window's reset.
-    peak_gpu_memory_bytes = max(
-        (outcome.peak_bytes for outcome in result["history"]), default=0
-    )
-    if torch.cuda.is_available():
-        peak_gpu_memory_bytes = max(
-            peak_gpu_memory_bytes, int(torch.cuda.max_memory_allocated())
-        )
+    # Rank 0 writes the run's summary; every other rank's part ends here, once
+    # rank 0 has written it. run_training returns on those ranks while rank 0
+    # may still be writing the tail train_state.pt -- an interrupted run's
+    # resume point -- and an srun with --wait kills the remaining tasks that
+    # long after the first one exits, so they wait in one last collective,
+    # which rank 0 enters only after its writes.
+    if not owner:
+        wait_for_every_rank()
+        dist.destroy_process_group()
+        return
 
     summary = {
         **_plan_summary(tally, args),
@@ -5932,6 +6404,8 @@ def main() -> None:
         # Zero unless --honour_recorded_tracks: nothing is requested otherwise.
         # Reported rather than raised on, because a recorded draw is not
         # reproducible (V6(c)) and a raise would fire on nearly every record.
+        # Rank 0's provider's counts: above one rank the run is a sampled pool,
+        # whose records carry no track ids, so every rank's stay at zero.
         "honour_recorded_tracks": bool(args.honour_recorded_tracks),
         "requested_track_ids": provider.requested_track_ids,
         "missing_track_ids": provider.missing_track_ids,
@@ -5965,9 +6439,27 @@ def main() -> None:
         "freeze_mode": args.freeze_mode,
         "precision": args.precision,
         "gpu_name": (
-            torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+            torch.cuda.get_device_name(torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else None
         ),
-        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+        # The run-wide peak run_training measured: the max over each window's
+        # reading with the tail folded in, and above one rank the largest any
+        # rank's GPU reached.
+        "peak_gpu_memory_bytes": result["peak_gpu_memory_bytes"],
+        # Above one rank only, so a single-process summary is the one it was: the
+        # timeout the group's collectives ran under, and the replica check --
+        # true whenever this file exists, since a mismatch stops the run before
+        # it is written -- with how many comparisons it made.
+        **(
+            {
+                "collective_timeout_minutes": args.collective_timeout_minutes,
+                "replicas_identical": True,
+                "replica_checks": result["replica_checks"],
+            }
+            if args.world_size > 1
+            else {}
+        ),
         **_gate_verdicts(
             {
                 "interrupted_by": result["interrupted_by"],
@@ -5986,6 +6478,10 @@ def main() -> None:
     # Reported verdicts, never an exit code: the verdict of a multi-scene run is
     # the held-out curve, not a threshold on a single number.
     print(f"gates_passed={summary['gates_passed']}")
+    if args.world_size > 1:
+        # Rank 0's half of the last collective: every write is done.
+        wait_for_every_rank()
+        dist.destroy_process_group()
 
 
 def _val_window(args) -> tuple[tuple[int, ...], str]:

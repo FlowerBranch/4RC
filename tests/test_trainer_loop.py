@@ -298,6 +298,13 @@ def _loop_args(tmp_path, **overrides):
         # it; 1 is the parser's default and the every-step-is-a-window contract
         # every existing test assumes.
         grad_accum=1,
+        # How many processes train the run, one per GPU: derived from the
+        # WORLD_SIZE launch variable by _validate_args, read by run_training and
+        # _plan_summary, and stored by _checkpoint_settings (REFUSED tier, absent
+        # default 1), so every loop test needs it present. 1 is the
+        # single-process run every existing test assumes; tests/test_data_parallel.py
+        # drives 2 over a gloo group.
+        world_size=1,
         # The query anchor every step's loss composes on: stream-defining
         # (REFUSED tier, absent default "predicted"), read by
         # _checkpoint_settings, _plan_summary and run_training's step and eval
@@ -1590,10 +1597,13 @@ def test_the_headroom_guard_is_inert_without_cuda_and_names_the_step_with_it(mon
     train_cli.check_device_headroom(10**12, step=7, max_fraction=0.5)  # no CUDA: inert
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # The guard reads the CURRENT device -- a rank's own GPU above one rank --
+    # so the fake answers only for the device current_device names.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
-        lambda index: SimpleNamespace(total_memory=100 * 2**30),
+        lambda index: SimpleNamespace(total_memory=100 * 2**30 if index == 3 else 0),
     )
 
     train_cli.check_device_headroom(50 * 2**30, step=7, max_fraction=0.9)
@@ -5114,6 +5124,8 @@ def _validator_args(tmp_path, **overrides):
         "transform_probability": None,
         "extra_pool_weight": None,
         "check_clips": False,
+        # Range-checked by _validate_args at any world size; the parser's default.
+        "collective_timeout_minutes": 120,
     }
     merged.update(overrides)
     return _loop_args(tmp_path, **merged)

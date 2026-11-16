@@ -944,6 +944,30 @@ def plan_pool(
     return tally
 
 
+def shard_plans(
+    planned: list[StepPlan], *, rank: int, world_size: int, num_steps: int
+) -> list[StepPlan]:
+    """Rank ``rank``'s share of one ``world_size``-fold draw: every ``world_size``-th plan.
+
+    The draw is ``plan_pool`` at ``world_size * num_steps``, so each shard is
+    exactly ``num_steps`` long and every pool -- the extra one included -- mixes
+    into every shard at its configured weight, since the pool draw rides in the
+    same stream.  :func:`plan_pool`'s prefix guarantee carries over: a longer
+    draw's shard begins with the shorter draw's, so a run extended through
+    ``--num_steps`` keeps every rank's earlier steps.  Each plan keeps its
+    ``step``, the global draw index ``k * world_size + rank``.
+    """
+
+    if not 0 <= rank < world_size:
+        raise ScenePoolError(f"rank {rank} is outside a world of {world_size}")
+    if len(planned) != world_size * num_steps:
+        raise ScenePoolError(
+            f"{world_size} ranks of {num_steps} steps shard a draw of exactly "
+            f"{world_size * num_steps} plans, but the draw holds {len(planned)}"
+        )
+    return list(planned[rank::world_size])
+
+
 # --------------------------------------------------------------- diagnostic ---
 
 
