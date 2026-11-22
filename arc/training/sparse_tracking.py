@@ -702,7 +702,9 @@ def reconstruction_drift_report(
     measurement rather than an absence.  Keyed by :func:`_anchor_key`, camera
     id and original time from ``scene.query_anchors``; the ``depth`` keys are
     view indices instead, and the two coincide whenever the view list is
-    ascending and complete, which the held-out loader's always is.
+    ascending and complete -- the held-out loader's always is, and so is a
+    benchmark's at views0123, but a DexYCB set at views4567 keys its depth
+    0..3 and its anchors 4..7.
     """
 
     depth = raw_predictions.get("depth")

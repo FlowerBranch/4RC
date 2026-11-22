@@ -401,7 +401,9 @@ def test_the_benchmark_flags_are_refused_at_parse_time(tmp_path, overrides, mess
 def test_the_name_alone_decides_the_parse_time_refusal():
     assert benchmark_name_refusal("kubric-multiview-v3-views0123-cached") is None
     assert benchmark_name_refusal("kubric-multiview-v3-duster0123-cached") is None
-    assert "not a supported benchmark" in benchmark_name_refusal("dex-ycb-multiview")
+    assert "not a supported benchmark" in benchmark_name_refusal(
+        "panoptic-multiview-views1_7_14_20-cached"
+    )
     assert "reads no cached track set" in benchmark_name_refusal("kubric-multiview-v3")
 
 

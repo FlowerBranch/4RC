@@ -3434,7 +3434,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=24.0,
         help=(
-            "Metres beyond which the loader marks depth invalid. Mirrors the "
+            "Depth beyond which the loader marks depth invalid, in the scene's "
+            "stored units rather than metres: Kubric units, and on the DexYCB "
+            "benchmark metres x6, so 24 is 4 m there. Mirrors the "
             "paired run's configs/train.yaml datasets.train.kubric_max_depth; "
             "MVTracker's loader defaults to 1000 whenever it is built without "
             "training args, which is every replay, and the difference is silent "
@@ -3485,8 +3487,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Frames in every held-out clip. Caps the held-out window alongside "
             "--observation_budget and --max_time_indices, exactly as a manifest "
             "row's seq_len caps a training step. Loader configuration rather "
-            "than scene data -- MVTracker's loader crops every evaluation clip "
-            "to this -- so the window is decided at parse time and under "
+            "than scene data -- MVTracker's Kubric loader crops every evaluation "
+            "clip to this; the DexYCB benchmark's loader crops nothing, so each "
+            "of its scenes must hold at least this many frames and is scored on "
+            "its first ones -- so the window is decided at parse time and under "
             "--plan_only (default: %(default)s)"
         ),
     )
@@ -3595,11 +3599,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "held-out set, in place of --val_scenes_file's -- every scene in the "
             "dataset's own order, with its own cameras (which must be "
             "--val_cameras) and the held-out window, loaded by the benchmark's "
-            "own protocol (from_name at subset 'test') with depth capped at "
-            "--kubric_max_depth. Every query of the benchmark is written to the "
-            "bundle in dataset order; one no anchor supervises is written as its "
-            "query point held still at confidence 0. kubric-multiview-v3 names "
-            "ending in -cached only, for now. Not stored in the checkpoint. "
+            "own protocol (its from_name; Kubric's at subset 'test') with label "
+            "depth capped at --kubric_max_depth. Every query of the benchmark is "
+            "written to the bundle in dataset order; one no anchor supervises is "
+            "written as its query point held still at confidence 0. Two "
+            "families: kubric-multiview-v3 names ending in -cached, and exactly "
+            "dex-ycb-multiview-views<digits>-cached (sensor depth, every track, "
+            "the shipped track cache; its scenes run 24 or 25 frames and each "
+            "must hold --val_seq_len). Not stored in the checkpoint. "
             "Needs --eval_benchmark_root and a nonzero --eval_every"
         ),
     )
@@ -3608,8 +3615,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DIR",
         help=(
-            "The dataset root holding kubric-multiview/test for "
-            "--eval_benchmark_dataset: the dataset_root MVTracker's from_name "
+            "The dataset root holding kubric-multiview/test or dex-ycb-multiview "
+            "for --eval_benchmark_dataset: the dataset_root MVTracker's from_name "
             "takes. The two flags require each other"
         ),
     )
@@ -3976,7 +3983,8 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.eval_benchmark_dataset and not args.eval_benchmark_root:
         raise ValueError(
             "--eval_benchmark_dataset needs --eval_benchmark_root: the name says "
-            "which benchmark, the root where its kubric-multiview/test sits"
+            "which benchmark, the root where its directory sits "
+            "(kubric-multiview/test, dex-ycb-multiview)"
         )
     if args.eval_benchmark_root and not args.eval_benchmark_dataset:
         raise ValueError(

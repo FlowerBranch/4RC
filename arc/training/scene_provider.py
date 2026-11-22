@@ -62,12 +62,15 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Mapping, Sequence
 
 import numpy as np
 import torch
+
+from arc.croco.utils.misc import is_main_process
 
 
 class SceneProviderError(RuntimeError):
@@ -773,11 +776,11 @@ class SceneProviderByRoot:
 
 # --- Held-out benchmarks. The eval can score an MVTracker benchmark in place of
 # the --val_scenes_file scenes, and such a set is opened by the benchmark's OWN
-# protocol -- MVTracker's from_name at subset "test", exactly the call 4I4's
-# triton/4rc/multiview/dump_common.py::build_dataset makes -- never by the
-# replay's dataset_overrides above: the point is to score the queries
-# MVTracker's figures are scored on. One entry per dataset family, matched by
-# name prefix, so Panoptic or DexYCB is one more entry.
+# protocol -- its family's from_name, exactly the call 4I4's
+# triton/4rc/multiview/dump_common.py::build_dataset makes (Kubric's at subset
+# "test") -- never by the replay's dataset_overrides above: the point is to
+# score the queries MVTracker's figures are scored on. One entry per dataset
+# family, matched by name prefix: Kubric and DexYCB, so Panoptic is one more.
 
 
 def _kubric_benchmark_refusal(name: str) -> str | None:
@@ -853,9 +856,240 @@ def _open_kubric_benchmark(name: str, root: str, *, max_depth: float):
     return dataset, kwargs
 
 
+# DexYCB's from_name builds its dataset itself, and its loader caps no depth,
+# crops no clip and records no camera ids, so the opener reads what the
+# provider checks off the data and _FromNameTestSet completes every sample.
+# Panoptic's loader has the same shape.
+
+_DEXYCB_PREFIX = "dex-ycb-multiview"
+_DEXYCB_BENCHMARK_NAME = re.compile(r"dex-ycb-multiview-views(\d+)-cached")
+# from_name's tokens that change what the model sees or what is scored, in its
+# parse order (dexycb_multiview_dataset.py:39-87, MVTracker 4002795).
+_DEXYCB_REFUSED_TOKENS = (
+    (
+        r"-(?:duster|vggt)\d*(?:cleaned)?",
+        "swaps the sensor depth for an estimate, and that depth is what the "
+        "Sim(3) fit and the anchor depth gate read",
+    ),
+    (r"-novelviews\d*", "loads cameras beyond the returned ones as novel views"),
+    (
+        r"-removehand",
+        "drops the hand's tracks: another scored set, under another track cache",
+    ),
+    (r"-single", "is MVTracker's one-query-at-a-time predictor mode"),
+    (r"-2dpt", "scores 2-D point tracks, not 3-D"),
+)
+
+
+def _dexycb_benchmark_refusal(name: str) -> str | None:
+    """Why a DexYCB name cannot be a held-out benchmark, or None.
+
+    Exactly ``dex-ycb-multiview-views<digits>-cached`` is accepted: the sensor
+    depth, the cameras named digit by digit and each once, every one of the
+    set's tracks, and the shipped track cache. Every other token from_name
+    parses changes what the model sees or what is scored, and is named.
+    """
+
+    match = _DEXYCB_BENCHMARK_NAME.fullmatch(name)
+    if match is not None:
+        digits = match.group(1)
+        if len(set(digits)) != len(digits):
+            return (
+                f"--eval_benchmark_dataset {name!r} names a camera twice "
+                f"(views{digits}); every returned view must be its own camera"
+            )
+        return None
+    rest = name[len(_DEXYCB_PREFIX):]
+    for pattern, reason in _DEXYCB_REFUSED_TOKENS:
+        token = re.search(pattern, rest)
+        if token is not None:
+            return (
+                f"--eval_benchmark_dataset {name!r}: {token.group(0)} {reason}; "
+                "only dex-ycb-multiview-views<digits>-cached is scored"
+            )
+    if not rest.endswith("-cached"):
+        return (
+            f"--eval_benchmark_dataset {name!r} reads no cached track set: only a "
+            "name ending in -cached scores the benchmark's own queries (384 per "
+            "scene, cached beside each scene's frames); any other draws them "
+            "anew and writes a cache file into the dataset root"
+        )
+    if "-views" not in rest:
+        return (
+            f"--eval_benchmark_dataset {name!r} names no cameras: write them as "
+            "-views<digits> (from_name's default is views0123)"
+        )
+    return (
+        f"--eval_benchmark_dataset {name!r} is not of the form "
+        "dex-ycb-multiview-views<digits>-cached"
+    )
+
+
+def _scene_frame_count(name: str, data_root: str, scene_name: str, views) -> int:
+    """One DexYCB scene's frame count, read as its loader reads the frames.
+
+    The scene's ``view_*`` entries, sorted and indexed by view number, then
+    every file of ``rgb/`` and of ``depth/`` (dexycb_multiview_dataset.py
+    :220-239). The loader stacks the returned views (:254-256), so they must
+    agree, in both folders; a disagreement or a missing folder would end the
+    run at the first load, after the model's.
+    """
+
+    scene_dir = os.path.join(data_root, scene_name)
+    folders = sorted(
+        entry for entry in os.listdir(scene_dir) if entry.startswith("view_")
+    )
+    counts = {}
+    for view in views:
+        if view >= len(folders):
+            raise ValueError(
+                f"scene {scene_name!r} of {name!r} at {data_root!r} has "
+                f"{len(folders)} view folders, but the set returns view {view}"
+            )
+        for kind in ("rgb", "depth"):
+            folder = os.path.join(scene_dir, folders[view], kind)
+            if not os.path.isdir(folder):
+                raise ValueError(
+                    f"scene {scene_name!r} of {name!r} has no {kind} folder at "
+                    f"{folder!r}"
+                )
+            counts[f"{folders[view]}/{kind}"] = len(os.listdir(folder))
+    if len(set(counts.values())) != 1:
+        listed = ", ".join(f"{folder} {count}" for folder, count in counts.items())
+        raise ValueError(
+            f"scene {scene_name!r} of {name!r} at {data_root!r} holds different "
+            f"frame counts across its returned views ({listed}); the loader "
+            "stacks them, so it would fail at the first load"
+        )
+    return next(iter(counts.values()))
+
+
+def _open_dexycb_benchmark(name: str, root: str, *, max_depth: float):
+    """MVTracker's DexYCB test set, by its own protocol, completed per sample.
+
+    ``from_name(name, dataset_root=root)`` builds the dataset itself -- it
+    takes no subset and returns no kwargs (dexycb_multiview_dataset.py:22-105,
+    MVTracker 4002795) -- so what the provider checks is read off the dataset
+    and the data: ``data_root`` (``<root>/dex-ycb-multiview``),
+    ``views_to_return``, and ``scene_frames``, each scene's frame count. There
+    is no ``seq_len``: the loader loads every frame on disk (:233), and the
+    set's scenes run 24 or 25 frames, so the provider holds each scene to the
+    window instead.
+
+    Refuses, before any load, what a load would trip over or write: a missing
+    dataset directory (the constructor lists it, :151); a scene whose track
+    cache is missing -- the loader would draw new queries and write the file
+    into the dataset root (:385-387, :464-475); and a scene whose returned
+    views disagree on their frames (:func:`_scene_frame_count`).
+    """
+
+    try:
+        from mvtracker.datasets.dexycb_multiview_dataset import DexYCBMultiViewDataset
+    except ImportError as error:
+        raise SceneProviderError(
+            "the benchmark needs MVTracker's DexYCB loader importable, so that it "
+            "is opened by the benchmark's own protocol; the module imports pandas "
+            "and matplotlib at module level. Run in RC_ENV with the mvtracker "
+            f"checkout on PYTHONPATH ({error})"
+        ) from error
+
+    # The loader's own join (:93), checked before from_name lists it.
+    data_root = os.path.join(root, _DEXYCB_PREFIX)
+    if not os.path.isdir(data_root):
+        raise ValueError(
+            f"--eval_benchmark_dataset {name!r} has no dataset directory at "
+            f"{data_root!r}: --eval_benchmark_root must be the root holding "
+            f"{_DEXYCB_PREFIX}"
+        )
+    dataset = DexYCBMultiViewDataset.from_name(name, dataset_root=root)
+    views = [int(view) for view in dataset.views_to_return]
+    missing = [
+        cache_file
+        for cache_file in (
+            os.path.join(
+                dataset.data_root, scene_name, "cache", f"{dataset.cache_name}.npz"
+            )
+            for scene_name in dataset.seq_names
+        )
+        if not os.path.isfile(cache_file)
+    ]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(dataset.seq_names)} scenes of {name!r} at "
+            f"{dataset.data_root!r} have no cached track file (first: "
+            f"{missing[0]}). MVTracker would redraw their queries and write the "
+            "file into the dataset root on first load, so the scored queries "
+            "would not be the benchmark's"
+        )
+    scene_frames = {
+        str(scene_name): _scene_frame_count(name, dataset.data_root, scene_name, views)
+        for scene_name in dataset.seq_names
+    }
+    return (
+        _FromNameTestSet(dataset, views=views, max_depth=max_depth),
+        {
+            "data_root": dataset.data_root,
+            "views_to_return": views,
+            "scene_frames": scene_frames,
+        },
+    )
+
+
+class _FromNameTestSet:
+    """A benchmark whose ``from_name`` builds its loader, completed per sample.
+
+    DexYCB's loader -- Panoptic's has the same shape -- leaves three things to
+    its caller, and every loaded sample gets them here, in place:
+
+    * the label-depth cap: depth beyond ``max_depth`` zeroed, strict ``>``, in
+      the loader's own units after its scene transform -- metres x6 on DexYCB
+      (dexycb_multiview_dataset.py:478-486), so the default 24 is 4 m -- as
+      Kubric's loader zeroes its own (kubric_multiview_dataset.py:882) and the
+      clip pool's provider does;
+    * ``sample_views``: the loader records none, so ``scene_from_datapoint``
+      would number the views 0..V-1, while the video axis is stacked in
+      ``views_to_return`` order (:254): each position's camera id is that
+      list's entry;
+    * one line per scene saying how much label depth the cap zeroed, out of
+      the valid (positive) pixels -- on rank 0, the first time the scene loads
+      in this process: the count cannot change between loads, and every rank
+      loads every scene at the preflight.
+    """
+
+    def __init__(self, dataset, *, views: Sequence[int], max_depth: float):
+        self.dataset = dataset
+        self.seq_names = dataset.seq_names
+        self.views = [int(view) for view in views]
+        self.max_depth = float(max_depth)
+        self._reported: set[str] = set()
+
+    def __getitem__(self, index):
+        sample, gotit = self.dataset[index]
+        if not gotit:
+            return sample, gotit
+        depth = sample.videodepth
+        beyond = depth > self.max_depth
+        zeroed = int(beyond.sum())
+        valid = int((depth > 0).sum())
+        depth[beyond] = 0.0
+        sample.sample_views = list(self.views)
+        scene_name = str(sample.seq_name)
+        if scene_name not in self._reported:
+            self._reported.add(scene_name)
+            if is_main_process():
+                share = 100.0 * zeroed / valid if valid else 0.0
+                print(
+                    f"benchmark scene={scene_name} frames={int(sample.video.shape[1])} "
+                    f"label_depth_zeroed={zeroed}/{valid} ({share:.4f}%) "
+                    f"beyond {self.max_depth:g}"
+                )
+        return sample, gotit
+
+
 # (name prefix, parse-time refusal, opener)
 BENCHMARK_DATASETS = (
     ("kubric-multiview-v3", _kubric_benchmark_refusal, _open_kubric_benchmark),
+    (_DEXYCB_PREFIX, _dexycb_benchmark_refusal, _open_dexycb_benchmark),
 )
 
 
@@ -883,6 +1117,11 @@ class BenchmarkSceneProvider:
     the name, the dataset's own cameras against ``--val_cameras`` (the
     window's camera set, a refused resume key), its clip length against
     ``--val_seq_len``, and -- through the opener -- a missing track cache.
+    The clip rule follows the loader. Kubric's crops every clip to its own
+    ``seq_len``, which must therefore be the window's. DexYCB's loads every
+    frame on disk and its scenes differ in length, so its opener reports
+    ``scene_frames`` instead, and every scene must hold the window: a
+    shorter one is refused, a longer one is scored on its first frames.
 
     A scene is the benchmark's sample as loaded: no world transform and no
     column selection, so the scene's tracks and queries are exactly the
@@ -934,12 +1173,31 @@ class BenchmarkSceneProvider:
                 f"{list(views)}, but the held-out window is --val_cameras "
                 f"{list(cameras)}; the window and its anchors are sized by those"
             )
-        if self.kwargs.get("seq_len") != seq_len:
-            raise ValueError(
-                f"--eval_benchmark_dataset {dataset_name!r} loads "
-                f"{self.kwargs.get('seq_len')}-frame clips, but the held-out window "
-                f"is planned on --val_seq_len {seq_len}"
-            )
+        scene_frames = self.kwargs.get("scene_frames")
+        if scene_frames is None:
+            # A loader that crops every clip to its own seq_len (Kubric's).
+            if self.kwargs.get("seq_len") != seq_len:
+                raise ValueError(
+                    f"--eval_benchmark_dataset {dataset_name!r} loads "
+                    f"{self.kwargs.get('seq_len')}-frame clips, but the held-out window "
+                    f"is planned on --val_seq_len {seq_len}"
+                )
+        else:
+            # A loader that loads every frame on disk (DexYCB's): each scene
+            # must seat the window; a longer clip's tail is never scored.
+            short = [
+                (scene_name, frames)
+                for scene_name, frames in scene_frames.items()
+                if frames < seq_len
+            ]
+            if short:
+                raise ValueError(
+                    f"--eval_benchmark_dataset {dataset_name!r} has {len(short)} of "
+                    f"{len(scene_frames)} scenes shorter than the held-out window's "
+                    f"--val_seq_len {seq_len} (first: {short[0][0]!r}, "
+                    f"{short[0][1]} frames); its loader does not crop, and a window "
+                    "past a clip's last frame cannot be seated"
+                )
         self.dataset_name = dataset_name
         self.dataset_root = dataset_root
         self.data_root = str(self.kwargs["data_root"])
@@ -961,7 +1219,12 @@ class BenchmarkSceneProvider:
         self.input_camera_vectors = input_camera_vectors
 
     def identity(self) -> dict:
-        """What the eval records about the set it scored."""
+        """What the eval records about the set it scored.
+
+        One record for every family. ``subset`` is the set's role, "test"
+        for both: Kubric's from_name takes it as an argument, DexYCB's takes
+        none -- MVTracker evaluates on that set and nothing else.
+        """
 
         return {
             "dataset": self.dataset_name,
