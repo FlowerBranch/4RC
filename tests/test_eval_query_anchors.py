@@ -338,8 +338,8 @@ def test_explicit_slots_are_extras_in_the_order_given_and_canonical(tmp_path):
     [
         (
             {"val_scenes_file": None, "val_data_root": None, "eval_query_anchors": ["all"]},
-            r"--eval_query_anchors needs a held-out set \(--val_scenes_file or "
-            r"--eval_benchmark_dataset\)",
+            r"--eval_query_anchors needs a held-out set \(--val_scenes_file, "
+            r"--eval_benchmark_dataset or --eval_benchmark_clips\)",
         ),
         ({"eval_query_anchors": ["all", "0:1"]}, "or 'all' alone"),
         ({"eval_query_anchors": ["0"]}, "^--eval_query_anchors entries must look like"),

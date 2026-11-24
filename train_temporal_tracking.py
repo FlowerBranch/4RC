@@ -67,7 +67,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -2444,8 +2444,8 @@ def _eval_anchor_rows(
 
     ``scene`` is the window anchored at the training spec's seated slots and
     ``raw`` its forward A, already scored; ``slots`` are the extra
-    ``--eval_query_anchors`` slots, resolved against this plan behind the
-    seated ones.
+    ``--eval_query_anchors`` slots, resolved against this plan's window on the
+    scene's camera ids, behind the seated ones.
 
     * Correspondences are rebuilt on the window anchored at both, with the
       seated anchors a priority tier (:func:`build_anchor_correspondences`): an
@@ -2480,8 +2480,15 @@ def _eval_anchor_rows(
     from arc.training.sparse_tracking import _anchor_key
 
     seated = scene.query_anchors
+    # Resolved on the scene's camera ids, in plan order: a clip set's plan names
+    # view positions (BenchmarkClipSceneProvider), which only coincide with ids
+    # when its view_ids are 0..V-1. Everywhere else the two are one tuple.
     extended = with_query_anchors(
-        scene, seated + resolve_anchor_slots(slots, plan, adaptive=False)
+        scene,
+        seated
+        + resolve_anchor_slots(
+            slots, replace(plan, cameras=scene.camera_ids), adaptive=False
+        ),
     )
     correspondences, eligibility = build_anchor_correspondences(
         extended, priority_anchor_count=len(seated)
@@ -3436,7 +3443,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Depth beyond which the loader marks depth invalid, in the scene's "
             "stored units rather than metres: Kubric units, and on the DexYCB "
-            "benchmark metres x6, so 24 is 4 m there. Mirrors the "
+            "benchmark metres x6, so 24 is 4 m there; on an "
+            "--eval_benchmark_clips set, its traj3d_world's units (Panoptic's "
+            "are metres x2.5, so 24 is 9.6 m). Mirrors the "
             "paired run's configs/train.yaml datasets.train.kubric_max_depth; "
             "MVTracker's loader defaults to 1000 whenever it is built without "
             "training args, which is every replay, and the difference is silent "
@@ -3473,6 +3482,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=[0, 1, 2, 3],
         help=(
             "Cameras for the held-out window; kubric-multiview-v3-views0123. "
+            "For --eval_benchmark_clips only their count matters: the window "
+            "takes each clip's views by position, and a clip's view_ids name "
+            "its cameras. "
             "Under --adaptive_query_anchors this count also caps the eval's "
             "anchors, because the window drops every slot it cannot seat, so a "
             "resume that changes it is refused: it would move what the curve "
@@ -3488,9 +3500,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--observation_budget and --max_time_indices, exactly as a manifest "
             "row's seq_len caps a training step. Loader configuration rather "
             "than scene data -- MVTracker's Kubric loader crops every evaluation "
-            "clip to this; the DexYCB benchmark's loader crops nothing, so each "
-            "of its scenes must hold at least this many frames and is scored on "
-            "its first ones -- so the window is decided at parse time and under "
+            "clip to this; the DexYCB benchmark's loader and an "
+            "--eval_benchmark_clips set crop nothing, so each of their scenes "
+            "must hold at least this many frames and is scored on its first "
+            "ones -- so the window is decided at parse time and under "
             "--plan_only (default: %(default)s)"
         ),
     )
@@ -3513,7 +3526,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "checkpoint, so a resume may switch it freely; the eval's "
             "metrics.json and run_summary.json record it. "
             "--oracle_query_anchor and --ground_truth_query_anchor are its "
-            "aliases. Needs --val_scenes_file"
+            "aliases. Needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips)"
         ),
     )
     evaluation.add_argument(
@@ -3521,7 +3535,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Alias for --eval_query_anchor_source query_position, kept so "
-            "recorded commands still run. Needs --val_scenes_file, and cannot "
+            "recorded commands still run. Needs a held-out set "
+            "(--val_scenes_file, --eval_benchmark_dataset or "
+            "--eval_benchmark_clips), and cannot "
             "be combined with --ground_truth_query_anchor or with an "
             "--eval_query_anchor_source that names another source"
         ),
@@ -3531,7 +3547,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Alias for --eval_query_anchor_source gt_depth, kept so recorded "
-            "commands still run. Needs --val_scenes_file, and cannot be "
+            "commands still run. Needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips), and cannot be "
             "combined with --oracle_query_anchor or with an "
             "--eval_query_anchor_source that names another source"
         ),
@@ -3552,7 +3569,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "so the disk cost multiplies: a 20000-step run at --eval_every 500 "
             "writes each scene 40 times. Changes no gradient, figure or other "
             "output and is not stored in the checkpoint, so a resume may switch "
-            "it freely. Needs --val_scenes_file and a nonzero --eval_every"
+            "it freely. Needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips) and a nonzero "
+            "--eval_every"
         ),
     )
     evaluation.add_argument(
@@ -3585,8 +3604,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "bundle and their readouts recorded per scene, while the pooled "
             "readouts stay on the training anchors. Changes no gradient and is "
             "not stored in the checkpoint, so a resume may switch it freely. "
-            "Needs a held-out set (--val_scenes_file or "
-            "--eval_benchmark_dataset); a slot must fit the held-out window and "
+            "Needs a held-out set (--val_scenes_file, --eval_benchmark_dataset "
+            "or --eval_benchmark_clips); a slot must fit the held-out window and "
             "must not repeat a seated one"
         ),
     )
@@ -3618,6 +3637,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "The dataset root holding kubric-multiview/test or dex-ycb-multiview "
             "for --eval_benchmark_dataset: the dataset_root MVTracker's from_name "
             "takes. The two flags require each other"
+        ),
+    )
+    evaluation.add_argument(
+        "--eval_benchmark_clips",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Eval-only: score a benchmark written as a clip set (4I4's "
+            "prepare_clips.py) as the held-out set, in place of "
+            "--val_scenes_file's -- every clip under DIR (a clip directory or "
+            "<name>.zip, listed as --extra_pool lists its clips) in name order, "
+            "read by this repo's clip reader with nothing imported from "
+            "MVTracker. The window takes a clip's views by position, so each "
+            "clip must hold len(--val_cameras) views (its view_ids name the "
+            "cameras; --val_cameras' values are not compared) and at least "
+            "--val_seq_len frames, a longer one scored on its first ones. Label "
+            "depth is capped at --kubric_max_depth in the clip's own units. "
+            "Every query is written to the bundle in clip order; one no anchor "
+            "supervises is written as its query point held still at confidence "
+            "0. DIR/benchmark.json, the rule that wrote the set, is recorded "
+            "with every eval. Not stored in the checkpoint. Needs a nonzero "
+            "--eval_every; cannot be combined with --eval_benchmark_dataset or "
+            "--eval_benchmark_root"
         ),
     )
     return parser
@@ -3980,6 +4022,25 @@ def _validate_args(args: argparse.Namespace) -> None:
     # is refused here; what needs the dataset opened -- its cameras, clip
     # length and track cache -- is refused where main() builds it, still
     # before the model load.
+    #
+    # A clip set is checked first, so naming it beside a loader flag gets its
+    # own refusal rather than the pair rule's. Its value is compared to None,
+    # not tested for truth: an empty DIR from an unset submit variable is then
+    # refused where main() opens it instead of silently meaning no held-out
+    # set. Its clips are checked there too.
+    if args.eval_benchmark_clips is not None:
+        if args.eval_benchmark_dataset or args.eval_benchmark_root:
+            raise ValueError(
+                "--eval_benchmark_clips cannot be combined with "
+                "--eval_benchmark_dataset or --eval_benchmark_root: each names "
+                "the held-out benchmark, and one eval scores one"
+            )
+        if not args.eval_every:
+            raise ValueError(
+                "--eval_benchmark_clips needs a nonzero --eval_every: "
+                "--eval_every 0 switches the held-out eval off, so the clips "
+                "would be checked and never scored"
+            )
     if args.eval_benchmark_dataset and not args.eval_benchmark_root:
         raise ValueError(
             "--eval_benchmark_dataset needs --eval_benchmark_root: the name says "
@@ -4008,24 +4069,24 @@ def _validate_args(args: argparse.Namespace) -> None:
     # that reading when nothing was measured.
     if args.eval_query_anchor_source is not None and not _has_held_out(args):
         raise ValueError(
-            "--eval_query_anchor_source needs a held-out set (--val_scenes_file "
-            "or --eval_benchmark_dataset): the flag only ever reaches the "
-            "held-out eval, so without one it changes nothing and would label a "
-            "run it never measured"
+            "--eval_query_anchor_source needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips): the flag only "
+            "ever reaches the held-out eval, so without one it changes nothing "
+            "and would label a run it never measured"
         )
     if args.oracle_query_anchor and not _has_held_out(args):
         raise ValueError(
-            "--oracle_query_anchor needs a held-out set (--val_scenes_file or "
-            "--eval_benchmark_dataset): the flag only ever reaches the held-out "
-            "eval, so without one it changes nothing and would label a run it "
-            "never measured"
+            "--oracle_query_anchor needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips): the flag only "
+            "ever reaches the held-out eval, so without one it changes nothing "
+            "and would label a run it never measured"
         )
     if args.ground_truth_query_anchor and not _has_held_out(args):
         raise ValueError(
-            "--ground_truth_query_anchor needs a held-out set (--val_scenes_file "
-            "or --eval_benchmark_dataset): the flag only ever reaches the "
-            "held-out eval, so without one it changes nothing and would label a "
-            "run it never measured"
+            "--ground_truth_query_anchor needs a held-out set (--val_scenes_file, "
+            "--eval_benchmark_dataset or --eval_benchmark_clips): the flag only "
+            "ever reaches the held-out eval, so without one it changes nothing "
+            "and would label a run it never measured"
         )
     # One eval writes one curve, so two spellings naming different readings
     # are refused -- by the resolver itself, which keeps the precedence and the
@@ -4039,9 +4100,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.eval_visual_scenes:
         if not _has_held_out(args):
             raise ValueError(
-                "--eval_visual_scenes needs a held-out set (--val_scenes_file or "
-                "--eval_benchmark_dataset): the dump is written by the held-out "
-                "eval, so without one nothing would ever be written"
+                "--eval_visual_scenes needs a held-out set (--val_scenes_file, "
+                "--eval_benchmark_dataset or --eval_benchmark_clips): the dump is "
+                "written by the held-out eval, so without one nothing would ever "
+                "be written"
             )
         if not args.eval_every:
             raise ValueError(
@@ -4139,9 +4201,10 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.eval_query_anchors is not None:
         if not _has_held_out(args):
             raise ValueError(
-                "--eval_query_anchors needs a held-out set (--val_scenes_file or "
-                "--eval_benchmark_dataset): the anchors only ever reach the "
-                "held-out eval, so without one they change nothing"
+                "--eval_query_anchors needs a held-out set (--val_scenes_file, "
+                "--eval_benchmark_dataset or --eval_benchmark_clips): the anchors "
+                "only ever reach the held-out eval, so without one they change "
+                "nothing"
             )
         _eval_anchor_slots(args)
     # Canonical form, recorded everywhere the spec is recorded: format-only
@@ -4542,8 +4605,10 @@ class HeldOut:
 
     ``scene_provider`` serves ``plans`` -- the training provider for
     --val_scenes_file's scenes, which the replay protocol loads like any step,
-    or a :class:`arc.training.scene_provider.BenchmarkSceneProvider`, which
-    loads a benchmark by its own. ``benchmark`` is what the eval records about
+    a :class:`arc.training.scene_provider.BenchmarkSceneProvider`, which
+    loads a benchmark by its own, or a
+    :class:`arc.training.scene_provider.BenchmarkClipSceneProvider`, which
+    reads a benchmark's clip set. ``benchmark`` is what the eval records about
     a benchmark (see :func:`_benchmark_record`), None for a scene list.
     """
 
@@ -6207,8 +6272,9 @@ def main() -> None:
         parser.error("--checkpoint_dir and --output_dir are required to train")
 
     # A benchmark is opened before the seeding and the model load: a wrong
-    # root, camera set, clip length or track cache is refused at no model
-    # load's cost, and opening it draws no randomness either way.
+    # root, camera set, clip length or track cache -- or a clip set's
+    # malformed or misshapen clip -- is refused at no model load's cost, and
+    # opening it draws no randomness either way.
     try:
         benchmark_provider = _open_benchmark(args)
     except ValueError as exc:
@@ -6572,10 +6638,16 @@ def _has_held_out(args) -> bool:
 
     Every eval-only flag and the held-out window's seating check gate on this
     rather than on --val_scenes_file, so a benchmark-only run is checked
-    exactly like one with a scene list.
+    exactly like one with a scene list. A benchmark is a loader's
+    (--eval_benchmark_dataset) or a clip set (--eval_benchmark_clips); the clip
+    flag counts whenever it is given, even empty (see _validate_args).
     """
 
-    return bool(args.val_scenes_file or args.eval_benchmark_dataset)
+    return bool(
+        args.val_scenes_file
+        or args.eval_benchmark_dataset
+        or args.eval_benchmark_clips is not None
+    )
 
 
 def _eval_anchor_slots(args) -> tuple[tuple[int, int], ...]:
@@ -6729,15 +6801,32 @@ def _val_plans(args) -> list[StepPlan]:
 
 
 def _open_benchmark(args):
-    """The --eval_benchmark_dataset provider, or None without the flag.
+    """The held-out benchmark's provider, or None without a benchmark flag.
 
-    Its window is the held-out one: the cameras must be --val_cameras and the
-    clip --val_seq_len, and its scenes are anchored at the training spec's
-    seated held-out slots, exactly as --val_scenes_file's are. Raises
-    ``ValueError`` for what opening the set reveals -- see
-    :class:`arc.training.scene_provider.BenchmarkSceneProvider`.
+    Its window is the held-out one, and its scenes are anchored at the
+    training spec's seated held-out slots, exactly as --val_scenes_file's are.
+    A clip set (--eval_benchmark_clips) takes each clip's views by position, so
+    every clip must hold len(--val_cameras) views and --val_seq_len frames
+    (:class:`arc.training.scene_provider.BenchmarkClipSceneProvider`). A
+    loader's set (--eval_benchmark_dataset) must return --val_cameras
+    themselves and fit --val_seq_len by its loader's clip rule
+    (:class:`arc.training.scene_provider.BenchmarkSceneProvider`). Raises
+    ``ValueError`` for what opening the set reveals.
     """
 
+    if args.eval_benchmark_clips is not None:
+        from arc.training.scene_provider import BenchmarkClipSceneProvider
+
+        return BenchmarkClipSceneProvider(
+            clips=args.eval_benchmark_clips,
+            view_count=len(args.val_cameras),
+            seq_len=args.val_seq_len,
+            max_depth=args.kubric_max_depth,
+            query_anchor_slots=_val_anchor_slots(args),
+            size=args.size,
+            input_depth=args.depth_input,
+            input_camera_vectors=args.camera_input,
+        )
     if not args.eval_benchmark_dataset:
         return None
     from arc.training.scene_provider import BenchmarkSceneProvider
@@ -6777,9 +6866,11 @@ def _held_out_set(args, provider, benchmark_provider) -> HeldOut | None:
 def _benchmark_plans(args, provider) -> list[StepPlan]:
     """A benchmark's test scenes as held-out plans, every one, in its own order.
 
-    On the dataset's own cameras -- equal to --val_cameras, which the provider
-    checked -- and on the same :func:`_val_window` the scene-list plans get,
-    so both held-out sources are scored on one window.
+    On the provider's cameras -- a loader's own, equal to --val_cameras, which
+    the provider checked, or a clip set's view positions 0..V-1, which its
+    provider maps through each clip's view_ids -- and on the same
+    :func:`_val_window` the scene-list plans get, so every held-out source is
+    scored on one window.
     """
 
     window = _val_window(args)

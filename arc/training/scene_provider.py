@@ -45,13 +45,18 @@ every MVTracker sample more than rgb jitter would, and is already accepted as
 unreplayable.  What the pairing controls is which samples arrive in which order,
 never the training recipe.
 
-**The extra pool is the one exception, because no MVTracker loader reads it.**
-``--extra_pool`` clips are 4I4's Syn4D conversion in the dump format, already
-assembled by the converter; :class:`DumpClipSceneProvider` reads their arrays and
-frames, and shares everything after that with the Kubric path -- MVTracker's
+**Dump-format clips are the exception, because no MVTracker loader reads them.**
+They are already assembled by 4I4's writers, and two providers read them through
+one body, :func:`_scene_from_clip`.  ``--extra_pool`` clips are 4I4's Syn4D
+conversion: :class:`DumpClipSceneProvider` reads their arrays and frames, and
+shares everything after that with the Kubric path -- MVTracker's
 ``transform_scene`` through :func:`apply_recorded_scene_transform`, the anchor
 slots, the track-pool guard, the label-depth cap and ``build_scene``.
 :class:`SceneProviderByRoot` sends each plan to the provider of its pool.
+``--eval_benchmark_clips`` is a held-out benchmark 4I4 wrote as a clip set:
+:class:`BenchmarkClipSceneProvider` reads it with the same label-depth cap and
+``build_scene``, the anchor slots resolved strictly, and neither the track-pool
+guard nor a world transform, so that path imports nothing from MVTracker.
 
 Importing MVTracker is deferred to the first load: this module is imported by the
 trainer's tests, which run in an environment where ``mvtracker`` is deliberately
@@ -60,6 +65,7 @@ absent.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -591,6 +597,117 @@ class MVTrackerSceneProvider:
         )
 
 
+def _scene_from_clip(
+    path,
+    plan,
+    *,
+    query_anchor_slots,
+    adaptive_query_anchors: bool,
+    max_depth: float,
+    scene_transform,
+    min_shared_queries: int | None,
+    size: int,
+    patch_size: int,
+    input_depth_max: float | None,
+    input_camera_vectors: bool,
+    report_label_depth=None,
+):
+    """``plan``'s window of the dump-format clip at ``path``: both clip providers' body.
+
+    ``read_clip`` checks the arrays and the frame set against the format
+    contract.  The plan's cameras are positions on the clip's view axis; they
+    become camera ids through its ``view_ids``, and the anchor slots are
+    resolved on those.  Label depth beyond ``max_depth`` is zeroed (strict
+    ``>``) before ``scene_transform`` moves the world and divides the factor,
+    as MVTracker's loader zeroes Kubric's (kubric_multiview_dataset.py:882)
+    before its own transform; under --depth_input ``input_depth_max`` is the
+    same number.  ``build_scene`` decodes only the window's frames.
+
+    ``min_shared_queries`` None skips the track-pool guard, and
+    ``report_label_depth(name, frames, zeroed, valid)``, when given, hears how
+    much label depth the cap zeroed out of the valid pixels, before the scene
+    is built; without it nothing is counted.  A clip that breaks the format
+    raises :class:`SceneProviderError` naming it, and what that costs is the
+    caller's: one skipped step in the training loop, the run on the held-out
+    path, where nothing absorbs it.  A slot the plan cannot seat stays a
+    ``ValueError``.
+    """
+
+    from arc.training.dump_clip import ClipFormatError, open_clip
+    from arc.training.dumped_kubric import build_scene, clip_frames, read_clip
+
+    label = f"clip {plan.seq_name!r} at {path}"
+    try:
+        with open_clip(path) as clip:
+            arrays = read_clip(clip, name=plan.seq_name)
+            outside = [view for view in plan.cameras if view >= arrays.view_count]
+            if outside:
+                raise SceneProviderError(
+                    f"{label} has {arrays.view_count} views, but the plan draws "
+                    f"view position(s) {outside}: the pool index is stale"
+                )
+            late = [time for time in plan.times if time >= arrays.time_count]
+            if late:
+                raise SceneProviderError(
+                    f"{label} has {arrays.time_count} frames, but the step's "
+                    f"window reaches frame(s) {late}"
+                )
+            if min_shared_queries is not None:
+                require_track_pool(plan.seq_name, arrays.track_count, min_shared_queries)
+            camera_ids = tuple(int(arrays.view_ids[view]) for view in plan.cameras)
+            anchors = resolve_anchor_slots(
+                query_anchor_slots,
+                replace(plan, cameras=camera_ids),
+                adaptive=adaptive_query_anchors,
+            )
+            depth = arrays.depth
+            beyond = depth > max_depth
+            if report_label_depth is not None:
+                report_label_depth(
+                    plan.seq_name,
+                    arrays.time_count,
+                    int(beyond.sum()),
+                    int((depth > 0).sum()),
+                )
+            depth[beyond] = 0.0
+            # The Kubric path's own transform, on the four fields it moves and
+            # the factor it divides; both are read back from the namespace.
+            sample = SimpleNamespace(
+                videodepth=torch.from_numpy(depth),
+                extrs=torch.from_numpy(arrays.extrinsics),
+                query_points_3d=torch.from_numpy(arrays.query_points),
+                trajectory_3d=torch.from_numpy(arrays.trajectories),
+                track_upscaling_factor=arrays.track_upscaling_factor,
+            )
+            apply_recorded_scene_transform(sample, scene_transform)
+            archive = clip.frames()
+            return build_scene(
+                name=plan.seq_name,
+                open_frames=lambda positions, times: clip_frames(
+                    archive, positions, times, grid=arrays.grid, label=str(path)
+                ),
+                query_points=sample.query_points_3d,
+                trajectories=sample.trajectory_3d,
+                visibility=arrays.visibility,
+                intrinsics=arrays.intrinsics,
+                extrinsics=sample.extrs,
+                depth0=sample.videodepth[:, 0],
+                depth=sample.videodepth,
+                view_ids=arrays.view_ids,
+                track_upscaling_factor=float(sample.track_upscaling_factor),
+                cameras=camera_ids,
+                times=plan.times,
+                query_anchors=anchors,
+                size=size,
+                patch_size=patch_size,
+                input_depth_max=input_depth_max,
+                input_camera_vectors=input_camera_vectors,
+                source=str(path),
+            )
+    except ClipFormatError as error:
+        raise SceneProviderError(f"{label} is malformed: {error}") from error
+
+
 class DumpClipSceneProvider:
     """``StepPlan -> DumpedKubricScene`` for a pool of dump-format clips (``--extra_pool``).
 
@@ -613,7 +730,8 @@ class DumpClipSceneProvider:
     one depth cap: label depth beyond ``max_depth`` is zeroed before the
     transform, as MVTracker's loader zeroes Kubric's (kubric_multiview_dataset.py
     :882, strict ``>``), and under --depth_input the same number is the input's
-    invalidity threshold.
+    invalidity threshold.  The clip-to-scene body is :func:`_scene_from_clip`,
+    which :class:`BenchmarkClipSceneProvider` calls too.
 
     **Views are positions.**  The sampler draws a clip's views from
     ``range(view_count)``, the index's count of its ``view_ids``, so
@@ -678,78 +796,24 @@ class DumpClipSceneProvider:
         return path
 
     def __call__(self, plan):
-        from arc.training.dump_clip import ClipFormatError, open_clip
-        from arc.training.dumped_kubric import build_scene, clip_frames, read_clip
-
         # Before any read: a slot this step cannot seat is a configuration error
         # in strict mode (see MVTrackerSceneProvider.resolve_query_anchors).
         resolve_anchor_slots(
             self.query_anchor_slots, plan, adaptive=self.adaptive_query_anchors
         )
-        path = self.clip_path(plan)
-        label = f"clip {plan.seq_name!r} at {path}"
-        try:
-            with open_clip(path) as clip:
-                arrays = read_clip(clip, name=plan.seq_name)
-                outside = [view for view in plan.cameras if view >= arrays.view_count]
-                if outside:
-                    raise SceneProviderError(
-                        f"{label} has {arrays.view_count} views, but the plan draws "
-                        f"view position(s) {outside}: the pool index is stale"
-                    )
-                late = [time for time in plan.times if time >= arrays.time_count]
-                if late:
-                    raise SceneProviderError(
-                        f"{label} has {arrays.time_count} frames, but the step's "
-                        f"window reaches frame(s) {late}"
-                    )
-                require_track_pool(
-                    plan.seq_name, arrays.track_count, self.min_shared_queries
-                )
-                camera_ids = tuple(int(arrays.view_ids[view]) for view in plan.cameras)
-                anchors = resolve_anchor_slots(
-                    self.query_anchor_slots,
-                    replace(plan, cameras=camera_ids),
-                    adaptive=self.adaptive_query_anchors,
-                )
-                depth = arrays.depth
-                depth[depth > self.max_depth] = 0.0
-                # The Kubric path's own transform, on the four fields it moves and
-                # the factor it divides; both are read back from the namespace.
-                sample = SimpleNamespace(
-                    videodepth=torch.from_numpy(depth),
-                    extrs=torch.from_numpy(arrays.extrinsics),
-                    query_points_3d=torch.from_numpy(arrays.query_points),
-                    trajectory_3d=torch.from_numpy(arrays.trajectories),
-                    track_upscaling_factor=arrays.track_upscaling_factor,
-                )
-                apply_recorded_scene_transform(sample, plan.scene_transform)
-                archive = clip.frames()
-                return build_scene(
-                    name=plan.seq_name,
-                    open_frames=lambda positions, times: clip_frames(
-                        archive, positions, times, grid=arrays.grid, label=str(path)
-                    ),
-                    query_points=sample.query_points_3d,
-                    trajectories=sample.trajectory_3d,
-                    visibility=arrays.visibility,
-                    intrinsics=arrays.intrinsics,
-                    extrinsics=sample.extrs,
-                    depth0=sample.videodepth[:, 0],
-                    depth=sample.videodepth,
-                    view_ids=arrays.view_ids,
-                    track_upscaling_factor=float(sample.track_upscaling_factor),
-                    cameras=camera_ids,
-                    times=plan.times,
-                    query_anchors=anchors,
-                    size=self.size,
-                    patch_size=self.patch_size,
-                    input_depth_max=self.max_depth if self.input_depth else None,
-                    input_camera_vectors=self.input_camera_vectors,
-                    source=str(path),
-                )
-        except ClipFormatError as error:
-            raise SceneProviderError(f"{label} is malformed: {error}") from error
+        return _scene_from_clip(
+            self.clip_path(plan),
+            plan,
+            query_anchor_slots=self.query_anchor_slots,
+            adaptive_query_anchors=self.adaptive_query_anchors,
+            max_depth=self.max_depth,
+            scene_transform=plan.scene_transform,
+            min_shared_queries=self.min_shared_queries,
+            size=self.size,
+            patch_size=self.patch_size,
+            input_depth_max=self.max_depth if self.input_depth else None,
+            input_camera_vectors=self.input_camera_vectors,
+        )
 
 
 class SceneProviderByRoot:
@@ -780,7 +844,13 @@ class SceneProviderByRoot:
 # triton/4rc/multiview/dump_common.py::build_dataset makes (Kubric's at subset
 # "test") -- never by the replay's dataset_overrides above: the point is to
 # score the queries MVTracker's figures are scored on. One entry per dataset
-# family, matched by name prefix: Kubric and DexYCB, so Panoptic is one more.
+# family, matched by name prefix: Kubric and DexYCB.
+#
+# A benchmark 4I4 wrote as a clip set (--eval_benchmark_clips) is the other
+# held-out benchmark: BenchmarkClipSceneProvider, at the end of this section,
+# reads it with this repo's clip reader and imports nothing from MVTracker.
+# Panoptic arrives only that way. The loader entries stay until
+# benchmark_clip_parity.py has matched the two readings on the cluster.
 
 
 def _kubric_benchmark_refusal(name: str) -> str | None:
@@ -1035,6 +1105,33 @@ def _open_dexycb_benchmark(name: str, root: str, *, max_depth: float):
     )
 
 
+class _LabelDepthReport:
+    """How much label depth the cap zeroed in a benchmark scene, said once per scene.
+
+    One line, out of the scene's valid (positive) pixels, on rank 0, the first
+    time the scene loads in this process: the count cannot change between loads,
+    and every rank loads every scene at the preflight.  Both benchmark readers
+    print it -- a loader-built set's (:class:`_FromNameTestSet`) and a clip set's
+    (:class:`BenchmarkClipSceneProvider`) -- so it is spelled here once.
+    """
+
+    def __init__(self, max_depth: float):
+        self.max_depth = float(max_depth)
+        self._reported: set[str] = set()
+
+    def __call__(self, scene_name: str, frames: int, zeroed: int, valid: int) -> None:
+        if scene_name in self._reported:
+            return
+        self._reported.add(scene_name)
+        if is_main_process():
+            share = 100.0 * zeroed / valid if valid else 0.0
+            print(
+                f"benchmark scene={scene_name} frames={frames} "
+                f"label_depth_zeroed={zeroed}/{valid} ({share:.4f}%) "
+                f"beyond {self.max_depth:g}"
+            )
+
+
 class _FromNameTestSet:
     """A benchmark whose ``from_name`` builds its loader, completed per sample.
 
@@ -1051,9 +1148,8 @@ class _FromNameTestSet:
       ``views_to_return`` order (:254): each position's camera id is that
       list's entry;
     * one line per scene saying how much label depth the cap zeroed, out of
-      the valid (positive) pixels -- on rank 0, the first time the scene loads
-      in this process: the count cannot change between loads, and every rank
-      loads every scene at the preflight.
+      the valid (positive) pixels, over every frame the loader loaded
+      (:class:`_LabelDepthReport`).
     """
 
     def __init__(self, dataset, *, views: Sequence[int], max_depth: float):
@@ -1061,7 +1157,7 @@ class _FromNameTestSet:
         self.seq_names = dataset.seq_names
         self.views = [int(view) for view in views]
         self.max_depth = float(max_depth)
-        self._reported: set[str] = set()
+        self._report = _LabelDepthReport(self.max_depth)
 
     def __getitem__(self, index):
         sample, gotit = self.dataset[index]
@@ -1073,16 +1169,7 @@ class _FromNameTestSet:
         valid = int((depth > 0).sum())
         depth[beyond] = 0.0
         sample.sample_views = list(self.views)
-        scene_name = str(sample.seq_name)
-        if scene_name not in self._reported:
-            self._reported.add(scene_name)
-            if is_main_process():
-                share = 100.0 * zeroed / valid if valid else 0.0
-                print(
-                    f"benchmark scene={scene_name} frames={int(sample.video.shape[1])} "
-                    f"label_depth_zeroed={zeroed}/{valid} ({share:.4f}%) "
-                    f"beyond {self.max_depth:g}"
-                )
+        self._report(str(sample.seq_name), int(sample.video.shape[1]), zeroed, valid)
         return sample, gotit
 
 
@@ -1259,4 +1346,176 @@ class BenchmarkSceneProvider:
             patch_size=self.patch_size,
             input_depth_max=self.input_depth_max,
             input_camera_vectors=self.input_camera_vectors,
+        )
+
+
+# The file at a clip set's root recording the rule that wrote it: an object whose
+# "setting" names evaluate_3dpt's setting. The eval records it and reads nothing
+# in it; a clip's own source.json is not read at all.
+BENCHMARK_PROTOCOL_NAME = "benchmark.json"
+
+
+class BenchmarkClipSceneProvider:
+    """``StepPlan -> DumpedKubricScene`` for a held-out benchmark written as a clip set.
+
+    ``--eval_benchmark_clips DIR``: 4I4's ``prepare_clips.py`` writes a
+    benchmark as a directory of dump-format clips -- the format
+    :class:`DumpClipSceneProvider` reads for ``--extra_pool`` -- with
+    ``benchmark.json`` at the root.  The clips are listed as an extra pool's
+    are (``list_pool``: clip directories or ``<name>.zip``, ``.`` and ``_``
+    entries skipped, plain string order), and every one is scored, in that
+    order.  Nothing here imports MVTracker.
+
+    Built once, before the model loads, so every refusal costs no model load: a
+    DIR that is not a directory or holds no clip; a clip ``check_clip`` finds
+    malformed or shorter than ``--val_seq_len`` (it reads meta.npz in full and
+    depth_full.npz's header, and decodes no frame, so a bad depth value or frame
+    is first refused by the preflight's load); a clip whose view count is not
+    the window's; and a ``benchmark.json`` that is not a JSON object.
+
+    **Views are positions.**  The window's cameras are ``range(V)``, ``V`` being
+    ``len(--val_cameras)``, and each becomes a camera id through the clip's own
+    ``view_ids`` (1 7 14 20 on Panoptic), so ``--val_cameras`` is compared by
+    count, never by value.  A clip longer than ``--val_seq_len`` is scored on
+    the window's frames.
+
+    A scene is the clip as written, through :func:`_scene_from_clip`, the body
+    the extra pool's provider calls too, with three differences: no
+    ``--min_shared_queries`` guard (a benchmark scores every query it has), the
+    anchors resolved strictly (they were checked against the window at parse
+    time), and no world transform.  ``--kubric_max_depth`` caps both depths,
+    as on the loader path, in the clip's own units -- traj3d_world's: Kubric
+    units, metres x6 on DexYCB, metres x2.5 on Panoptic -- and a line per
+    scene says how much the cap zeroed (:class:`_LabelDepthReport`).  A clip
+    that fails to read raises :class:`SceneProviderError`, which the held-out
+    preflight and eval do not absorb: a benchmark scored on a subset of its
+    scenes would not be the benchmark.
+    """
+
+    def __init__(
+        self,
+        *,
+        clips,
+        view_count: int,
+        seq_len: int,
+        max_depth: float,
+        query_anchor_slots: Sequence[tuple[int, int]],
+        size: int = 512,
+        patch_size: int = 14,
+        input_depth: bool = False,
+        input_camera_vectors: bool = False,
+    ):
+        from arc.training.dump_clip import CLIP_POOL_KIND, clip_view_ids
+        from arc.training.dumped_kubric import check_clip
+        from arc.training.scene_sampler import ScenePoolError, list_pool
+
+        flag = "--eval_benchmark_clips"
+        clips = os.fspath(clips)
+        # Checked first so the refusal names this flag: list_pool's own names
+        # the extra pool's.
+        if not os.path.isdir(clips):
+            raise ValueError(f"{flag} {clips!r} is not a directory")
+        try:
+            listing = list_pool(clips, kind=CLIP_POOL_KIND)
+        except ScenePoolError as error:
+            raise ValueError(f"{flag} {clips!r} cannot be listed: {error}") from error
+
+        failing = {}
+        for name, path in listing.items():
+            problems = check_clip(path, name=name, min_frames=seq_len)
+            if problems:
+                failing[name] = problems
+        if failing:
+            named = "; ".join(
+                problem for problems in list(failing.values())[:8] for problem in problems
+            )
+            raise ValueError(
+                f"{flag} {clips!r}: {len(failing)} of {len(listing)} clip(s) fail the "
+                f"clip format check at the held-out window's --val_seq_len {seq_len}: "
+                f"{named}" + (" ..." if len(failing) > 8 else "")
+            )
+        miscounted = []
+        for name, path in listing.items():
+            count = int(clip_view_ids(path).shape[0])
+            if count != view_count:
+                miscounted.append(f"{name} ({count} views)")
+        if miscounted:
+            raise ValueError(
+                f"{flag} {clips!r}: {len(miscounted)} of {len(listing)} clip(s) do "
+                f"not hold the held-out window's {view_count} cameras "
+                "(len(--val_cameras); its values are not compared, a clip names "
+                "its own through view_ids): "
+                + ", ".join(miscounted[:8])
+                + (" ..." if len(miscounted) > 8 else "")
+            )
+
+        protocol = None
+        protocol_path = os.path.join(clips, BENCHMARK_PROTOCOL_NAME)
+        if os.path.exists(protocol_path):
+            try:
+                with open(protocol_path, encoding="utf-8") as handle:
+                    protocol = json.load(handle)
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"{flag} {clips!r}: {protocol_path} cannot be read as JSON: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
+            if not isinstance(protocol, dict):
+                raise ValueError(
+                    f"{flag} {clips!r}: {protocol_path} holds a "
+                    f"{type(protocol).__name__}, not the JSON object recording the "
+                    "rule that wrote the set"
+                )
+
+        self.clips = clips
+        self.protocol = protocol
+        self.data_root = clips
+        self.cameras = tuple(range(int(view_count)))
+        self.scene_names = list(listing)
+        self._paths = dict(listing)
+        self.max_depth = float(max_depth)
+        self.query_anchor_slots = checked_anchor_slots(query_anchor_slots)
+        self.size = size
+        self.patch_size = patch_size
+        self.input_depth_max = self.max_depth if input_depth else None
+        self.input_camera_vectors = input_camera_vectors
+        self._report = _LabelDepthReport(self.max_depth)
+
+    def identity(self) -> dict:
+        """What the eval records about the set it scored.
+
+        ``clips`` is the flag's value as given and ``name`` the set directory's
+        own; ``protocol`` is ``benchmark.json``, the rule that wrote the set,
+        or None for a set without one.  ``scene_count`` and ``max_depth`` mean
+        what they mean in a loader-built set's record.
+        """
+
+        return {
+            "clips": self.clips,
+            "name": os.path.basename(os.path.abspath(self.clips)),
+            "protocol": self.protocol,
+            "scene_count": len(self.scene_names),
+            "max_depth": self.max_depth,
+        }
+
+    def __call__(self, plan):
+        path = self._paths.get(plan.seq_name)
+        if path is None:
+            raise SceneProviderError(
+                f"scene {plan.seq_name!r} is not in the benchmark clip set at "
+                f"{self.data_root!r} ({len(self.scene_names)} clips)"
+            )
+        return _scene_from_clip(
+            path,
+            plan,
+            query_anchor_slots=self.query_anchor_slots,
+            adaptive_query_anchors=False,
+            max_depth=self.max_depth,
+            scene_transform=None,
+            min_shared_queries=None,
+            size=self.size,
+            patch_size=self.patch_size,
+            input_depth_max=self.input_depth_max,
+            input_camera_vectors=self.input_camera_vectors,
+            report_label_depth=self._report,
         )

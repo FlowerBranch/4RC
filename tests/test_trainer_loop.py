@@ -341,14 +341,16 @@ def _loop_args(tmp_path, **overrides):
         # existing test assumes.
         eval_visual_scenes=[],
         eval_visual_stride=4,
-        # The eval's extra anchors and its benchmark source: eval-only too, so
-        # NOT stored by _checkpoint_settings and in no resume tier. run_training
-        # resolves the anchors for every eval, and _validate_args and
-        # _has_held_out read all three, so every loop test needs them present.
-        # None is the parser's default: no extra anchor, no benchmark.
+        # The eval's extra anchors and its benchmark sources, a loader's or a
+        # clip set: eval-only too, so NOT stored by _checkpoint_settings and in
+        # no resume tier. run_training resolves the anchors for every eval, and
+        # _validate_args and _has_held_out read all four, so every loop test
+        # needs them present. None is the parser's default: no extra anchor, no
+        # benchmark.
         eval_query_anchors=None,
         eval_benchmark_dataset=None,
         eval_benchmark_root=None,
+        eval_benchmark_clips=None,
         # Where the stream came from, read by _plan_summary's scene_source
         # block and by nothing in the loop: a manifest, the mode every existing
         # test assumes.
@@ -3002,7 +3004,8 @@ def test_the_oracle_anchor_needs_a_held_out_set(tmp_path):
         ValueError,
         match=(
             r"--oracle_query_anchor needs a held-out set "
-            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+            r"\(--val_scenes_file, --eval_benchmark_dataset or "
+            r"--eval_benchmark_clips\)"
         ),
     ):
         train_cli._validate_args(args)
@@ -3023,7 +3026,8 @@ def test_the_ground_truth_anchor_needs_a_held_out_set(tmp_path):
         ValueError,
         match=(
             r"--ground_truth_query_anchor needs a held-out set "
-            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+            r"\(--val_scenes_file, --eval_benchmark_dataset or "
+            r"--eval_benchmark_clips\)"
         ),
     ):
         train_cli._validate_args(args)

@@ -1,12 +1,14 @@
 """Find the members of one dump-format clip, whether it is a directory or a ``<name>.zip``.
 
-The extra training pool (``--extra_pool``) holds clips in the layout 4I4's clip writer
-(``triton/4rc/multiview/clip_writer.py``) produces for the Syn4D converter: three members side by
-side, in a clip directory or at the root of ``<name>.zip``::
+The extra training pool (``--extra_pool``) and a held-out benchmark's clip set
+(``--eval_benchmark_clips``) hold clips in the layout 4I4's clip writer
+(``triton/4rc/multiview/clip_writer.py``) produces, for the Syn4D converter and for
+``prepare_clips.py`` respectively: three members side by side, in a clip directory or at the
+root of ``<name>.zip``::
 
     meta.npz        seq_name, query_points, traj3d_world, visibility, intrs, extrs, depth0,
                     view_ids, track_upscaling_factor
-    depth_full.npz  key "depth", (V,T,1,H,W) metres, 0 where invalid
+    depth_full.npz  key "depth", (V,T,1,H,W) in traj3d_world's units, 0 where invalid
     frames.zip      view_<v>/<t:04d>.png, v the position on the view axis
 
 This module owns that layout the way the vendored ``scene_archive`` owns MV-Kubric's, and like it

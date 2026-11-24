@@ -735,7 +735,8 @@ def test_the_eval_anchor_flag_needs_a_held_out_set_and_the_training_flag_does_no
         ValueError,
         match=(
             r"--eval_query_anchor_source needs a held-out set "
-            r"\(--val_scenes_file or --eval_benchmark_dataset\)"
+            r"\(--val_scenes_file, --eval_benchmark_dataset or "
+            r"--eval_benchmark_clips\)"
         ),
     ):
         train_cli._validate_args(

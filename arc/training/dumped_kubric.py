@@ -9,11 +9,11 @@ scene; :func:`scene_from_datapoint` is its front-end for a live MVTracker
 ``Datapoint``.  A live sample always carries per-frame depth, so an anchor may
 sit at any original time.
 
-The extra training pool's dump-format clips are the other source: :func:`read_clip`
-checks one clip's arrays against the format contract and :func:`clip_frames` decodes
-its frames for ``build_scene``, the way the retired disk loader fed the same core.
-``arc.training.dump_clip`` finds the members; ``DumpClipSceneProvider`` puts the two
-together.
+Dump-format clips are the other source -- the extra training pool's, and a held-out
+benchmark's clip set: :func:`read_clip` checks one clip's arrays against the format
+contract and :func:`clip_frames` decodes its frames for ``build_scene``, the way the
+retired disk loader fed the same core.  ``arc.training.dump_clip`` finds the members;
+``scene_provider._scene_from_clip`` puts the two together for both clip providers.
 """
 
 from __future__ import annotations
@@ -1057,10 +1057,12 @@ def scene_from_datapoint(
     )
 
 
-# --- Dump-format clips (the extra training pool). One contract, checked here at
-# every load and by --check_clips at index time, and mirrored on the writing side
-# by 4I4's triton/syn4d/check_clip.py. Every violation is a ClipFormatError naming
-# the clip and the member, which the provider turns into a skipped scene.
+# --- Dump-format clips (the extra training pool and a benchmark's clip set). One
+# contract, checked here at every load, by --check_clips at index time and by the
+# benchmark clip provider when it opens a set, and mirrored on the writing side by
+# 4I4's triton/syn4d/check_clip.py. Every violation is a ClipFormatError naming the
+# clip and the member, which the extra pool's provider turns into a skipped scene
+# and the benchmark's into a refusal.
 
 # meta.npz's floating arrays, by their names in the file.
 _CLIP_FLOAT_KEYS = ("query_points", "traj3d_world", "intrs", "extrs", "depth0")
@@ -1299,12 +1301,15 @@ def _npy_header(npz, key: str) -> tuple[tuple[int, ...], np.dtype]:
 
 
 def check_clip(path, *, name: str, min_frames: int) -> list[str]:
-    """``--check_clips``: one clip against the contract, at index time; ``[]`` when it passes.
+    """One clip against the contract, without decoding it; ``[]`` when it passes.
+
+    ``--check_clips`` runs it at index time, and the benchmark clip provider on
+    every clip of a set when it opens it.
 
     meta.npz in full through the load path's own checks, depth_full.npz's shape
     and dtype from its ``.npy`` header (the array is not decompressed), the
     frames.zip member set, and at least ``min_frames`` frames -- the window every
-    step is planned on.  Frames are not decoded.
+    step is planned on, or the held-out window.  Frames are not decoded.
     """
 
     problems = []

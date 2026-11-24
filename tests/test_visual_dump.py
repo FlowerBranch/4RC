@@ -830,7 +830,8 @@ _HELD_OUT = {"val_scenes_file": "val.json", "val_data_root": "/held/out/dir"}
     (
         (
             {"eval_visual_scenes": ["0000"], "eval_every": 500},
-            r"needs a held-out set \(--val_scenes_file or --eval_benchmark_dataset\)",
+            r"needs a held-out set \(--val_scenes_file, --eval_benchmark_dataset "
+            r"or --eval_benchmark_clips\)",
         ),
         (
             {"eval_visual_scenes": ["0000"], "eval_every": 0, **_HELD_OUT},
